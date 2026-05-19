@@ -9,7 +9,11 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 try:
     import tomllib
@@ -33,10 +37,19 @@ CODEX_AUTH_FILE = CODEX_HOME / "auth.json"
 CODEX_CONFIG_FILE = CODEX_HOME / "config.toml"
 CODEX_KEYCHAIN_PREFIX = "codex-switcher:"
 CODEX_LOGIN_TIMEOUT_SECONDS = 300
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_KEYRING_UNSUPPORTED_MESSAGE = (
     "Codex keyring credential storage is not supported yet. "
     'Set cli_auth_credentials_store = "file" in ~/.codex/config.toml and run codex login.'
 )
+CODEX_SESSION_EXPIRED_MESSAGE = (
+    "This saved Codex session has expired. Please add the Codex account again to sign in."
+)
+
+
+class CodexCredentialsExpiredError(RuntimeError):
+    """Raised when Codex refresh tokens have already been consumed or revoked."""
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -176,6 +189,62 @@ def _credentials_data(creds_json: str | None = None) -> dict | None:
         return None
 
 
+def refresh_codex_credentials(creds_json: str) -> str | None:
+    """Refresh Codex OAuth credentials, returning an updated auth.json blob."""
+    data = _credentials_data(creds_json)
+    if not data:
+        return None
+
+    tokens = data.get("tokens", {})
+    if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
+        return None
+
+    body = urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": CODEX_OAUTH_CLIENT_ID,
+    }).encode("utf-8")
+    req = Request(CODEX_OAUTH_TOKEN_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urlopen(req, timeout=15) as resp:
+            refreshed = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        if exc.code in {400, 401} and (
+            "already been used" in body_text
+            or "invalid_grant" in body_text
+            or "token_invalidated" in body_text
+        ):
+            raise CodexCredentialsExpiredError(CODEX_SESSION_EXPIRED_MESSAGE) from exc
+        return None
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return None
+
+    for key in ("access_token", "refresh_token", "id_token"):
+        if refreshed.get(key):
+            tokens[key] = refreshed[key]
+    for key in ("token_type", "expires_in", "account_id"):
+        if refreshed.get(key):
+            tokens[key] = refreshed[key]
+    data["tokens"] = tokens
+    data["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return json.dumps(data, separators=(",", ":"))
+
+
+def backup_codex_credentials(creds: str) -> str | None:
+    """Store a valid Codex auth blob in the switcher Keychain backup."""
+    creds = normalize_codex_credentials_blob(creds) or ""
+    email = _codex_email_from_credentials(creds)
+    if not email:
+        return None
+    _validate_email(email)
+    backup_codex_credentials(creds)
+    return email
+
+
 def _codex_email_from_credentials(creds_json: str | None = None) -> str | None:
     """Extract email from Codex credentials."""
     data = _credentials_data(creds_json)
@@ -257,6 +326,11 @@ def _write_codex_credentials(creds: str) -> None:
     CODEX_AUTH_FILE.chmod(0o600)
 
 
+def write_active_codex_credentials(creds: str) -> None:
+    """Write the active Codex auth.json with validation."""
+    _write_codex_credentials(creds)
+
+
 def run_codex_logout() -> None:
     """Run `codex logout`."""
     subprocess.run([_codex_cmd(), "logout"], capture_output=True, text=True)
@@ -336,6 +410,7 @@ def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_P
     target_creds = keychain.read_credentials(f"{CODEX_KEYCHAIN_PREFIX}{target_email}")
     if not target_creds:
         raise RuntimeError(f"Credentials not found for Codex account {target_email}")
+    target_creds = normalize_codex_credentials_blob(target_creds) or target_creds
 
     accounts = load_accounts(config_path)
     target_account = next(
@@ -344,6 +419,21 @@ def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_P
     )
     if not target_account:
         raise RuntimeError(f"Codex account {target_email} not found in config")
+
+    try:
+        refreshed = refresh_codex_credentials(target_creds)
+    except CodexCredentialsExpiredError as exc:
+        raise RuntimeError(
+            f"Saved Codex session for {target_email} expired. "
+            "Use Add Codex account to sign in again."
+        ) from exc
+    if refreshed:
+        target_creds = refreshed
+        keychain.write_credentials(
+            f"{CODEX_KEYCHAIN_PREFIX}{target_email}",
+            target_account.keychain_account,
+            target_creds,
+        )
 
     _write_codex_credentials(target_creds)
     for account in accounts:

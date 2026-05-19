@@ -6,9 +6,11 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
 from claude_switcher.codex_usage import (
+    CODEX_LOGIN_REQUIRED_USAGE,
     _extract_codex_token,
     fetch_codex_usage,
     fetch_codex_usage_for_account,
+    fetch_codex_usage_with_refresh,
     format_codex_usage,
     codex_usage_state,
 )
@@ -72,6 +74,9 @@ class TestFormatCodexUsage:
     def test_returns_unavailable_for_empty(self):
         assert format_codex_usage({}) == "Usage unavailable"
 
+    def test_returns_login_required_for_expired_session(self):
+        assert codex_usage_state(CODEX_LOGIN_REQUIRED_USAGE).display == "Login required"
+
     def test_usage_state_marks_exhausted_at_100(self):
         usage = {
             "rate_limit": {
@@ -104,11 +109,11 @@ class TestFetchCodexUsageForAccount:
         assert result["rate_limit"]["primary_window"]["used_percent"] == 10
         assert mock_urlopen.call_count == 2
 
-    @patch("claude_switcher.codex_usage.fetch_codex_usage")
+    @patch("claude_switcher.codex_usage.fetch_codex_usage_with_refresh")
     @patch("claude_switcher.codex_usage.keychain")
     def test_fetches_for_account(self, mock_kc, mock_fetch):
         mock_kc.read_credentials.return_value = FAKE_CREDS_NESTED
-        mock_fetch.return_value = {"rate_limit": {}}
+        mock_fetch.return_value = ({"rate_limit": {}}, None)
         result = fetch_codex_usage_for_account("user@test.com")
         mock_kc.read_credentials.assert_called_with("codex-switcher:user@test.com")
         assert result is not None
@@ -118,3 +123,31 @@ class TestFetchCodexUsageForAccount:
         mock_kc.read_credentials.return_value = None
         result = fetch_codex_usage_for_account("user@test.com")
         assert result is None
+
+    @patch("claude_switcher.codex_usage._fetch_codex_usage_once")
+    @patch("claude_switcher.codex_usage.refresh_codex_credentials")
+    def test_fetch_refreshes_stale_credentials(self, mock_refresh, mock_fetch_once):
+        refreshed = json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "fresh", "account_id": "acc-123"},
+        })
+        mock_fetch_once.side_effect = [None, {"rate_limit": {}}]
+        mock_refresh.return_value = refreshed
+
+        usage, refreshed_creds = fetch_codex_usage_with_refresh(FAKE_CREDS_NESTED)
+
+        assert usage == {"rate_limit": {}}
+        assert refreshed_creds == refreshed
+
+    @patch("claude_switcher.codex_usage.fetch_codex_usage_with_refresh")
+    @patch("claude_switcher.codex_usage.keychain")
+    def test_fetch_for_account_saves_refreshed_credentials(self, mock_kc, mock_fetch):
+        mock_kc.read_credentials.return_value = FAKE_CREDS_NESTED
+        mock_fetch.return_value = ({"rate_limit": {}}, '{"fresh": true}')
+
+        assert fetch_codex_usage_for_account("user@test.com") == {"rate_limit": {}}
+        mock_kc.write_credentials.assert_called_once_with(
+            "codex-switcher:user@test.com",
+            "user@test.com",
+            '{"fresh": true}',
+        )

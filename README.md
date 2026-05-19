@@ -113,6 +113,8 @@ Then run:
 codex login
 ```
 
+If a saved Codex session expires because its refresh token was already rotated, the app refuses to restore that stale session and shows **Login required** for usage. Add that Codex account again to refresh the saved Keychain backup.
+
 ## Security
 
 - Saved account backups are stored in macOS Keychain

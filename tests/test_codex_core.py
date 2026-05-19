@@ -9,6 +9,7 @@ import pytest
 
 import claude_switcher.codex_core as codex_core_mod
 from claude_switcher.codex_core import (
+    CodexCredentialsExpiredError,
     CODEX_KEYRING_UNSUPPORTED_MESSAGE,
     add_new_codex_account,
     check_codex_cli,
@@ -16,6 +17,7 @@ from claude_switcher.codex_core import (
     read_codex_credentials,
     import_current_codex_account,
     normalize_codex_credentials_blob,
+    refresh_codex_credentials,
     run_codex_login,
     switch_codex_account,
     remove_codex_account,
@@ -113,6 +115,42 @@ class TestCodexCredentials:
             with pytest.raises(RuntimeError, match="keyring credential storage"):
                 read_codex_credentials()
         assert "cli_auth_credentials_store" in CODEX_KEYRING_UNSUPPORTED_MESSAGE
+
+    @patch("claude_switcher.codex_core.urlopen")
+    def test_refresh_credentials_updates_rotated_tokens(self, mock_urlopen):
+        response = MagicMock()
+        response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "id_token": _jwt({"email": "user@test.com"}),
+            "expires_in": 3600,
+        }).encode()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = response
+
+        refreshed = refresh_codex_credentials(_auth_json(email="user@test.com"))
+        data = json.loads(refreshed)
+
+        assert data["tokens"]["access_token"] == "new-access"
+        assert data["tokens"]["refresh_token"] == "new-refresh"
+        assert "last_refresh" in data
+
+    @patch("claude_switcher.codex_core.urlopen")
+    def test_refresh_credentials_raises_for_consumed_refresh_token(self, mock_urlopen):
+        error_body = json.dumps({
+            "error": {"message": "Your refresh token has already been used."}
+        }).encode()
+        mock_urlopen.side_effect = codex_core_mod.HTTPError(
+            "https://auth.openai.com/oauth/token",
+            401,
+            "Unauthorized",
+            {},
+            MagicMock(read=MagicMock(return_value=error_body)),
+        )
+
+        with pytest.raises(CodexCredentialsExpiredError):
+            refresh_codex_credentials(_auth_json(email="user@test.com"))
 
 
 class TestImportCodexAccount:
@@ -252,6 +290,56 @@ class TestSwitchCodexAccount:
         mock_write.assert_called_once_with('{"token": "target-token"}')
         active = [a for a in load_accounts(config) if a.provider == "codex" and a.active]
         assert active[0].email == "new@test.com"
+
+    @patch("claude_switcher.codex_core.refresh_codex_credentials")
+    @patch("claude_switcher.codex_core._write_codex_credentials")
+    @patch("claude_switcher.codex_core.keychain")
+    def test_switch_refreshes_target_before_write(self, mock_kc, mock_write, mock_refresh, tmp_path):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        auth_file.write_text(_auth_json(email="old@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
+            AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
+        ], config)
+        target_creds = _auth_json(email="new@test.com")
+        refreshed_creds = _auth_json(email="new@test.com", plan="pro")
+        mock_kc.read_credentials.return_value = target_creds
+        mock_refresh.return_value = refreshed_creds
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            switch_codex_account("new@test.com", config)
+
+        mock_write.assert_called_once_with(refreshed_creds)
+        mock_kc.write_credentials.assert_any_call("codex-switcher:new@test.com", "new", refreshed_creds)
+
+    @patch("claude_switcher.codex_core.refresh_codex_credentials")
+    @patch("claude_switcher.codex_core._write_codex_credentials")
+    @patch("claude_switcher.codex_core.keychain")
+    def test_switch_refuses_expired_target_session(self, mock_kc, mock_write, mock_refresh, tmp_path):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        auth_file.write_text(_auth_json(email="old@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
+            AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
+        ], config)
+        mock_kc.read_credentials.return_value = _auth_json(email="new@test.com")
+        mock_refresh.side_effect = CodexCredentialsExpiredError("expired")
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            with pytest.raises(RuntimeError, match="expired"):
+                switch_codex_account("new@test.com", config)
+
+        mock_write.assert_not_called()
 
     @patch("claude_switcher.codex_core.keychain")
     def test_switch_decodes_hex_encoded_target_credentials(self, mock_kc, tmp_path):

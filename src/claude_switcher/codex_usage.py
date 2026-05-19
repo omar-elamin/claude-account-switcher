@@ -2,17 +2,24 @@
 
 import json
 from datetime import datetime, timezone
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from claude_switcher import keychain
-from claude_switcher.codex_core import normalize_codex_credentials_blob
+from claude_switcher.codex_core import (
+    CodexCredentialsExpiredError,
+    backup_codex_credentials,
+    normalize_codex_credentials_blob,
+    refresh_codex_credentials,
+    write_active_codex_credentials,
+)
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/wham/usage",
     "https://chatgpt.com/backend-api/api/codex/usage",
 )
+CODEX_LOGIN_REQUIRED_USAGE = {"error": {"code": "login_required"}}
 
 
 def _decode_jwt_payload(token: str) -> dict | None:
@@ -51,8 +58,8 @@ def _extract_codex_token(creds_json: str) -> tuple[str, str] | None:
     return None
 
 
-def fetch_codex_usage(creds_json: str) -> dict | None:
-    """Fetch Codex usage from the first available ChatGPT backend endpoint."""
+def _fetch_codex_usage_once(creds_json: str) -> dict | None:
+    """Fetch Codex usage once from the first available ChatGPT backend endpoint."""
     result = _extract_codex_token(creds_json)
     if not result:
         return None
@@ -63,22 +70,51 @@ def fetch_codex_usage(creds_json: str) -> dict | None:
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("ChatGPT-Account-Id", account_id)
         req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", "claude-switcher/0.4.2")
+        req.add_header("User-Agent", "claude-switcher/0.4.3")
 
         try:
             with urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode())
+        except HTTPError:
+            continue
         except (URLError, TimeoutError, json.JSONDecodeError, OSError):
             continue
     return None
 
 
+def fetch_codex_usage_with_refresh(creds_json: str) -> tuple[dict | None, str | None]:
+    """Fetch usage, refreshing Codex credentials once if the saved access token is stale."""
+    normalized = normalize_codex_credentials_blob(creds_json) or creds_json
+    usage = _fetch_codex_usage_once(normalized)
+    if usage is not None:
+        return usage, None
+
+    try:
+        refreshed = refresh_codex_credentials(normalized)
+    except CodexCredentialsExpiredError:
+        return CODEX_LOGIN_REQUIRED_USAGE, None
+    if not refreshed:
+        return None, None
+
+    return _fetch_codex_usage_once(refreshed), refreshed
+
+
+def fetch_codex_usage(creds_json: str) -> dict | None:
+    """Fetch Codex usage from the first available ChatGPT backend endpoint."""
+    usage, _ = fetch_codex_usage_with_refresh(creds_json)
+    return usage
+
+
 def fetch_codex_usage_for_account(email: str) -> dict | None:
     """Fetch usage for a saved Codex account stored in Keychain."""
-    creds = keychain.read_credentials(f"codex-switcher:{email}")
+    service = f"codex-switcher:{email}"
+    creds = keychain.read_credentials(service)
     if not creds:
         return None
-    return fetch_codex_usage(creds)
+    usage, refreshed = fetch_codex_usage_with_refresh(creds)
+    if refreshed:
+        keychain.write_credentials(service, email, refreshed)
+    return usage
 
 
 def fetch_active_codex_usage() -> dict | None:
@@ -91,7 +127,11 @@ def fetch_active_codex_usage() -> dict | None:
         return None
     if not creds:
         return None
-    return fetch_codex_usage(creds)
+    usage, refreshed = fetch_codex_usage_with_refresh(creds)
+    if refreshed:
+        write_active_codex_credentials(refreshed)
+        backup_codex_credentials(refreshed)
+    return usage
 
 
 def _format_reset_delta(reset_at: float) -> str:
@@ -119,6 +159,10 @@ def codex_usage_state(usage: dict | None) -> UsageState:
     """Convert Codex usage data into a normalized usage state."""
     if not usage:
         return UsageState(available=False, display="Usage unavailable")
+
+    error = usage.get("error")
+    if isinstance(error, dict) and error.get("code") == "login_required":
+        return UsageState(available=False, display="Login required")
 
     rate_limit = usage.get("rate_limit")
     if not isinstance(rate_limit, dict):
