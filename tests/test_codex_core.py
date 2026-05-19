@@ -10,10 +10,12 @@ import pytest
 import claude_switcher.codex_core as codex_core_mod
 from claude_switcher.codex_core import (
     CODEX_KEYRING_UNSUPPORTED_MESSAGE,
+    add_new_codex_account,
     check_codex_cli,
     get_codex_auth_status,
     read_codex_credentials,
     import_current_codex_account,
+    run_codex_login,
     switch_codex_account,
     remove_codex_account,
 )
@@ -129,6 +131,86 @@ class TestImportCodexAccount:
             codex_core_mod, "CODEX_CONFIG_FILE", config_file
         ):
             assert import_current_codex_account(tmp_path / "accounts.json") is None
+
+    def test_import_no_auto_credentials_returns_none(self, tmp_path):
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", tmp_path / "missing.json"), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", tmp_path / "missing.toml"
+        ):
+            assert import_current_codex_account(tmp_path / "accounts.json") is None
+
+
+class TestCodexLogin:
+    @patch("claude_switcher.codex_core._launch_codex_login_terminal")
+    @patch("claude_switcher.codex_core.time.sleep")
+    def test_run_codex_login_waits_for_auth_file(self, mock_sleep, mock_launch):
+        with patch(
+            "claude_switcher.codex_core._read_codex_credentials_from_file",
+            side_effect=[None, _auth_json(email="new@test.com")],
+        ):
+            assert run_codex_login(timeout=3) is True
+        mock_launch.assert_called_once()
+
+    @patch("claude_switcher.codex_core.subprocess.run")
+    @patch("claude_switcher.codex_core._codex_cmd", return_value="/opt/homebrew/bin/codex")
+    def test_launch_codex_login_opens_terminal(self, mock_cmd, mock_run, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("claude_switcher.codex_core.tempfile.gettempdir", return_value=str(tmp_path)):
+            codex_core_mod._launch_codex_login_terminal()
+
+        script_path = tmp_path / "claude-switcher-codex-login-{}.command".format(
+            codex_core_mod.os.getpid()
+        )
+        assert script_path.exists()
+        assert 'cli_auth_credentials_store="file"' in script_path.read_text()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0][0] == "open"
+
+    @patch("claude_switcher.codex_core.import_current_codex_account")
+    @patch("claude_switcher.codex_core.run_codex_login")
+    @patch("claude_switcher.codex_core.run_codex_logout")
+    def test_add_new_account_opens_login_when_no_current_file(
+        self, mock_logout, mock_login, mock_import, tmp_path
+    ):
+        config = tmp_path / "accounts.json"
+        mock_login.return_value = True
+        mock_import.return_value = AccountInfo(
+            "new@test.com", "plus", "", True, "new@test.com", provider="codex"
+        )
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", tmp_path / "missing.json"), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", tmp_path / "missing.toml"
+        ):
+            result = add_new_codex_account(config)
+
+        assert result.email == "new@test.com"
+        mock_logout.assert_called_once()
+        mock_login.assert_called_once()
+
+    @patch("claude_switcher.codex_core._write_codex_credentials")
+    @patch("claude_switcher.codex_core.run_codex_login")
+    @patch("claude_switcher.codex_core.run_codex_logout")
+    @patch("claude_switcher.codex_core.keychain")
+    def test_add_new_account_restores_saved_creds_when_cancelled(
+        self, mock_kc, mock_logout, mock_login, mock_write, tmp_path
+    ):
+        config = tmp_path / "accounts.json"
+        config_file = tmp_path / "config.toml"
+        auth_file = tmp_path / "auth.json"
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old@test.com", provider="codex")
+        ], config)
+        mock_kc.read_credentials.return_value = _auth_json(email="old@test.com")
+        mock_login.return_value = False
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            result = add_new_codex_account(config)
+
+        assert result is None
+        mock_write.assert_called_once_with(_auth_json(email="old@test.com"))
 
 
 class TestSwitchCodexAccount:

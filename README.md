@@ -53,7 +53,7 @@ Open the menu bar icon to:
 
 - click any Claude or Codex account to make it active
 - add a Claude account with `claude auth login`
-- add a Codex account with `codex login`
+- add a Codex account with a visible Terminal-based `codex login` flow
 - refresh live usage manually
 - enable or disable auto-switch separately for Claude and Codex
 - remove saved inactive accounts from Keychain
@@ -100,7 +100,7 @@ macOS Keychain
 
 ## Codex setup note
 
-Codex keyring storage is detected but not switched in this release. To use Codex account switching, configure file-mode credentials:
+Codex keyring storage is detected but not switched in this release. When adding a Codex account, the app opens Terminal and runs Codex login with file-mode credentials. You can also configure file mode explicitly:
 
 ```toml
 # ~/.codex/config.toml

@@ -61,7 +61,7 @@ def fetch_codex_usage(creds_json: str) -> dict | None:
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("ChatGPT-Account-Id", account_id)
         req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", "claude-switcher/0.4.0")
+        req.add_header("User-Agent", "claude-switcher/0.4.1")
 
         try:
             with urlopen(req, timeout=10) as resp:

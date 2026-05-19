@@ -2,9 +2,13 @@
 
 import base64
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -28,6 +32,7 @@ CODEX_HOME = Path.home() / ".codex"
 CODEX_AUTH_FILE = CODEX_HOME / "auth.json"
 CODEX_CONFIG_FILE = CODEX_HOME / "config.toml"
 CODEX_KEYCHAIN_PREFIX = "codex-switcher:"
+CODEX_LOGIN_TIMEOUT_SECONDS = 300
 CODEX_KEYRING_UNSUPPORTED_MESSAGE = (
     "Codex keyring credential storage is not supported yet. "
     'Set cli_auth_credentials_store = "file" in ~/.codex/config.toml and run codex login.'
@@ -113,6 +118,14 @@ def read_codex_credentials() -> str | None:
     return creds
 
 
+def _read_codex_credentials_for_import() -> str | None:
+    """Read file-mode credentials without treating a missing file as a hard failure."""
+    store = _codex_credentials_store()
+    if store == "keyring":
+        raise RuntimeError(CODEX_KEYRING_UNSUPPORTED_MESSAGE)
+    return _read_codex_credentials_from_file()
+
+
 def _decode_jwt_payload(token: str) -> dict | None:
     """Decode a JWT payload without verification."""
     try:
@@ -182,7 +195,7 @@ def _saved_codex_account(email: str, config_path: Path) -> AccountInfo | None:
 
 def import_current_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Import the currently logged-in Codex account."""
-    creds = read_codex_credentials()
+    creds = _read_codex_credentials_for_import()
     if not creds or get_codex_auth_status() is None:
         return None
 
@@ -218,10 +231,61 @@ def run_codex_logout() -> None:
     subprocess.run([_codex_cmd(), "logout"], capture_output=True, text=True)
 
 
-def run_codex_login() -> bool:
-    """Run `codex login`. Returns True if successful."""
-    result = subprocess.run([_codex_cmd(), "login"])
-    return result.returncode == 0
+def _clear_codex_credentials_file() -> None:
+    """Remove the active file-mode Codex credentials before a fresh login."""
+    try:
+        CODEX_AUTH_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _launch_codex_login_terminal() -> None:
+    """Open Terminal.app and run an interactive Codex login command."""
+    script_path = Path(tempfile.gettempdir()) / f"claude-switcher-codex-login-{os.getpid()}.command"
+    codex_cmd = shlex.quote(_codex_cmd())
+    script = f"""#!/bin/zsh
+echo "Claude Switcher - Codex login"
+echo ""
+echo "Complete the Codex login flow in this Terminal window."
+echo "When login succeeds, return to Claude Switcher."
+echo ""
+{codex_cmd} login -c 'cli_auth_credentials_store="file"'
+status=$?
+echo ""
+if [ $status -eq 0 ]; then
+  echo "Codex login completed. You can close this window."
+else
+  echo "Codex login failed or was cancelled. You can close this window."
+fi
+echo ""
+read -k 1 "?Press any key to close..."
+exit $status
+"""
+    script_path.write_text(script, encoding="utf-8")
+    script_path.chmod(0o700)
+
+    result = subprocess.run(
+        ["open", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Could not open Terminal for Codex login.")
+
+
+def run_codex_login(timeout: int = CODEX_LOGIN_TIMEOUT_SECONDS) -> bool:
+    """Open a visible Codex login flow and wait for file credentials."""
+    _launch_codex_login_terminal()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        creds = _read_codex_credentials_from_file()
+        if creds and _codex_email_from_credentials(creds):
+            return True
+        time.sleep(2)
+    return False
 
 
 def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
@@ -229,7 +293,7 @@ def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_P
     active = get_active_account(config_path, provider="codex")
 
     if active:
-        current_creds = read_codex_credentials()
+        current_creds = _read_codex_credentials_for_import()
         if current_creds:
             keychain.write_credentials(
                 f"{CODEX_KEYCHAIN_PREFIX}{active.email}",
@@ -260,7 +324,7 @@ def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_P
 def add_new_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Add a Codex account via `codex login`."""
     active = get_active_account(config_path, provider="codex")
-    current_creds = read_codex_credentials()
+    current_creds = _read_codex_credentials_for_import()
     current_email = _codex_email_from_credentials(current_creds)
 
     if current_creds and current_email:
@@ -275,6 +339,7 @@ def add_new_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInf
         current_creds = keychain.read_credentials(f"{CODEX_KEYCHAIN_PREFIX}{active.email}")
 
     run_codex_logout()
+    _clear_codex_credentials_file()
 
     if not run_codex_login():
         if current_creds:
