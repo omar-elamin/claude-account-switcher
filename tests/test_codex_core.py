@@ -15,6 +15,7 @@ from claude_switcher.codex_core import (
     get_codex_auth_status,
     read_codex_credentials,
     import_current_codex_account,
+    normalize_codex_credentials_blob,
     run_codex_login,
     switch_codex_account,
     remove_codex_account,
@@ -69,6 +70,18 @@ class TestCodexCLI:
 
 
 class TestCodexCredentials:
+    def test_normalize_plain_json_credentials(self):
+        creds = _auth_json(email="plain@test.com")
+        assert normalize_codex_credentials_blob(creds) == creds
+
+    def test_normalize_hex_encoded_json_credentials(self):
+        creds = _auth_json(email="hex@test.com")
+        encoded = creds.encode("utf-8").hex()
+        assert normalize_codex_credentials_blob(encoded) == creds
+
+    def test_normalize_leaves_invalid_text_unchanged(self):
+        assert normalize_codex_credentials_blob("not json") == "not json"
+
     def test_read_from_auth_file(self, tmp_path):
         auth_file = tmp_path / "auth.json"
         config_file = tmp_path / "config.toml"
@@ -239,6 +252,28 @@ class TestSwitchCodexAccount:
         mock_write.assert_called_once_with('{"token": "target-token"}')
         active = [a for a in load_accounts(config) if a.provider == "codex" and a.active]
         assert active[0].email == "new@test.com"
+
+    @patch("claude_switcher.codex_core.keychain")
+    def test_switch_decodes_hex_encoded_target_credentials(self, mock_kc, tmp_path):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        target_creds = _auth_json(email="new@test.com")
+        auth_file.write_text(_auth_json(email="old@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
+            AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
+        ], config)
+        mock_kc.read_credentials.return_value = target_creds.encode("utf-8").hex()
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            switch_codex_account("new@test.com", config)
+
+        assert json.loads(auth_file.read_text(encoding="utf-8"))["tokens"]["account_id"] == "acc-123"
+        assert auth_file.read_text(encoding="utf-8") == target_creds
 
     @patch("claude_switcher.codex_core.keychain")
     def test_switch_missing_keychain_raises(self, mock_kc, tmp_path):

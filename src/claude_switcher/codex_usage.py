@@ -6,6 +6,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from claude_switcher import keychain
+from claude_switcher.codex_core import normalize_codex_credentials_blob
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 CODEX_USAGE_URLS = (
@@ -31,6 +32,7 @@ def _decode_jwt_payload(token: str) -> dict | None:
 def _extract_codex_token(creds_json: str) -> tuple[str, str] | None:
     """Extract access_token and ChatGPT account id from Codex credentials JSON."""
     try:
+        creds_json = normalize_codex_credentials_blob(creds_json) or creds_json
         data = json.loads(creds_json)
         tokens = data.get("tokens", {})
         if not isinstance(tokens, dict):
@@ -61,7 +63,7 @@ def fetch_codex_usage(creds_json: str) -> dict | None:
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("ChatGPT-Account-Id", account_id)
         req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", "claude-switcher/0.4.1")
+        req.add_header("User-Agent", "claude-switcher/0.4.2")
 
         try:
             with urlopen(req, timeout=10) as resp:

@@ -38,6 +38,11 @@ class TestExtractCodexToken:
         assert token == "sk-test-token"
         assert account_id == "acc-123"
 
+    def test_extracts_token_from_hex_encoded_structure(self):
+        token, account_id = _extract_codex_token(FAKE_CREDS_NESTED.encode("utf-8").hex())
+        assert token == "sk-test-token"
+        assert account_id == "acc-123"
+
     def test_returns_none_for_invalid_json(self):
         result = _extract_codex_token("not json")
         assert result is None

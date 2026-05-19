@@ -106,6 +106,32 @@ def _read_codex_credentials_from_file() -> str | None:
     return content or None
 
 
+def normalize_codex_credentials_blob(creds: str | None) -> str | None:
+    """Return a JSON auth blob, decoding hex-encoded Keychain output when needed."""
+    if not creds:
+        return creds
+
+    raw = creds.strip()
+    try:
+        if isinstance(json.loads(raw), dict):
+            return raw
+    except json.JSONDecodeError:
+        pass
+
+    compact = "".join(raw.split())
+    if len(compact) % 2 != 0 or not re.fullmatch(r"[0-9a-fA-F]+", compact):
+        return raw
+
+    try:
+        decoded = bytes.fromhex(compact).decode("utf-8").strip()
+        if isinstance(json.loads(decoded), dict):
+            return decoded
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return raw
+
+    return raw
+
+
 def read_codex_credentials() -> str | None:
     """Read Codex credentials from ~/.codex/auth.json."""
     store = _codex_credentials_store()
@@ -115,7 +141,7 @@ def read_codex_credentials() -> str | None:
     creds = _read_codex_credentials_from_file()
     if not creds and store == "auto":
         raise RuntimeError(CODEX_KEYRING_UNSUPPORTED_MESSAGE)
-    return creds
+    return normalize_codex_credentials_blob(creds)
 
 
 def _read_codex_credentials_for_import() -> str | None:
@@ -123,7 +149,7 @@ def _read_codex_credentials_for_import() -> str | None:
     store = _codex_credentials_store()
     if store == "keyring":
         raise RuntimeError(CODEX_KEYRING_UNSUPPORTED_MESSAGE)
-    return _read_codex_credentials_from_file()
+    return normalize_codex_credentials_blob(_read_codex_credentials_from_file())
 
 
 def _decode_jwt_payload(token: str) -> dict | None:
@@ -143,7 +169,9 @@ def _decode_jwt_payload(token: str) -> dict | None:
 def _credentials_data(creds_json: str | None = None) -> dict | None:
     try:
         raw = creds_json if creds_json is not None else read_codex_credentials()
-        return json.loads(raw) if raw else None
+        raw = normalize_codex_credentials_blob(raw)
+        data = json.loads(raw) if raw else None
+        return data if isinstance(data, dict) else None
     except (json.JSONDecodeError, RuntimeError):
         return None
 
@@ -221,6 +249,9 @@ def import_current_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> Acc
 
 def _write_codex_credentials(creds: str) -> None:
     """Write credentials back to ~/.codex/auth.json."""
+    creds = normalize_codex_credentials_blob(creds) or ""
+    if _credentials_data(creds) is None:
+        raise RuntimeError("Invalid Codex credentials; refusing to write ~/.codex/auth.json.")
     CODEX_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
     CODEX_AUTH_FILE.write_text(creds, encoding="utf-8")
     CODEX_AUTH_FILE.chmod(0o600)
