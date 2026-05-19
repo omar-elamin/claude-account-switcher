@@ -165,3 +165,46 @@ class TestRemoveSavedAccount:
         mock_kc.delete_credentials.assert_called_once_with("claude-switcher:a@test.com")
         from claude_switcher.config import load_accounts
         assert len(load_accounts(config_path)) == 0
+
+
+class TestCoreWithMixedProviders:
+    @patch("claude_switcher.core._write_oauth_account")
+    @patch("claude_switcher.core._read_oauth_account")
+    @patch("claude_switcher.core.keychain")
+    def test_switch_claude_ignores_codex_account_with_same_email(
+        self, mock_kc, mock_read_oauth, mock_write_oauth, tmp_path
+    ):
+        config_path = tmp_path / "accounts.json"
+        from claude_switcher.config import add_account, load_accounts
+
+        add_account(
+            AccountInfo("user@test.com", "pro", "", True, "claude-user", provider="claude"),
+            config_path,
+        )
+        add_account(
+            AccountInfo(
+                "other@test.com",
+                "pro",
+                "",
+                False,
+                "claude-other",
+                oauth_account={"emailAddress": "other@test.com"},
+                provider="claude",
+            ),
+            config_path,
+        )
+        add_account(
+            AccountInfo("user@test.com", "plus", "", True, "codex-user", provider="codex"),
+            config_path,
+        )
+        mock_kc.read_credentials.side_effect = ['{"token":"current"}', '{"token":"target"}']
+        mock_read_oauth.return_value = {"emailAddress": "user@test.com"}
+
+        switch_account("other@test.com", config_path)
+
+        accounts = load_accounts(config_path)
+        codex = next(a for a in accounts if a.provider == "codex")
+        claude_target = next(a for a in accounts if a.email == "other@test.com")
+        assert codex.active is True
+        assert claude_target.active is True
+        mock_write_oauth.assert_called_once_with({"emailAddress": "other@test.com"})

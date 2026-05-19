@@ -6,6 +6,7 @@ import urllib.error
 from datetime import datetime, timezone
 
 from claude_switcher import keychain
+from claude_switcher.usage_state import UsageState, UsageWindow
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
 
@@ -88,22 +89,35 @@ def _format_reset_delta(resets_at: str) -> str:
         return "?"
 
 
-def format_usage(usage: dict | None) -> str:
-    """Format usage data into a readable string."""
+def claude_usage_state(usage: dict | None) -> UsageState:
+    """Convert Claude usage data into a normalized usage state."""
     if not usage:
-        return "Usage indisponible"
+        return UsageState(available=False, display="Usage indisponible")
 
     parts = []
+    windows = []
     five_h = usage.get("five_hour", {})
     seven_d = usage.get("seven_day", {})
 
-    if "utilization" in five_h:
-        pct = f"{five_h['utilization']:.0f}%"
-        reset = f" ({_format_reset_delta(five_h['resets_at'])})" if "resets_at" in five_h else ""
-        parts.append(f"5h {pct}{reset}")
-    if "utilization" in seven_d:
-        pct = f"{seven_d['utilization']:.0f}%"
-        reset = f" ({_format_reset_delta(seven_d['resets_at'])})" if "resets_at" in seven_d else ""
-        parts.append(f"7j {pct}{reset}")
+    for label, window in (("5h", five_h), ("7j", seven_d)):
+        if not isinstance(window, dict) or "utilization" not in window:
+            continue
+        try:
+            percent = float(window["utilization"])
+        except (TypeError, ValueError):
+            continue
 
-    return " | ".join(parts) if parts else "Usage indisponible"
+        reset = _format_reset_delta(window["resets_at"]) if "resets_at" in window else None
+        reset_suffix = f" ({reset})" if reset else ""
+        parts.append(f"{label} {percent:.0f}%{reset_suffix}")
+        windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
+
+    if not parts:
+        return UsageState(available=False, display="Usage indisponible")
+
+    return UsageState(available=True, display=" | ".join(parts), windows=tuple(windows))
+
+
+def format_usage(usage: dict | None) -> str:
+    """Format usage data into a readable string."""
+    return claude_usage_state(usage).display

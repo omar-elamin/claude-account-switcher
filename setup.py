@@ -21,14 +21,15 @@ OPTIONS = {
         "CFBundleName": "Claude Switcher",
         "CFBundleDisplayName": "Claude Switcher",
         "CFBundleIdentifier": "com.emilejouannet.claude-switcher",
-        "CFBundleVersion": "0.3.6",
-        "CFBundleShortVersionString": "0.3.6",
+        "CFBundleVersion": "0.4.0",
+        "CFBundleShortVersionString": "0.4.0",
         "LSUIElement": True,
         "LSMinimumSystemVersion": "12.0",
     },
     # Include our package + rumps and its dependencies
     "packages": ["claude_switcher", "rumps"],
     "includes": ["objc", "Foundation", "AppKit"],
+    "excludes": ["pytest", "_pytest", "pygments", "iniconfig", "pluggy", "setuptools.tests"],
     "resources": ["src/claude_switcher/resources"],
 }
 

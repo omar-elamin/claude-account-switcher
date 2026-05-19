@@ -2,7 +2,12 @@ import json
 import subprocess
 from unittest.mock import patch, MagicMock
 
-from claude_switcher.keychain import read_credentials, write_credentials, delete_credentials
+from claude_switcher.keychain import (
+    KEYCHAIN_TIMEOUT_SECONDS,
+    read_credentials,
+    write_credentials,
+    delete_credentials,
+)
 
 FAKE_CREDS = json.dumps({"accessToken": "sk-ant-oat01-xxx", "refreshToken": "sk-ant-ort01-xxx"})
 
@@ -17,6 +22,7 @@ class TestReadCredentials:
             ["security", "find-generic-password", "-s", "claude-switcher:emile@gmail.com", "-w"],
             capture_output=True,
             text=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
         )
 
     @patch("claude_switcher.keychain.subprocess.run")
@@ -41,7 +47,9 @@ class TestWriteCredentials:
         # Verify delete calls
         mock_run.assert_any_call(
             ["security", "delete-generic-password", "-s", "claude-switcher:emile@gmail.com"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
         )
         # Verify add call
         mock_run.assert_any_call(
@@ -53,6 +61,7 @@ class TestWriteCredentials:
             ],
             capture_output=True,
             text=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
         )
 
     @patch("claude_switcher.keychain.subprocess.run")

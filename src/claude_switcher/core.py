@@ -144,9 +144,10 @@ def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountIn
         active=True,
         keychain_account=acct_attr,
         oauth_account=oauth_account,
+        provider="claude",
     )
     add_account(account, config_path)
-    set_active_account(email, config_path)
+    set_active_account(email, config_path, provider="claude")
     return account
 
 
@@ -172,7 +173,9 @@ def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -
         raise RuntimeError(f"Credentials not found in Keychain for {target_email}")
 
     accounts = load_accounts(config_path)
-    target_account = next((a for a in accounts if a.email == target_email), None)
+    target_account = next(
+        (a for a in accounts if a.email == target_email and a.provider == "claude"), None
+    )
     if not target_account:
         raise RuntimeError(f"Account {target_email} not found in config")
 
@@ -182,7 +185,7 @@ def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -
     if target_account.oauth_account:
         _write_oauth_account(target_account.oauth_account)
 
-    set_active_account(target_email, config_path)
+    set_active_account(target_email, config_path, provider="claude")
 
 
 def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:

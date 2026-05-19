@@ -4,7 +4,13 @@ import json
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 
-from claude_switcher.usage import _extract_token, _format_reset_delta, format_usage, fetch_usage_for_account
+from claude_switcher.usage import (
+    _extract_token,
+    _format_reset_delta,
+    format_usage,
+    fetch_usage_for_account,
+    claude_usage_state,
+)
 
 
 class TestExtractToken:
@@ -68,6 +74,24 @@ class TestFormatUsage:
 
     def test_returns_unavailable_for_empty(self):
         assert format_usage({}) == "Usage indisponible"
+
+    def test_usage_state_marks_exhausted_at_100(self):
+        usage = {
+            "five_hour": {"utilization": 100.0},
+            "seven_day": {"utilization": 12.0},
+        }
+        state = claude_usage_state(usage)
+        assert state.available is True
+        assert state.is_exhausted() is True
+        assert state.max_percent == 100.0
+
+    def test_usage_state_does_not_mark_99_9_exhausted(self):
+        state = claude_usage_state({"five_hour": {"utilization": 99.9}})
+        assert state.is_exhausted() is False
+
+    def test_usage_state_unavailable_without_windows(self):
+        state = claude_usage_state({"five_hour": {}, "seven_day": {}})
+        assert state.available is False
 
 
 class TestFetchUsageForAccount:
