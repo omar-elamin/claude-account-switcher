@@ -484,10 +484,20 @@ class ClaudeSwitcherApp(rumps.App):
             )
             return
 
-        if provider == "claude":
-            remove_saved_account(email, self.config_path)
-        else:
-            remove_codex_account(email, self.config_path)
+        try:
+            if provider == "claude":
+                remove_saved_account(email, self.config_path)
+            elif not remove_codex_account(email, self.config_path):
+                rumps.alert(
+                    title="Account busy",
+                    message="The Codex account changed or is busy. Please try again in a moment.",
+                )
+                self._rebuild_menu()
+                return
+        except RuntimeError as exc:
+            rumps.alert(title="Account busy", message=str(exc))
+            self._rebuild_menu()
+            return
         rumps.notification(
             title="Claude Switcher",
             subtitle=f"{PROVIDER_LABELS[provider]} account removed",

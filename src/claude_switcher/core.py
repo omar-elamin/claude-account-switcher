@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from claude_switcher.config import (
     load_accounts,
     remove_account,
     set_active_account,
+    _atomic_write,
     DEFAULT_CONFIG_PATH,
 )
 
@@ -22,6 +24,8 @@ CLAUDE_SERVICE = keychain.CLAUDE_SERVICE
 CLAUDE_STATE_FILE = Path.home() / ".claude.json"
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_CLAUDE_LOCK = threading.Lock()
+_add_in_progress = False
 
 
 def _validate_email(email: str) -> str:
@@ -47,7 +51,7 @@ def _write_oauth_account(oauth_account: dict) -> None:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return
     data["oauthAccount"] = oauth_account
-    CLAUDE_STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    _atomic_write(CLAUDE_STATE_FILE, json.dumps(data))
 
 
 _EXTRA_PATHS = [
@@ -153,79 +157,105 @@ def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountIn
 
 def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Switch to a different account. Saves current credentials first."""
-    active = get_active_account(config_path)
+    with _CLAUDE_LOCK:
+        if _add_in_progress:
+            raise RuntimeError("A Claude account add is in progress. Try again in a moment.")
 
-    if active:
-        current_creds = keychain.read_credentials(CLAUDE_SERVICE)
-        if current_creds:
-            keychain.write_credentials(
-                f"claude-switcher:{active.email}", active.keychain_account, current_creds
-            )
-        # Save current oauthAccount state from ~/.claude.json
-        current_oauth = _read_oauth_account()
-        if current_oauth:
-            active.oauth_account = current_oauth
-            add_account(active, config_path)
+        active = get_active_account(config_path)
 
-    _validate_email(target_email)
-    target_creds = keychain.read_credentials(f"claude-switcher:{target_email}")
-    if not target_creds:
-        raise RuntimeError(f"Credentials not found in Keychain for {target_email}")
+        if active:
+            current_creds = keychain.read_credentials(CLAUDE_SERVICE)
+            if current_creds:
+                keychain.write_credentials(
+                    f"claude-switcher:{active.email}", active.keychain_account, current_creds
+                )
+            # Save current oauthAccount state from ~/.claude.json
+            current_oauth = _read_oauth_account()
+            if current_oauth:
+                active.oauth_account = current_oauth
+                add_account(active, config_path)
 
-    accounts = load_accounts(config_path)
-    target_account = next(
-        (a for a in accounts if a.email == target_email and a.provider == "claude"), None
-    )
-    if not target_account:
-        raise RuntimeError(f"Account {target_email} not found in config")
+        _validate_email(target_email)
+        target_creds = keychain.read_credentials(f"claude-switcher:{target_email}")
+        if not target_creds:
+            raise RuntimeError(f"Credentials not found in Keychain for {target_email}")
 
-    keychain.write_credentials(CLAUDE_SERVICE, target_account.keychain_account, target_creds)
+        accounts = load_accounts(config_path)
+        target_account = next(
+            (a for a in accounts if a.email == target_email and a.provider == "claude"), None
+        )
+        if not target_account:
+            raise RuntimeError(f"Account {target_email} not found in config")
 
-    # Restore target's oauthAccount into ~/.claude.json
-    if target_account.oauth_account:
-        _write_oauth_account(target_account.oauth_account)
+        keychain.write_credentials(CLAUDE_SERVICE, target_account.keychain_account, target_creds)
 
-    set_active_account(target_email, config_path, provider="claude")
+        # Restore target's oauthAccount into ~/.claude.json
+        if target_account.oauth_account:
+            _write_oauth_account(target_account.oauth_account)
+
+        set_active_account(target_email, config_path, provider="claude")
 
 
 def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Add a new account via claude auth login. Returns AccountInfo or None if cancelled."""
-    active = get_active_account(config_path)
-    if active:
-        current_creds = keychain.read_credentials(CLAUDE_SERVICE)
-        if current_creds:
-            keychain.write_credentials(
-                f"claude-switcher:{active.email}", active.keychain_account, current_creds
-            )
-
-    run_auth_logout()
-
-    # Ensure all "Claude Code-credentials" entries are gone before login.
-    # claude auth logout may not clean up the Keychain properly, and leftover
-    # entries cause security find-generic-password -w to return the OLD token
-    # instead of the freshly-issued one after login.
-    while keychain.delete_credentials(CLAUDE_SERVICE):
-        pass
-
-    if not run_auth_login():
-        if active:
-            prev_creds = keychain.read_credentials(f"claude-switcher:{active.email}")
-            if prev_creds:
-                keychain.write_credentials(CLAUDE_SERVICE, active.keychain_account, prev_creds)
-        return None
+    global _add_in_progress
+    with _CLAUDE_LOCK:
+        if _add_in_progress:
+            raise RuntimeError("A Claude account add is already in progress.")
+        _add_in_progress = True
 
     try:
-        return import_current_account(config_path)
-    except Exception:
-        # Login succeeded but import failed — restore previous account
-        if active:
-            prev_creds = keychain.read_credentials(f"claude-switcher:{active.email}")
-            if prev_creds:
-                keychain.write_credentials(CLAUDE_SERVICE, active.keychain_account, prev_creds)
-        return None
+        active = get_active_account(config_path)
+        snapshot = keychain.snapshot_credentials(CLAUDE_SERVICE)
+        if snapshot is not None:
+            keychain._single_line(snapshot[1])
+        if active and snapshot is not None:
+            keychain.write_credentials(
+                f"claude-switcher:{active.email}", snapshot[0], snapshot[1]
+            )
+
+        result = None
+        try:
+            run_auth_logout()
+
+            # Leftover entries can make the login poll accept the old token.
+            while keychain.delete_credentials(CLAUDE_SERVICE):
+                pass
+
+            if run_auth_login():
+                result = import_current_account(config_path)
+        except BaseException as original:
+            if snapshot is not None:
+                try:
+                    keychain.restore_credentials(CLAUDE_SERVICE, snapshot)
+                except BaseException as restore_error:
+                    raise original from restore_error
+            raise
+
+        if result is None and snapshot is not None:
+            keychain.restore_credentials(CLAUDE_SERVICE, snapshot)
+        return result
+    finally:
+        with _CLAUDE_LOCK:
+            _add_in_progress = False
 
 
 def remove_saved_account(email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Remove a saved account from config and Keychain."""
-    keychain.delete_credentials(f"claude-switcher:{email}")
-    remove_account(email, config_path)
+    with _CLAUDE_LOCK:
+        if _add_in_progress:
+            raise RuntimeError("A Claude account add is in progress. Try again in a moment.")
+        service = f"claude-switcher:{email}"
+        snapshot = keychain.snapshot_credentials(service)
+        if snapshot is not None:
+            keychain._single_line(snapshot[1])
+        try:
+            keychain.delete_credentials(service)
+            remove_account(email, config_path)
+        except BaseException as original:
+            if snapshot is not None:
+                try:
+                    keychain.restore_credentials(service, snapshot)
+                except BaseException as restore_error:
+                    raise original from restore_error
+            raise

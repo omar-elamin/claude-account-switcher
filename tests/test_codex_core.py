@@ -2,6 +2,7 @@
 
 import base64
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -106,6 +107,21 @@ class TestCodexCredentials:
             codex_core_mod, "CODEX_CONFIG_FILE", config_file
         ):
             assert read_codex_credentials() is None
+
+    @patch("claude_switcher.codex_core.keychain")
+    def test_backup_writes_valid_credentials_exactly_once(self, mock_kc):
+        creds = _auth_json(email="backup@test.com")
+
+        assert codex_core_mod.backup_codex_credentials(creds) == "backup@test.com"
+
+        mock_kc.write_credentials.assert_called_once_with(
+            "codex-switcher:backup@test.com", "backup@test.com", creds
+        )
+
+    @patch("claude_switcher.codex_core.keychain")
+    def test_backup_without_extractable_email_is_noop(self, mock_kc):
+        assert codex_core_mod.backup_codex_credentials('{"tokens": {}}') is None
+        mock_kc.write_credentials.assert_not_called()
 
     def test_keyring_mode_raises_clear_error(self, tmp_path):
         config_file = tmp_path / "config.toml"
@@ -238,12 +254,11 @@ class TestCodexLogin:
         mock_logout.assert_called_once()
         mock_login.assert_called_once()
 
-    @patch("claude_switcher.codex_core._write_codex_credentials")
     @patch("claude_switcher.codex_core.run_codex_login")
     @patch("claude_switcher.codex_core.run_codex_logout")
     @patch("claude_switcher.codex_core.keychain")
     def test_add_new_account_restores_saved_creds_when_cancelled(
-        self, mock_kc, mock_logout, mock_login, mock_write, tmp_path
+        self, mock_kc, mock_logout, mock_login, tmp_path
     ):
         config = tmp_path / "accounts.json"
         config_file = tmp_path / "config.toml"
@@ -261,7 +276,73 @@ class TestCodexLogin:
             result = add_new_codex_account(config)
 
         assert result is None
-        mock_write.assert_called_once_with(_auth_json(email="old@test.com"))
+        assert auth_file.read_text(encoding="utf-8") == _auth_json(email="old@test.com")
+
+    def test_failed_auth_file_unlink_aborts_before_login_poll(self, tmp_path):
+        config = tmp_path / "accounts.json"
+        config_file = tmp_path / "config.toml"
+        auth_file = tmp_path / "auth.json"
+        current = _auth_json(email="old@test.com")
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        auth_file.write_text(current)
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old@test.com", provider="codex")
+        ], config)
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ), patch.object(codex_core_mod, "keychain"), patch.object(
+            codex_core_mod, "run_codex_logout"
+        ), patch.object(codex_core_mod, "run_codex_login") as mock_login, patch.object(
+            Path, "unlink", side_effect=PermissionError("unlink denied")
+        ):
+            with pytest.raises(PermissionError, match="unlink denied"):
+                add_new_codex_account(config)
+
+        mock_login.assert_not_called()
+
+    def test_add_lease_refuses_overlapping_switch(self, tmp_path):
+        config = tmp_path / "accounts.json"
+        config_file = tmp_path / "config.toml"
+        auth_file = tmp_path / "auth.json"
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("target@test.com", "plus", "", False, "target", provider="codex")
+        ], config)
+        login_started = threading.Event()
+        release_login = threading.Event()
+        errors = []
+
+        def blocked_login():
+            login_started.set()
+            assert release_login.wait(timeout=2)
+            return False
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ), patch.object(codex_core_mod, "run_codex_logout"), patch.object(
+            codex_core_mod, "run_codex_login", side_effect=blocked_login
+        ), patch.object(codex_core_mod, "keychain") as mock_kc:
+            mock_kc.read_credentials.return_value = _auth_json(email="target@test.com")
+
+            def add_in_thread():
+                try:
+                    add_new_codex_account(config)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=add_in_thread)
+            thread.start()
+            assert login_started.wait(timeout=2)
+
+            with pytest.raises(RuntimeError, match="add.*progress"):
+                switch_codex_account("target@test.com", config)
+
+            release_login.set()
+            thread.join(timeout=2)
+
+        assert not errors
+        assert not thread.is_alive()
 
 
 class TestSwitchCodexAccount:
@@ -341,8 +422,11 @@ class TestSwitchCodexAccount:
 
         mock_write.assert_not_called()
 
+    @patch("claude_switcher.codex_core.refresh_codex_credentials", return_value=None)
     @patch("claude_switcher.codex_core.keychain")
-    def test_switch_decodes_hex_encoded_target_credentials(self, mock_kc, tmp_path):
+    def test_switch_decodes_hex_encoded_target_credentials(
+        self, mock_kc, mock_refresh, tmp_path
+    ):
         config = tmp_path / "accounts.json"
         auth_file = tmp_path / "auth.json"
         config_file = tmp_path / "config.toml"
@@ -372,6 +456,105 @@ class TestSwitchCodexAccount:
         with pytest.raises(RuntimeError, match="Credentials not found"):
             switch_codex_account("new@test.com", config)
 
+    def test_concurrent_config_add_survives_switch_commit(self, tmp_path):
+        from claude_switcher.config import add_account
+
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        auth_file.write_text(_auth_json(email="old@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
+            AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
+        ], config)
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+        errors = []
+
+        def blocked_refresh(creds):
+            refresh_started.set()
+            assert release_refresh.wait(timeout=2)
+            return None
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ), patch.object(codex_core_mod, "keychain") as mock_kc, patch.object(
+            codex_core_mod, "refresh_codex_credentials", side_effect=blocked_refresh
+        ):
+            mock_kc.read_credentials.return_value = _auth_json(email="new@test.com")
+
+            def switch_in_thread():
+                try:
+                    switch_codex_account("new@test.com", config)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=switch_in_thread)
+            thread.start()
+            assert refresh_started.wait(timeout=2)
+            add_account(
+                AccountInfo("added@test.com", "pro", "", False, "added"), config
+            )
+            release_refresh.set()
+            thread.join(timeout=2)
+
+        assert not errors
+        assert not thread.is_alive()
+        assert {account.email for account in load_accounts(config)} == {
+            "old@test.com", "new@test.com", "added@test.com"
+        }
+
+    def test_target_removed_during_refresh_aborts_without_recreating_backup(self, tmp_path):
+        from claude_switcher.config import remove_account
+
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        old_creds = _auth_json(email="old@test.com")
+        auth_file.write_text(old_creds)
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
+            AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
+        ], config)
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+        errors = []
+
+        def blocked_refresh(creds):
+            refresh_started.set()
+            assert release_refresh.wait(timeout=2)
+            return _auth_json(email="new@test.com", plan="pro")
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ), patch.object(codex_core_mod, "keychain") as mock_kc, patch.object(
+            codex_core_mod, "refresh_codex_credentials", side_effect=blocked_refresh
+        ):
+            mock_kc.read_credentials.return_value = _auth_json(email="new@test.com")
+
+            def switch_in_thread():
+                try:
+                    switch_codex_account("new@test.com", config)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=switch_in_thread)
+            thread.start()
+            assert refresh_started.wait(timeout=2)
+            remove_account("new@test.com", config, provider="codex")
+            release_refresh.set()
+            thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert errors and "not found" in str(errors[0]).lower()
+        assert auth_file.read_text() == old_creds
+        assert not any(
+            call.args and call.args[0] == "codex-switcher:new@test.com"
+            for call in mock_kc.write_credentials.call_args_list
+        )
+
 
 class TestRemoveCodexAccount:
     @patch("claude_switcher.codex_core.keychain")
@@ -379,7 +562,101 @@ class TestRemoveCodexAccount:
         config = tmp_path / "accounts.json"
         save_accounts([AccountInfo("rm@test.com", "plus", "", False, "rm", provider="codex")], config)
 
-        remove_codex_account("rm@test.com", config)
+        assert remove_codex_account("rm@test.com", config) is True
 
         mock_kc.delete_credentials.assert_called_with("codex-switcher:rm@test.com")
         assert load_accounts(config) == []
+
+    @patch("claude_switcher.codex_core.remove_account", side_effect=OSError("config failed"))
+    @patch("claude_switcher.codex_core.keychain")
+    def test_remove_restores_snapshot_when_config_update_fails(
+        self, mock_kc, mock_remove, tmp_path
+    ):
+        config = tmp_path / "accounts.json"
+        save_accounts([
+            AccountInfo("rm@test.com", "plus", "", False, "rm", provider="codex")
+        ], config)
+        snapshot = ("rm", "saved-password")
+        mock_kc.snapshot_credentials.return_value = snapshot
+        mock_kc._single_line.side_effect = lambda value: value
+
+        with pytest.raises(OSError, match="config failed"):
+            remove_codex_account("rm@test.com", config)
+
+        mock_kc.restore_credentials.assert_called_once_with(
+            "codex-switcher:rm@test.com", snapshot
+        )
+
+    @patch("claude_switcher.codex_core.keychain")
+    def test_removal_refuses_if_target_became_active(self, mock_kc, tmp_path):
+        config = tmp_path / "accounts.json"
+        save_accounts([
+            AccountInfo("active@test.com", "plus", "", True, "active", provider="codex")
+        ], config)
+
+        assert remove_codex_account("active@test.com", config) is False
+        mock_kc.delete_credentials.assert_not_called()
+        assert load_accounts(config)[0].active is True
+
+    @patch("claude_switcher.codex_core.keychain")
+    def test_main_thread_removal_returns_busy_when_codex_lock_is_held(self, mock_kc, tmp_path):
+        config = tmp_path / "accounts.json"
+        save_accounts([
+            AccountInfo("idle@test.com", "plus", "", False, "idle", provider="codex")
+        ], config)
+        assert codex_core_mod._CODEX_LOCK.acquire(blocking=False)
+        try:
+            assert remove_codex_account("idle@test.com", config) is False
+        finally:
+            codex_core_mod._CODEX_LOCK.release()
+
+        mock_kc.delete_credentials.assert_not_called()
+        assert load_accounts(config)[0].email == "idle@test.com"
+
+    def test_removal_during_switch_is_refused_and_completed_switch_stays_valid(self, tmp_path):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        auth_file.write_text(_auth_json(email="old@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
+            AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
+        ], config)
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+        errors = []
+
+        def blocked_refresh(creds):
+            refresh_started.set()
+            assert release_refresh.wait(timeout=2)
+            return None
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ), patch.object(codex_core_mod, "keychain") as mock_kc, patch.object(
+            codex_core_mod, "refresh_codex_credentials", side_effect=blocked_refresh
+        ):
+            mock_kc.read_credentials.return_value = _auth_json(email="new@test.com")
+
+            def switch_in_thread():
+                try:
+                    switch_codex_account("new@test.com", config)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=switch_in_thread)
+            thread.start()
+            assert refresh_started.wait(timeout=2)
+            assert remove_codex_account("new@test.com", config) is False
+            release_refresh.set()
+            thread.join(timeout=2)
+
+        assert not errors
+        assert not thread.is_alive()
+        active = next(account for account in load_accounts(config) if account.active)
+        assert active.email == "new@test.com"
+        assert any(
+            call.args and call.args[0] == "codex-switcher:new@test.com"
+            for call in mock_kc.read_credentials.call_args_list
+        )

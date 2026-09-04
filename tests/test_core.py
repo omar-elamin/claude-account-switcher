@@ -1,12 +1,14 @@
 import json
+import threading
 from unittest.mock import patch, MagicMock
-from pathlib import Path
+
+import pytest
+
+import claude_switcher.core as core_mod
 
 from claude_switcher.core import (
     check_claude_cli,
     get_auth_status,
-    run_auth_logout,
-    run_auth_login,
     import_current_account,
     switch_account,
     add_new_account,
@@ -124,10 +126,9 @@ class TestAddNewAccount:
         from claude_switcher.config import add_account, AccountInfo
         add_account(AccountInfo("a@test.com", "pro", "Org A", True, "usera"), config_path)
 
-        mock_kc.read_credentials.side_effect = [
-            '{"accessToken":"tok-a"}',
-            '{"accessToken":"tok-new"}',
-        ]
+        mock_kc.snapshot_credentials.return_value = ("usera", '{"accessToken":"tok-a"}')
+        mock_kc._single_line.side_effect = lambda value: value
+        mock_kc.read_credentials.return_value = '{"accessToken":"tok-new"}'
         mock_kc.read_account_attribute.side_effect = ["newuser"]
         mock_kc.delete_credentials.return_value = False
         mock_login.return_value = True
@@ -145,12 +146,165 @@ class TestAddNewAccount:
     @patch("claude_switcher.core.keychain")
     def test_add_account_login_cancelled(self, mock_kc, mock_logout, mock_login, tmp_path):
         config_path = tmp_path / "accounts.json"
-        mock_kc.read_credentials.return_value = None
+        mock_kc.snapshot_credentials.return_value = None
         mock_kc.delete_credentials.return_value = False
         mock_login.return_value = False
 
         result = add_new_account(config_path)
         assert result is None
+
+    def test_cancelled_add_without_active_config_restores_live_snapshot(self, tmp_path):
+        snapshot = ("live-account", '{"accessToken":"live"}')
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ), patch.object(core_mod, "run_auth_login", return_value=False):
+            mock_kc.snapshot_credentials.return_value = snapshot
+            mock_kc._single_line.side_effect = lambda value: value
+            mock_kc.delete_credentials.return_value = False
+
+            assert add_new_account(tmp_path / "accounts.json") is None
+
+        mock_kc.restore_credentials.assert_called_once_with(
+            core_mod.CLAUDE_SERVICE, snapshot
+        )
+
+    @pytest.mark.parametrize("outcome", ["login-false", "import-none", "import-raises"])
+    def test_all_failed_add_outcomes_restore_exact_live_pair(self, tmp_path, outcome):
+        from claude_switcher.config import add_account
+
+        config_path = tmp_path / "accounts.json"
+        add_account(
+            AccountInfo("old@test.com", "pro", "", True, "config-account"),
+            config_path,
+        )
+        snapshot = ("live-account", '{"accessToken":"live"}')
+
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ), patch.object(core_mod, "run_auth_login") as mock_login, patch.object(
+            core_mod, "import_current_account"
+        ) as mock_import:
+            mock_kc.snapshot_credentials.return_value = snapshot
+            mock_kc._single_line.side_effect = lambda value: value
+            mock_kc.delete_credentials.return_value = False
+            mock_login.return_value = outcome != "login-false"
+            if outcome == "import-none":
+                mock_import.return_value = None
+            elif outcome == "import-raises":
+                mock_import.side_effect = RuntimeError("import failed")
+
+            if outcome == "import-raises":
+                with pytest.raises(RuntimeError, match="import failed"):
+                    add_new_account(config_path)
+            else:
+                assert add_new_account(config_path) is None
+
+        mock_kc.write_credentials.assert_called_once_with(
+            "claude-switcher:old@test.com", "live-account", snapshot[1]
+        )
+        mock_kc.restore_credentials.assert_called_once_with(
+            core_mod.CLAUDE_SERVICE, snapshot
+        )
+        mock_kc.read_credentials.assert_not_called()
+
+    def test_login_exception_after_delete_restores_snapshot(self, tmp_path):
+        snapshot = ("live-account", "live-password")
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ), patch.object(
+            core_mod, "run_auth_login", side_effect=PermissionError("claude denied")
+        ):
+            mock_kc.snapshot_credentials.return_value = snapshot
+            mock_kc._single_line.side_effect = lambda value: value
+            mock_kc.delete_credentials.return_value = False
+
+            with pytest.raises(PermissionError, match="claude denied"):
+                add_new_account(tmp_path / "accounts.json")
+
+        mock_kc.restore_credentials.assert_called_once_with(
+            core_mod.CLAUDE_SERVICE, snapshot
+        )
+
+    def test_unrestorable_live_value_aborts_before_logout(self, tmp_path):
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ) as mock_logout:
+            mock_kc.snapshot_credentials.return_value = ("live", "first\nsecond")
+            mock_kc._single_line.side_effect = ValueError("must be single-line JSON")
+
+            with pytest.raises(ValueError, match="single-line"):
+                add_new_account(tmp_path / "accounts.json")
+
+        mock_logout.assert_not_called()
+        mock_kc.delete_credentials.assert_not_called()
+
+    def test_restore_failure_re_raises_original_add_exception(self, tmp_path):
+        original = PermissionError("login binary denied")
+        restore_error = RuntimeError("restore failed")
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ), patch.object(core_mod, "run_auth_login", side_effect=original):
+            mock_kc.snapshot_credentials.return_value = ("live", "password")
+            mock_kc._single_line.side_effect = lambda value: value
+            mock_kc.delete_credentials.return_value = False
+            mock_kc.restore_credentials.side_effect = restore_error
+
+            with pytest.raises(PermissionError, match="login binary denied") as caught:
+                add_new_account(tmp_path / "accounts.json")
+
+        assert caught.value is original
+        assert caught.value.__cause__ is restore_error
+
+    def test_claude_add_lease_refuses_switch_and_removal(self, tmp_path):
+        from claude_switcher.config import add_account, load_accounts
+
+        config_path = tmp_path / "accounts.json"
+        add_account(AccountInfo("a@test.com", "pro", "", True, "a"), config_path)
+        add_account(AccountInfo("b@test.com", "pro", "", False, "b"), config_path)
+        login_started = threading.Event()
+        release_login = threading.Event()
+        errors = []
+
+        def blocked_login():
+            login_started.set()
+            assert release_login.wait(timeout=2)
+            return False
+
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ), patch.object(core_mod, "run_auth_login", side_effect=blocked_login):
+            snapshot = ("live-a", "password-a")
+            mock_kc.snapshot_credentials.return_value = snapshot
+            mock_kc._single_line.side_effect = lambda value: value
+            mock_kc.delete_credentials.return_value = False
+
+            def add_in_thread():
+                try:
+                    add_new_account(config_path)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=add_in_thread)
+            thread.start()
+            assert login_started.wait(timeout=2)
+
+            with pytest.raises(RuntimeError, match="add.*progress"):
+                switch_account("b@test.com", config_path)
+            with pytest.raises(RuntimeError, match="add.*progress"):
+                remove_saved_account("b@test.com", config_path)
+
+            release_login.set()
+            thread.join(timeout=2)
+
+        assert not errors
+        assert not thread.is_alive()
+        assert core_mod.get_active_account(config_path).email == "a@test.com"
+        assert {account.email for account in load_accounts(config_path)} == {
+            "a@test.com", "b@test.com"
+        }
+        mock_kc.restore_credentials.assert_called_once_with(
+            core_mod.CLAUDE_SERVICE, snapshot
+        )
 
 
 class TestRemoveSavedAccount:
@@ -165,6 +319,22 @@ class TestRemoveSavedAccount:
         mock_kc.delete_credentials.assert_called_once_with("claude-switcher:a@test.com")
         from claude_switcher.config import load_accounts
         assert len(load_accounts(config_path)) == 0
+
+    @patch("claude_switcher.core.remove_account", side_effect=OSError("config write failed"))
+    @patch("claude_switcher.core.keychain")
+    def test_remove_restores_snapshot_when_config_update_fails(
+        self, mock_kc, mock_remove, tmp_path
+    ):
+        snapshot = ("saved-account", "saved-password")
+        mock_kc.snapshot_credentials.return_value = snapshot
+        mock_kc._single_line.side_effect = lambda value: value
+
+        with pytest.raises(OSError, match="config write failed"):
+            remove_saved_account("a@test.com", tmp_path / "accounts.json")
+
+        mock_kc.restore_credentials.assert_called_once_with(
+            "claude-switcher:a@test.com", snapshot
+        )
 
 
 class TestCoreWithMixedProviders:
