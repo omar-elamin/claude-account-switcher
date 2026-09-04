@@ -18,17 +18,61 @@ rm -rf build dist
 python3 setup.py py2app
 
 APP="dist/Claude Switcher.app"
-FFI=$(python3 - <<'PY'
-import glob, sys, os
-base = sys.base_prefix
-c = glob.glob(os.path.join(base, "lib", "libffi.8.dylib"))
-print(c[0] if c else "")
-PY
-)
-if [ -n "$FFI" ] && [ ! -f "$APP/Contents/Frameworks/libffi.8.dylib" ]; then
-    cp "$FFI" "$APP/Contents/Frameworks/libffi.8.dylib"   # step 2: vendor libffi
-    chmod u+w "$APP/Contents/Frameworks/libffi.8.dylib"
-fi
-codesign --force --deep -s - "$APP"       # re-sign ad-hoc after the edit
+
+# py2app bundles the C-extension .so files (libffi-backed _ctypes, _ssl, _hashlib,
+# ...) but does not always vendor the @rpath dylibs they link against. Find every
+# such dylib the bundle's .so files need and copy it from the interpreter's lib
+# dir into Contents/Frameworks, where @rpath resolves. Without this the app fails
+# at launch (libffi) or loses HTTPS/ssl at runtime (libssl/libcrypto).
+python3 - "$APP" <<'PYV'
+import os, sys, glob, subprocess, shutil
+app = sys.argv[1]
+libdir = os.path.join(sys.base_prefix, "lib")
+fw = os.path.join(app, "Contents", "Frameworks")
+os.makedirs(fw, exist_ok=True)
+
+def rpath_deps(binary):
+    out = subprocess.run(["otool", "-L", binary], capture_output=True, text=True).stdout
+    deps = []
+    for line in out.splitlines()[1:]:
+        ref = line.strip().split(" ")[0]
+        if ref.startswith("@rpath/"):
+            deps.append(ref.split("/", 1)[1])
+    return deps
+
+pending = set()
+for so in glob.glob(os.path.join(app, "**", "*.so"), recursive=True) + \
+          glob.glob(os.path.join(fw, "*.dylib")):
+    for dep in rpath_deps(so):
+        pending.add(dep)
+
+copied, missing = [], []
+seen = set()
+while pending:
+    name = pending.pop()
+    if name in seen:
+        continue
+    seen.add(name)
+    dst = os.path.join(fw, name)
+    if os.path.exists(dst):
+        for d in rpath_deps(dst):
+            pending.add(d)
+        continue
+    src = os.path.join(libdir, name)
+    if os.path.exists(src):
+        shutil.copy(src, dst)
+        os.chmod(dst, 0o644)
+        copied.append(name)
+        for d in rpath_deps(dst):   # transitive deps (libssl -> libcrypto)
+            pending.add(d)
+    else:
+        missing.append(name)
+
+print("vendored dylibs:", copied or "(none needed)")
+if missing:
+    print("WARNING: could not find:", missing)
+PYV
+
+codesign --force --deep -s - "$APP"       # re-sign ad-hoc after vendoring
 
 echo "Built: $APP"
