@@ -49,6 +49,28 @@ PROVIDER_LABELS = {
 }
 AUTO_SWITCH_COOLDOWN_SECONDS = 60
 
+# When a usage refresh comes back unavailable (e.g. the first fetch races a macOS
+# Keychain-access prompt, which blocks `security` past its timeout), retry a few
+# times on a short delay instead of leaving stale text until the 300s timer.
+QUICK_RETRY_BUDGET = 3
+QUICK_RETRY_DELAY_SECONDS = 6
+
+
+def _plan_quick_retry(states, retries_left):
+    """Decide whether to schedule a quick usage retry.
+
+    Returns (should_retry, new_retries_left). Retry while any usage window is
+    unavailable and budget remains; refill the budget once everything is
+    available so a later transient failure gets a fresh set of quick retries.
+    A missing state (None) counts as unavailable.
+    """
+    any_unavailable = any(state is None or not state.available for state in states)
+    if not any_unavailable:
+        return False, QUICK_RETRY_BUDGET
+    if retries_left <= 0:
+        return False, 0
+    return True, retries_left - 1
+
 
 def _on_main_thread(fn):
     """Schedule fn() to run on the main thread via Cocoa's operation queue."""
@@ -66,6 +88,8 @@ class ClaudeSwitcherApp(rumps.App):
         self._last_auto_switch_attempt: dict[str, float] = {}
         self._refresh_in_progress = False
         self._switch_in_progress: set[str] = set()
+        self._quick_retries_left = QUICK_RETRY_BUDGET
+        self._quick_retry_timer: threading.Timer | None = None
         self._first_launch()
         self._rebuild_menu()
         self._fetch_all_usage()
@@ -357,17 +381,44 @@ class ClaudeSwitcherApp(rumps.App):
             finally:
                 def _finish():
                     self._refresh_in_progress = False
-                    if any(result["status"] == "switched" for result in auto_switch_results):
+                    switched = any(r["status"] == "switched" for r in auto_switch_results)
+                    if switched:
                         self._rebuild_menu()
+
+                    states = [self._usage_state_cache.get(account_key(a)) for a in accounts]
+                    should_retry, self._quick_retries_left = _plan_quick_retry(
+                        states, self._quick_retries_left
+                    )
+                    if should_retry:
+                        # Show progress on the rows that have no data yet, rather
+                        # than leaving them reading "Usage unavailable".
+                        for account, state in zip(accounts, states):
+                            if state is None or not state.available:
+                                self._usage_cache[account_key(account)] = "Checking…"
+
                     self._update_usage_labels()
                     for result in auto_switch_results:
                         self._notify_auto_switch_result(result)
-                    if any(result["status"] == "switched" for result in auto_switch_results):
+                    if switched:
                         self._fetch_all_usage()
+                    elif should_retry:
+                        self._schedule_quick_retry()
 
                 _on_main_thread(_finish)
 
         threading.Thread(target=_fetch, daemon=True).start()
+
+    def _schedule_quick_retry(self):
+        """Refetch usage after a short delay, on the main thread. One pending at a time."""
+        if self._quick_retry_timer is not None:
+            self._quick_retry_timer.cancel()
+
+        def _fire():
+            _on_main_thread(self._fetch_all_usage)
+
+        self._quick_retry_timer = threading.Timer(QUICK_RETRY_DELAY_SECONDS, _fire)
+        self._quick_retry_timer.daemon = True
+        self._quick_retry_timer.start()
 
     def _fetch_usage_state(self, account, active_account) -> UsageState:
         try:
@@ -466,9 +517,11 @@ class ClaudeSwitcherApp(rumps.App):
 
     def _on_refresh_usage(self, _):
         """Refresh usage data for all accounts."""
+        self._quick_retries_left = QUICK_RETRY_BUDGET
         self._fetch_all_usage()
 
     def _on_periodic_usage_refresh(self, _):
+        self._quick_retries_left = QUICK_RETRY_BUDGET
         self._fetch_all_usage()
 
     def _on_remove_account(self, sender):

@@ -79,3 +79,37 @@ def test_busy_codex_removal_rebuilds_without_success_notification(app_module, tm
     fake_rumps.alert.assert_called_once()
     assert "try again in a moment" in fake_rumps.alert.call_args.kwargs["message"].lower()
     app._rebuild_menu.assert_called_once()
+
+
+class TestPlanQuickRetry:
+    """The pure retry-decision helper that makes usage self-heal after a
+    transient unavailable fetch (e.g. the first read racing a Keychain prompt)."""
+
+    def _states(self, app, *avails):
+        UsageState = importlib.import_module("claude_switcher.usage_state").UsageState
+        return [None if a is None else UsageState(available=a, display="") for a in avails]
+
+    def test_all_available_stops_and_refills(self, app_module):
+        st = self._states(app_module, True, True)
+        assert app_module._plan_quick_retry(st, 1) == (False, app_module.QUICK_RETRY_BUDGET)
+
+    def test_unavailable_with_budget_retries_and_decrements(self, app_module):
+        st = self._states(app_module, True, False)
+        assert app_module._plan_quick_retry(st, 3) == (True, 2)
+
+    def test_budget_exhausted_gives_up(self, app_module):
+        st = self._states(app_module, False)
+        assert app_module._plan_quick_retry(st, 0) == (False, 0)
+
+    def test_missing_state_counts_as_unavailable(self, app_module):
+        st = self._states(app_module, None)
+        assert app_module._plan_quick_retry(st, 2) == (True, 1)
+
+    def test_no_accounts_is_not_a_failure(self, app_module):
+        assert app_module._plan_quick_retry([], 1) == (False, app_module.QUICK_RETRY_BUDGET)
+
+    def test_last_retry_then_stops(self, app_module):
+        st = self._states(app_module, False)
+        should, left = app_module._plan_quick_retry(st, 1)
+        assert (should, left) == (True, 0)
+        assert app_module._plan_quick_retry(st, left) == (False, 0)
