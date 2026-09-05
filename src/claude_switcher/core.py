@@ -164,16 +164,21 @@ def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -
         active = get_active_account(config_path)
 
         if active:
-            current_creds = keychain.read_credentials(CLAUDE_SERVICE)
-            if current_creds:
-                keychain.write_credentials(
-                    f"claude-switcher:{active.email}", active.keychain_account, current_creds
-                )
-            # Save current oauthAccount state from ~/.claude.json
+            # Only back up the live credential if it actually belongs to the
+            # account config marks active. ~/.claude.json's oauthAccount
+            # identifies the live session; if it has drifted from active.email,
+            # saving would overwrite a different account's backup. Skip on drift.
             current_oauth = _read_oauth_account()
-            if current_oauth:
-                active.oauth_account = current_oauth
-                add_account(active, config_path)
+            live_email = (current_oauth or {}).get("emailAddress")
+            if live_email == active.email:
+                current_creds = keychain.read_credentials(CLAUDE_SERVICE)
+                if current_creds:
+                    keychain.write_credentials(
+                        f"claude-switcher:{active.email}", active.keychain_account, current_creds
+                    )
+                if current_oauth:
+                    active.oauth_account = current_oauth
+                    add_account(active, config_path)
 
         _validate_email(target_email)
         target_creds = keychain.read_credentials(f"claude-switcher:{target_email}")

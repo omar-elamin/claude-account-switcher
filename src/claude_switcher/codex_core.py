@@ -428,7 +428,17 @@ def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_P
         active = get_active_account(config_path, provider="codex")
         if active:
             current_creds = _read_codex_credentials_for_import()
-            if current_creds:
+            # Back up the live credential ONLY if it actually belongs to the
+            # account config marks active. If config's active has drifted from
+            # what is really in ~/.codex/auth.json (e.g. after a bare `codex
+            # login`, or a prior mis-save), writing it under active.email would
+            # overwrite a DIFFERENT account's backup with these credentials —
+            # the exact corruption that clobbered a real user's account. Verify
+            # the blob's embedded identity; skip the save on any mismatch.
+            live_email = (
+                _codex_email_from_credentials(current_creds) if current_creds else None
+            )
+            if current_creds and live_email == active.email:
                 keychain.write_credentials(
                     f"{CODEX_KEYCHAIN_PREFIX}{active.email}",
                     active.keychain_account,

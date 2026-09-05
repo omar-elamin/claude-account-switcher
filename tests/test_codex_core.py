@@ -348,19 +348,23 @@ class TestCodexLogin:
 
 
 class TestSwitchCodexAccount:
+    @patch("claude_switcher.codex_core.refresh_codex_credentials", return_value=None)
     @patch("claude_switcher.codex_core._write_codex_credentials")
     @patch("claude_switcher.codex_core.keychain")
-    def test_switch_saves_current_loads_target(self, mock_kc, mock_write, tmp_path):
+    def test_switch_saves_current_loads_target(self, mock_kc, mock_write, mock_refresh, tmp_path):
         config = tmp_path / "accounts.json"
         auth_file = tmp_path / "auth.json"
         config_file = tmp_path / "config.toml"
-        auth_file.write_text('{"token": "old-token"}')
+        # live auth.json must carry an identity matching the active account,
+        # else the identity guard correctly refuses to back it up.
+        live_blob = _auth_json(email="old@test.com")
+        auth_file.write_text(live_blob)
         config_file.write_text('cli_auth_credentials_store = "file"')
         save_accounts([
             AccountInfo("old@test.com", "plus", "", True, "old", provider="codex"),
             AccountInfo("new@test.com", "plus", "", False, "new", provider="codex"),
         ], config)
-        mock_kc.read_credentials.return_value = '{"token": "target-token"}'
+        mock_kc.read_credentials.return_value = _auth_json(email="new@test.com")
 
         with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
             codex_core_mod, "CODEX_CONFIG_FILE", config_file
@@ -368,9 +372,12 @@ class TestSwitchCodexAccount:
             switch_codex_account("new@test.com", config)
 
         mock_kc.write_credentials.assert_any_call(
-            "codex-switcher:old@test.com", "old", '{"token": "old-token"}'
+            "codex-switcher:old@test.com", "old", live_blob
         )
-        mock_write.assert_called_once_with('{"token": "target-token"}')
+        # target written to auth.json is the normalized target blob
+        import json as _json
+        from claude_switcher.codex_core import normalize_codex_credentials_blob as _norm
+        mock_write.assert_called_once_with(_norm(_auth_json(email="new@test.com")))
         active = [a for a in load_accounts(config) if a.provider == "codex" and a.active]
         assert active[0].email == "new@test.com"
 
@@ -662,3 +669,40 @@ class TestRemoveCodexAccount:
             call.args and call.args[0] == "codex-switcher:new@test.com"
             for call in mock_kc.read_credentials.call_args_list
         )
+
+
+class TestSwitchIdentityGuard:
+    """Regression: a switch must never save the live credential under the wrong
+    account name. This is the bug that clobbered a real user's voysai backup
+    with elamin's credential when config's active drifted from ~/.codex/auth.json.
+    """
+
+    @patch("claude_switcher.codex_core.refresh_codex_credentials", return_value=None)
+    @patch("claude_switcher.codex_core._write_codex_credentials")
+    @patch("claude_switcher.codex_core.keychain")
+    def test_switch_does_not_backup_when_live_identity_differs(
+        self, mock_kc, mock_write, mock_refresh, tmp_path
+    ):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        # config says A is active, but the live file actually holds B's credential
+        auth_file.write_text(_auth_json(email="B@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([
+            AccountInfo("A@test.com", "plus", "", True, "A", provider="codex"),
+            AccountInfo("C@test.com", "plus", "", False, "C", provider="codex"),
+        ], config)
+        mock_kc.read_credentials.return_value = _auth_json(email="C@test.com")
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            switch_codex_account("C@test.com", config)
+
+        # NOTHING may have been written to codex-switcher:A@test.com — that would
+        # put B's credential into A's backup slot.
+        for call in mock_kc.write_credentials.call_args_list:
+            assert call.args[0] != "codex-switcher:A@test.com", (
+                "clobbered A's backup with a non-A credential"
+            )

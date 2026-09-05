@@ -106,7 +106,7 @@ class TestSwitchAccount:
         add_account(AccountInfo("a@test.com", "pro", "Org", True, "u"), config_path)
         add_account(AccountInfo("b@test.com", "pro", "Org", False, "u"), config_path)
         mock_kc.read_credentials.side_effect = ['{"tok":"a"}', None]
-        mock_read_oauth.return_value = None
+        mock_read_oauth.return_value = {"emailAddress": "a@test.com"}
 
         try:
             switch_account("b@test.com", config_path)
@@ -382,3 +382,27 @@ class TestCoreWithMixedProviders:
         assert codex.active is True
         assert claude_target.active is True
         mock_write_oauth.assert_called_once_with({"emailAddress": "other@test.com"})
+
+
+class TestClaudeSwitchIdentityGuard:
+    @patch("claude_switcher.core.set_active_account")
+    @patch("claude_switcher.core._write_oauth_account")
+    @patch("claude_switcher.core._read_oauth_account")
+    @patch("claude_switcher.core.keychain")
+    def test_switch_does_not_backup_when_live_oauth_differs(
+        self, mock_kc, mock_read_oauth, mock_write_oauth, mock_set_active, tmp_path
+    ):
+        from claude_switcher.config import add_account, AccountInfo
+        config_path = tmp_path / "accounts.json"
+        add_account(AccountInfo("A@test.com", "pro", "Org", True, "uA", oauth_account={"emailAddress": "A@test.com"}), config_path)
+        add_account(AccountInfo("C@test.com", "pro", "Org", False, "uC", oauth_account={"emailAddress": "C@test.com"}), config_path)
+        # config active = A, but live ~/.claude.json oauthAccount is B
+        mock_read_oauth.return_value = {"emailAddress": "B@test.com"}
+        mock_kc.read_credentials.return_value = '{"claudeAiOauth":{"accessToken":"tok"}}'
+
+        switch_account("C@test.com", config_path)
+
+        for call in mock_kc.write_credentials.call_args_list:
+            assert call.args[0] != "claude-switcher:A@test.com", (
+                "clobbered A's backup with a non-A credential"
+            )
