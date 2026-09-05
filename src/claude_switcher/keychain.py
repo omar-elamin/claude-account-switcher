@@ -1,4 +1,14 @@
-"""Wrapper around macOS `security` CLI for Keychain credential management."""
+"""Wrapper around macOS `security` CLI for Keychain credential management.
+
+Note on process-argument exposure (audit finding 2): writes deliver the secret
+to `security add-generic-password` as a hex string via -X. The plaintext token
+is never on the command line, but the hex is, and hex is trivially reversible,
+so `ps` exposure is reduced, not eliminated. This is a deliberate trade: the
+alternative that fully hides the secret (piping it to the -w prompt) truncates at
+128 characters via readpassphrase() and silently corrupts every real credential.
+Fully eliminating argument exposure requires the Security framework SecItemAdd
+API instead of the `security` CLI, which is a larger change than this fix set.
+"""
 
 import json
 import re
@@ -38,6 +48,38 @@ def read_credentials(service: str) -> str | None:
     return result.stdout.strip() if result.stdout.strip() else None
 
 
+def _add_password(service: str, account: str, value: str, *, error: str, timeout_error: str) -> None:
+    """Add one Keychain entry, delivering the secret as hex via -X.
+
+    macOS `security add-generic-password` reads the -w prompt through
+    readpassphrase(), which truncates at 128 characters. Piping the secret to
+    that prompt therefore silently corrupts any real credential (a Claude/Codex
+    blob is thousands of bytes). The -X flag takes the value as a hex string and
+    has no such limit, so it round-trips long blobs intact. The secret is not
+    passed as cleartext on the command line; the hex is still visible in `ps`,
+    so this reduces but does not eliminate process-argument exposure (fully
+    eliminating it requires the Security framework SecItemAdd API rather than the
+    `security` CLI — see the module note).
+    """
+    hex_value = value.encode("utf-8").hex()
+    try:
+        result = subprocess.run(
+            [
+                "security", "add-generic-password",
+                "-s", service,
+                "-a", account,
+                "-X", hex_value,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(timeout_error) from exc
+    if result.returncode != 0:
+        raise RuntimeError(error)
+
+
 def write_credentials(service: str, account: str, password: str) -> None:
     """Write a Keychain entry, replacing all existing entries for that service."""
     with _LOCK:
@@ -51,26 +93,11 @@ def write_credentials(service: str, account: str, password: str) -> None:
                 pass
 
             add_attempted = True
-            try:
-                result = subprocess.run(
-                    [
-                        "security", "add-generic-password",
-                        "-s", service,
-                        "-a", account,
-                        "-w",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    input=f"{value}\n{value}\n",
-                    timeout=KEYCHAIN_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(
-                    "Keychain write timed out. Check macOS Keychain access permissions."
-                ) from exc
-            if result.returncode != 0:
-                raise RuntimeError("Keychain write failed. Check macOS Keychain access permissions.")
+            _add_password(
+                service, account, value,
+                error="Keychain write failed. Check macOS Keychain access permissions.",
+                timeout_error="Keychain write timed out. Check macOS Keychain access permissions.",
+            )
         except BaseException as original:
             rollback_error = None
             if add_attempted:
@@ -82,23 +109,11 @@ def write_credentials(service: str, account: str, password: str) -> None:
 
             if snapshot is not None:
                 try:
-                    result = subprocess.run(
-                        [
-                            "security", "add-generic-password",
-                            "-s", service,
-                            "-a", snapshot[0],
-                            "-w",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        input=f"{snapshot_value}\n{snapshot_value}\n",
-                        timeout=KEYCHAIN_TIMEOUT_SECONDS,
+                    _add_password(
+                        service, snapshot[0], snapshot_value,
+                        error="Keychain restore failed. Check macOS Keychain access permissions.",
+                        timeout_error="Keychain restore timed out. Check macOS Keychain access permissions.",
                     )
-                    if result.returncode != 0:
-                        raise RuntimeError(
-                            "Keychain restore failed. Check macOS Keychain access permissions."
-                        )
                 except BaseException as exc:
                     rollback_error = exc
 

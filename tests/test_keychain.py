@@ -64,14 +64,13 @@ class TestWriteCredentials:
                 "security", "add-generic-password",
                 "-s", "claude-switcher:emile@gmail.com",
                 "-a", "emilejouannet",
-                "-w",
+                "-X", FAKE_CREDS.encode("utf-8").hex(),
             ],
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            input=f"{FAKE_CREDS}\n{FAKE_CREDS}\n",
             timeout=KEYCHAIN_TIMEOUT_SECONDS,
         )
+        # plaintext secret never appears in any argument list
         assert all(FAKE_CREDS not in call.args[0] for call in mock_run.call_args_list)
 
     @patch("claude_switcher.keychain.subprocess.run")
@@ -117,10 +116,8 @@ class TestWriteCredentials:
         restore_call = mock_run.call_args_list[-1]
         assert restore_call.args[0] == [
             "security", "add-generic-password", "-s", "service",
-            "-a", "legacy", "-w",
+            "-a", "legacy", "-X", normalized.encode("utf-8").hex(),
         ]
-        assert restore_call.kwargs["input"] == f"{normalized}\n{normalized}\n"
-        assert restore_call.kwargs["encoding"] == "utf-8"
         assert all(legacy not in call.args[0] for call in mock_run.call_args_list)
 
     @patch("claude_switcher.keychain.subprocess.run")
@@ -138,8 +135,10 @@ class TestWriteCredentials:
         with pytest.raises(RuntimeError, match="Keychain write failed"):
             write_credentials("service", "new-account", "new-password")
 
-        assert mock_run.call_args_list[-1].args[0][-3:] == ["-a", "old-account", "-w"]
-        assert mock_run.call_args_list[-1].kwargs["input"] == "old-password\nold-password\n"
+        assert mock_run.call_args_list[-1].args[0][-3:] == [
+            "-a", "old-account", "-X", "old-password".encode("utf-8").hex()
+        ][-3:]
+        assert mock_run.call_args_list[-1].args[0][-2:] == ["-X", "old-password".encode("utf-8").hex()]
 
     @patch("claude_switcher.keychain.subprocess.run")
     def test_delete_timeout_after_removal_restores_snapshot(self, mock_run):
@@ -153,7 +152,7 @@ class TestWriteCredentials:
         with pytest.raises(RuntimeError, match="delete timed out"):
             write_credentials("service", "new-account", "new-password")
 
-        assert mock_run.call_args_list[-1].kwargs["input"] == "old-password\nold-password\n"
+        assert mock_run.call_args_list[-1].args[0][-2:] == ["-X", "old-password".encode("utf-8").hex()]
 
     @patch("claude_switcher.keychain.subprocess.run")
     def test_timed_out_add_without_snapshot_is_reconciled_to_empty(self, mock_run):
@@ -238,9 +237,12 @@ class TestWriteCredentials:
         write_credentials("service", "account", secret)
 
         add_call = mock_run.call_args_list[-1]
-        assert add_call.kwargs["encoding"] == "utf-8"
-        assert add_call.kwargs["input"] == f"{secret}\n{secret}\n"
+        assert add_call.args[0][-2] == "-X"
+        # hex round-trips the UTF-8 bytes; the -X argument is pure ASCII, so a C
+        # locale cannot corrupt it, and the plaintext secret never appears.
+        assert add_call.args[0][-1] == secret.encode("utf-8").hex()
         assert secret not in add_call.args[0]
+        assert bytes.fromhex(add_call.args[0][-1]).decode("utf-8") == secret
 
 
 class TestSnapshotAndRestore:
@@ -326,3 +328,63 @@ class TestReadAccountAttribute:
         from claude_switcher.keychain import read_account_attribute
         result = read_account_attribute("Claude Code-credentials")
         assert result == "emilejouannet"
+
+
+import os
+import shutil
+import subprocess as _sp
+
+import pytest as _pytest
+
+_SECURITY = shutil.which("security")
+
+
+@_pytest.mark.skipif(
+    _SECURITY is None or os.uname().sysname != "Darwin",
+    reason="requires the real macOS `security` binary",
+)
+class TestRealSecurityTransport:
+    """Integration tests against the ACTUAL `security` binary in an isolated
+    keychain. These exist because the original stdin (`-w` prompt) transport
+    passed every mock-based test yet truncated real credentials to 128 bytes on
+    macOS, corrupting logins. A stub can hide that; the real binary cannot.
+    """
+
+    def _mk_keychain(self, tmp_path):
+        kc = str(tmp_path / "cs-itest.keychain-db")
+        _sp.run([_SECURITY, "create-keychain", "-p", "t", kc], check=True,
+                capture_output=True)
+        _sp.run([_SECURITY, "unlock-keychain", "-p", "t", kc], check=True,
+                capture_output=True)
+        return kc
+
+    def test_hex_transport_roundtrips_a_long_blob(self, tmp_path):
+        kc = self._mk_keychain(tmp_path)
+        # ~3200 bytes: larger than a real Claude Code credential, far over 128.
+        blob = '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-%s","refreshToken":"rt-%s"}}' % ("A" * 3000, "B" * 40)
+        assert len(blob) > 3000
+        try:
+            # exactly the argv the code builds, plus an isolated keychain positional
+            _sp.run([_SECURITY, "add-generic-password", "-s", "cs-itest", "-a", "me",
+                     "-X", blob.encode("utf-8").hex(), kc],
+                    check=True, capture_output=True, text=True)
+            got = _sp.run([_SECURITY, "find-generic-password", "-s", "cs-itest", "-w", kc],
+                          capture_output=True, text=True).stdout.strip()
+            assert got == blob, "hex -X transport must round-trip a >3000-byte credential intact"
+        finally:
+            _sp.run([_SECURITY, "delete-keychain", kc], capture_output=True)
+
+    def test_stdin_prompt_transport_truncates(self, tmp_path):
+        # Documents WHY the code does not use the -w prompt: the real binary
+        # truncates it. If a future macOS ever fixes this, this test flips and we
+        # can revisit; until then it guards against anyone "restoring" the -w path.
+        kc = self._mk_keychain(tmp_path)
+        blob = "X" * 500
+        try:
+            _sp.run([_SECURITY, "add-generic-password", "-s", "cs-trunc", "-a", "me", "-w", kc],
+                    input="%s\n%s\n" % (blob, blob), capture_output=True, text=True)
+            got = _sp.run([_SECURITY, "find-generic-password", "-s", "cs-trunc", "-w", kc],
+                          capture_output=True, text=True).stdout.strip()
+            assert got != blob, "the -w prompt transport is expected to corrupt a 500-byte secret"
+        finally:
+            _sp.run([_SECURITY, "delete-keychain", kc], capture_output=True)
