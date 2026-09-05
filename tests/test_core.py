@@ -187,7 +187,9 @@ class TestAddNewAccount:
             core_mod, "run_auth_logout"
         ), patch.object(core_mod, "run_auth_login") as mock_login, patch.object(
             core_mod, "import_current_account"
-        ) as mock_import:
+        ) as mock_import, patch.object(
+            core_mod, "_read_oauth_account", return_value={"emailAddress": "old@test.com"}
+        ):
             mock_kc.snapshot_credentials.return_value = snapshot
             mock_kc._single_line.side_effect = lambda value: value
             mock_kc.delete_credentials.return_value = False
@@ -405,4 +407,31 @@ class TestClaudeSwitchIdentityGuard:
         for call in mock_kc.write_credentials.call_args_list:
             assert call.args[0] != "claude-switcher:A@test.com", (
                 "clobbered A's backup with a non-A credential"
+            )
+
+
+class TestClaudeAddIdentityGuard:
+    """Regression: adding an account must not back up the live credential under
+    the active account's name when the live session belongs to someone else."""
+
+    def test_add_does_not_backup_when_live_oauth_differs(self, tmp_path):
+        from claude_switcher.config import add_account
+        config_path = tmp_path / "accounts.json"
+        add_account(AccountInfo("A@test.com", "pro", "", True, "uA"), config_path)
+
+        with patch.object(core_mod, "keychain") as mock_kc, patch.object(
+            core_mod, "run_auth_logout"
+        ), patch.object(core_mod, "run_auth_login", return_value=False), patch.object(
+            core_mod, "import_current_account", return_value=None
+        ), patch.object(
+            core_mod, "_read_oauth_account", return_value={"emailAddress": "B@test.com"}
+        ):
+            mock_kc.snapshot_credentials.return_value = ("uB", '{"accessToken":"B"}')
+            mock_kc._single_line.side_effect = lambda v: v
+            mock_kc.delete_credentials.return_value = False
+            add_new_account(config_path)
+
+        for call in mock_kc.write_credentials.call_args_list:
+            assert call.args[0] != "claude-switcher:A@test.com", (
+                "add clobbered A's backup with a non-A credential"
             )

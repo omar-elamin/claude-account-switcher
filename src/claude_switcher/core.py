@@ -214,10 +214,15 @@ def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | No
         snapshot = keychain.snapshot_credentials(CLAUDE_SERVICE)
         if snapshot is not None:
             keychain._single_line(snapshot[1])
+        # Back up the outgoing credential under active.email ONLY if the live
+        # session actually belongs to that account. Same identity guard as
+        # switch_account: on drift, skip rather than clobber a different backup.
         if active and snapshot is not None:
-            keychain.write_credentials(
-                f"claude-switcher:{active.email}", snapshot[0], snapshot[1]
-            )
+            live_email = (_read_oauth_account() or {}).get("emailAddress")
+            if live_email == active.email:
+                keychain.write_credentials(
+                    f"claude-switcher:{active.email}", snapshot[0], snapshot[1]
+                )
 
         result = None
         try:
