@@ -216,9 +216,12 @@ def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | No
 
         result = None
         try:
-            run_auth_logout()
-
-            # Leftover entries can make the login poll accept the old token.
+            # Do NOT run `claude auth logout` here. It revokes the *previous*
+            # account's session server-side, which permanently invalidates the
+            # backup we just saved for it — so adding account B would silently
+            # kill account A. Clearing the local Keychain slot below is all the
+            # fresh login needs; the old account's server session stays valid so
+            # it can be switched back to later.
             while keychain.delete_credentials(CLAUDE_SERVICE):
                 pass
 

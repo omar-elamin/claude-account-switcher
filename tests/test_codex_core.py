@@ -251,7 +251,9 @@ class TestCodexLogin:
             result = add_new_codex_account(config)
 
         assert result.email == "new@test.com"
-        mock_logout.assert_called_once()
+        # Must NOT call `codex logout`: it revokes the previous account
+        # server-side and invalidates its saved backup.
+        mock_logout.assert_not_called()
         mock_login.assert_called_once()
 
     @patch("claude_switcher.codex_core.run_codex_login")

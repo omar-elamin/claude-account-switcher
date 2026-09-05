@@ -519,7 +519,10 @@ def add_new_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInf
 
         result = None
         try:
-            run_codex_logout()
+            # Do NOT run `codex logout` here. It revokes the *previous* account's
+            # session server-side, invalidating the backup we just saved for it,
+            # so adding a new Codex account would kill the old one. Clearing the
+            # local auth.json below is all the fresh login needs.
             _clear_codex_credentials_file()
             if run_codex_login():
                 result = import_current_codex_account(config_path)

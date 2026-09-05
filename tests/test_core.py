@@ -138,7 +138,11 @@ class TestAddNewAccount:
         result = add_new_account(config_path)
         assert result is not None
         assert result.email == "new@test.com"
-        mock_logout.assert_called_once()
+        # Must NOT call `claude auth logout`: that would revoke the previous
+        # account server-side and invalidate its just-saved backup.
+        mock_logout.assert_not_called()
+        # The local slot is still cleared before the fresh login.
+        assert mock_kc.delete_credentials.called
         mock_login.assert_called_once()
 
     @patch("claude_switcher.core.run_auth_login")
