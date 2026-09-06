@@ -145,19 +145,20 @@ class TestRefreshAndLoginRouting:
         UsageState = importlib.import_module("claude_switcher.usage_state").UsageState
         app = self._app(app_module)
         app._usage_state_cache[("codex", "dead@test.com")] = UsageState(available=False, display="Login required")
-        app._on_add_codex_account = MagicMock()
+        app._on_add = MagicMock()
         app._switch_account = MagicMock()
-        app._on_codex_account_click(SimpleNamespace(_email="dead@test.com"))
-        app._on_add_codex_account.assert_called_once()
+        sender = SimpleNamespace(_email="dead@test.com", _provider="codex")
+        app._on_codex_account_click(sender)
+        app._on_add.assert_called_once_with(sender)
         app._switch_account.assert_not_called()
 
     def test_healthy_row_still_switches(self, app_module):
         UsageState = importlib.import_module("claude_switcher.usage_state").UsageState
         app = self._app(app_module)
         app._usage_state_cache[("codex", "ok@test.com")] = UsageState(available=True, display="1h 10%")
-        app._on_add_codex_account = MagicMock()
+        app._on_add = MagicMock()
         app._switch_account = MagicMock()
-        app._on_codex_account_click(SimpleNamespace(_email="ok@test.com"))
+        app._on_codex_account_click(SimpleNamespace(_email="ok@test.com", _provider="codex"))
         app._switch_account.assert_called_once_with("codex", "ok@test.com")
 
 
@@ -212,25 +213,128 @@ class TestAddRestartsInProgressSignIn:
         return app
 
     def test_add_while_signing_in_cancels_then_starts_fresh(self, app_module):
-        app = self._app(app_module); app_module.rumps.notification.reset_mock()
-        with patch.object(app_module, "check_codex_cli", return_value=True), \
-             patch.object(app_module, "_add_lease_held", lambda p: p == "codex"), \
-             patch("claude_switcher.codex_core.cancel_codex_login") as cancel, \
-             patch.object(app_module.threading, "Thread") as thread:
-            app._on_add_codex_account(None)
-        cancel.assert_called_once()                       # old sign-in cancelled
-        thread.assert_called_once()                       # fresh login started (not refused)
-        assert "Restarting" in app_module.rumps.notification.call_args.kwargs["subtitle"]
+        for provider, label, window in (("claude", "Claude", "browser"), ("codex", "Codex", "Terminal")):
+            for held, released in ((True, True), (True, False), (False, True)):
+                app = self._app(app_module)
+                # Also cover restart during the grace before the worker takes its lease.
+                if not held:
+                    app._signing_in_since[provider] = 99.0
+                app_module.rumps.notification.reset_mock()
+                check, add, cancel = MagicMock(return_value=True), MagicMock(return_value=None), MagicMock()
+                events = []
+                cancel.side_effect = lambda: events.append("cancel")
+                add.side_effect = lambda path: events.append("add")
+                def wait(p):
+                    assert p == provider
+                    events.append("wait")
+                    return released
+                entry = (label, check, add, cancel, f"Sign in in the {window} window that appears, then come back here.")
+                with patch.dict(app_module.ADD_PROVIDERS, {provider: entry}), \
+                     patch.object(app_module, "_add_lease_held", return_value=held), \
+                     patch.object(app_module.time, "time", return_value=100.0), \
+                     patch.object(app_module, "_wait_for_lease_release", side_effect=wait), \
+                     patch.object(app_module.threading, "Thread") as thread, \
+                     patch.object(app_module, "_on_main_thread") as on_main:
+                    app._on_add(SimpleNamespace(_provider=provider))
+                    cancel.assert_called_once()       # old sign-in cancelled
+                    thread.assert_called_once()       # fresh login started (not refused)
+                    thread.return_value.start.assert_called_once()
+                    assert thread.call_args.kwargs["daemon"] is True
+                    assert "Restarting" in app_module.rumps.notification.call_args.kwargs["subtitle"]
+                    app_module.rumps.notification.assert_called_once_with(
+                        title="Claude Switcher", subtitle=f"Restarting {label} login…", message=entry[4])
+                    assert app._signing_in_since == {provider: 100.0}
+                    assert events == ["cancel"]
+                    thread.call_args.kwargs["target"]()
+                    assert events == (["cancel", "wait", "add"] if released else ["cancel", "wait"])
+                    if released:
+                        add.assert_called_once_with(app.config_path)
+                    else:
+                        add.assert_not_called()
+                    app._rebuild_menu.assert_not_called()
+                    app._fetch_all_usage.assert_not_called()
+                    on_main.assert_called_once()
+                    on_main.call_args.args[0]()
+                app_module.rumps.notification.assert_called_with(
+                    title="Claude Switcher",
+                    subtitle="Cancelled" if released else "Error",
+                    message="Login was cancelled or failed." if released else
+                        f"The previous {label} sign-in did not stop in time. Try again.")
+                app._rebuild_menu.assert_called_once()
+                app._fetch_all_usage.assert_called_once()
 
     def test_add_when_idle_does_not_cancel(self, app_module):
-        app = self._app(app_module); app_module.rumps.notification.reset_mock()
-        with patch.object(app_module, "check_codex_cli", return_value=True), \
-             patch.object(app_module, "_add_lease_held", lambda p: False), \
-             patch("claude_switcher.codex_core.cancel_codex_login") as cancel, \
-             patch.object(app_module.threading, "Thread") as thread:
-            app._on_add_codex_account(None)
-        cancel.assert_not_called(); thread.assert_called_once()
-        assert "Opening" in app_module.rumps.notification.call_args.kwargs["subtitle"]
+        app = self._app(app_module)
+        app.menu = MagicMock()
+        app._add_auto_switch_menu = MagicMock()
+        # Exercise the real menu builder: both rows must carry their provider
+        # and invoke the unified handler with the existing labels and order.
+        with patch.object(app_module, "load_accounts", return_value=[]), \
+             patch.object(app_module.rumps, "MenuItem", side_effect=lambda title, callback=None:
+                          SimpleNamespace(title=title, callback=callback)):
+            app_module.ClaudeSwitcherApp._rebuild_menu(app)
+        add_items = [c.args[0] for c in app.menu.add.call_args_list
+                     if getattr(c.args[0], "callback", None) == app._on_add]
+        assert [(item.title, item._provider) for item in add_items] == [
+            ("✚  Add Claude account...", "claude"), ("✚  Add Codex account...", "codex")]
+        for item, label, window, cli, add_name, cancel_name, success in (
+            (add_items[0], "Claude", "browser", "check_claude_cli", "add_new_account", "cancel_login", "Claude account added"),
+            (add_items[1], "Codex", "Terminal", "check_codex_cli", "add_new_codex_account", "cancel_codex_login", "Signed in to Codex"),
+        ):
+            provider = item._provider
+            entry = app_module.ADD_PROVIDERS[provider]
+            assert entry == (label, getattr(app_module, cli), getattr(app_module, add_name),
+                             getattr(app_module, cancel_name),
+                             f"Sign in in the {window} window that appears, then come back here.")
+            for outcome in ("missing_cli", "success", "cancelled", "error"):
+                app._signing_in_since = {}
+                app._rebuild_menu.reset_mock(); app._fetch_all_usage.reset_mock()
+                app_module.rumps.notification.reset_mock(); app_module.rumps.alert.reset_mock()
+                check = MagicMock(return_value=outcome != "missing_cli")
+                add = MagicMock(return_value=SimpleNamespace(email="new@test.com", subscription_type="pro")
+                                if outcome == "success" else None)
+                if outcome == "error":
+                    add.side_effect = RuntimeError("login failed")
+                cancel = MagicMock()
+                with patch.dict(app_module.ADD_PROVIDERS, {provider: (label, check, add, cancel, entry[4])}), \
+                     patch.object(app_module, "_add_lease_held", return_value=False), \
+                     patch.object(app_module.time, "time", return_value=100.0), \
+                     patch.object(app_module, "_wait_for_lease_release") as wait, \
+                     patch.object(app_module.threading, "Thread") as thread, \
+                     patch.object(app_module, "_on_main_thread") as on_main:
+                    item.callback(item)
+                    check.assert_called_once_with()
+                    cancel.assert_not_called()
+                    if outcome == "missing_cli":
+                        app_module.rumps.alert.assert_called_once_with(
+                            title=f"{label} CLI not found",
+                            message=f"Please install {app_module.PROVIDER_LABELS[provider]} before adding an account.")
+                        thread.assert_not_called(); add.assert_not_called()
+                        app_module.rumps.notification.assert_not_called()
+                        assert app._signing_in_since == {}
+                        app._rebuild_menu.assert_not_called(); app._fetch_all_usage.assert_not_called()
+                        continue
+                    app_module.rumps.alert.assert_not_called()
+                    thread.assert_called_once()
+                    thread.return_value.start.assert_called_once()
+                    assert "Opening" in app_module.rumps.notification.call_args.kwargs["subtitle"]
+                    app_module.rumps.notification.assert_called_once_with(
+                        title="Claude Switcher", subtitle=f"Opening {label} login…", message=entry[4])
+                    assert app._signing_in_since == {provider: 100.0}
+                    thread.call_args.kwargs["target"]()
+                    wait.assert_not_called()
+                    add.assert_called_once_with(app.config_path)
+                    app._rebuild_menu.assert_not_called(); app._fetch_all_usage.assert_not_called()
+                    on_main.assert_called_once()
+                    on_main.call_args.args[0]()
+                subtitle, message = {
+                    "success": (success, "new@test.com (pro)"),
+                    "cancelled": ("Cancelled", "Login was cancelled or failed."),
+                    "error": ("Error", "login failed"),
+                }[outcome]
+                app_module.rumps.notification.assert_called_with(
+                    title="Claude Switcher", subtitle=subtitle, message=message)
+                app._rebuild_menu.assert_called_once(); app._fetch_all_usage.assert_called_once()
 
     def test_wait_for_lease_release_returns_when_lease_clears(self, app_module):
         held = {"v": True}

@@ -15,6 +15,7 @@ from claude_switcher.auto_switch import (
 )
 from claude_switcher.codex_core import (
     check_codex_cli,
+    cancel_codex_login,
     import_current_codex_account,
     switch_codex_account,
     add_new_codex_account,
@@ -34,6 +35,7 @@ from claude_switcher.config import (
 )
 from claude_switcher.core import (
     check_claude_cli,
+    cancel_login,
     import_current_account,
     switch_account,
     add_new_account,
@@ -46,6 +48,17 @@ from claude_switcher.usage_state import UsageState
 PROVIDER_LABELS = {
     "claude": "Claude Code",
     "codex": "Codex CLI",
+}
+# Add-flow differences: label, check_cli, add_fn, cancel_fn, login_instruction.
+ADD_PROVIDERS = {
+    "claude": (
+        "Claude", check_claude_cli, add_new_account, cancel_login,
+        "Sign in in the browser window that appears, then come back here.",
+    ),
+    "codex": (
+        "Codex", check_codex_cli, add_new_codex_account, cancel_codex_login,
+        "Sign in in the Terminal window that appears, then come back here.",
+    ),
 }
 AUTO_SWITCH_COOLDOWN_SECONDS = 60
 
@@ -187,8 +200,10 @@ class ClaudeSwitcherApp(rumps.App):
 
         self.menu.add(rumps.separator)
         self._add_auto_switch_menu()
-        self.menu.add(rumps.MenuItem("\u271A  Add Claude account...", callback=self._on_add_claude_account))
-        self.menu.add(rumps.MenuItem("\u271A  Add Codex account...", callback=self._on_add_codex_account))
+        for provider, (label, _, _, _, _) in ADD_PROVIDERS.items():
+            item = rumps.MenuItem(f"\u271A  Add {label} account...", callback=self._on_add)
+            item._provider = provider
+            self.menu.add(item)
         self.menu.add(rumps.MenuItem("\u21BB  Refresh usage", callback=self._on_refresh_usage))
 
         if accounts:
@@ -261,7 +276,7 @@ class ClaudeSwitcherApp(rumps.App):
         # can only fail. Send the user straight to the login flow instead.
         state = self._usage_state_cache.get(("codex", sender._email))
         if state is not None and not state.available and "Login required" in state.display:
-            self._on_add_codex_account(None)
+            self._on_add(sender)
             return
         self._switch_account("codex", sender._email)
 
@@ -306,92 +321,39 @@ class ClaudeSwitcherApp(rumps.App):
 
         threading.Thread(target=_switch, daemon=True).start()
 
-    def _on_add_claude_account(self, _):
-        """Add a new Claude Code account via claude auth login."""
-        if not check_claude_cli():
+    def _on_add(self, sender):
+        """Add an account through the selected provider's login flow."""
+        provider = sender._provider
+        label, check_cli, add_fn, cancel_fn, login_instruction = ADD_PROVIDERS[provider]
+        if not check_cli():
             rumps.alert(
-                title="Claude CLI not found",
-                message="Please install Claude Code before adding an account.",
+                title=f"{label} CLI not found",
+                message=f"Please install {PROVIDER_LABELS[provider]} before adding an account.",
             )
             return
         # Clicking Add while a sign-in is already open means "start over":
         # cancel the old one (its snapshot is restored by its own cancelled
         # path) and begin a fresh login. One button, obvious intent.
-        restarting = self._signing_in("claude")
+        restarting = self._signing_in(provider)
         if restarting:
-            from claude_switcher.core import cancel_login
-            cancel_login()
+            cancel_fn()
 
-        self._signing_in_since["claude"] = time.time()
+        self._signing_in_since[provider] = time.time()
         rumps.notification(
             title="Claude Switcher",
-            subtitle="Restarting Claude login…" if restarting else "Opening Claude login…",
-            message="Sign in in the browser window that appears, then come back here.",
+            subtitle=f"Restarting {label} login…" if restarting else f"Opening {label} login…",
+            message=login_instruction,
         )
 
         def _add():
             try:
-                if restarting and not _wait_for_lease_release("claude"):
-                    raise RuntimeError("The previous Claude sign-in did not stop in time. Try again.")
-                result = add_new_account(self.config_path)
+                if restarting and not _wait_for_lease_release(provider):
+                    raise RuntimeError(f"The previous {label} sign-in did not stop in time. Try again.")
+                result = add_fn(self.config_path)
                 if result:
                     title, subtitle, message = (
                         "Claude Switcher",
-                        "Claude account added",
-                        f"{result.email} ({result.subscription_type})",
-                    )
-                else:
-                    title, subtitle, message = (
-                        "Claude Switcher",
-                        "Cancelled",
-                        "Login was cancelled or failed.",
-                    )
-            except Exception as exc:
-                title, subtitle, message = "Claude Switcher", "Error", str(exc)
-
-            def _finish():
-                rumps.notification(title=title, subtitle=subtitle, message=message)
-                self._rebuild_menu()
-                self._fetch_all_usage()
-
-            _on_main_thread(_finish)
-
-        threading.Thread(target=_add, daemon=True).start()
-
-    def _on_add_codex_account(self, _):
-        """Add a new Codex CLI account via codex login."""
-        if not check_codex_cli():
-            rumps.alert(
-                title="Codex CLI not found",
-                message="Please install Codex CLI before adding an account.",
-            )
-            return
-        # Clicking Add while a sign-in is already open means "start over":
-        # cancel the old one (its snapshot is restored) and begin a fresh login.
-        restarting = self._signing_in("codex")
-        if restarting:
-            from claude_switcher.codex_core import cancel_codex_login
-            cancel_codex_login()
-
-        self._signing_in_since["codex"] = time.time()
-
-        # Immediate feedback: the menu closes on click, and the login opens in a
-        # separate Terminal window, so without this the click looks like a no-op.
-        rumps.notification(
-            title="Claude Switcher",
-            subtitle="Restarting Codex login…" if restarting else "Opening Codex login…",
-            message="Sign in in the Terminal window that appears, then come back here.",
-        )
-
-        def _add():
-            try:
-                if restarting and not _wait_for_lease_release("codex"):
-                    raise RuntimeError("The previous Codex sign-in did not stop in time. Try again.")
-                result = add_new_codex_account(self.config_path)
-                if result:
-                    title, subtitle, message = (
-                        "Claude Switcher",
-                        "Signed in to Codex",
+                        "Claude account added" if provider == "claude" else "Signed in to Codex",
                         f"{result.email} ({result.subscription_type})",
                     )
                 else:
