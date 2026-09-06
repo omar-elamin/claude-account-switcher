@@ -706,3 +706,55 @@ class TestSwitchIdentityGuard:
             assert call.args[0] != "codex-switcher:A@test.com", (
                 "clobbered A's backup with a non-A credential"
             )
+
+
+class TestAddAlwaysOpensLogin:
+    """Regression: 'Add Codex account' must open the login even when the live
+    session isn't saved yet. Previously it silently imported the live session
+    and returned, so the first click looked like it did nothing."""
+
+    @patch("claude_switcher.codex_core.import_current_codex_account")
+    @patch("claude_switcher.codex_core.run_codex_login")
+    @patch("claude_switcher.codex_core.keychain")
+    def test_unsaved_live_session_is_preserved_then_login_opens(
+        self, mock_kc, mock_login, mock_import, tmp_path
+    ):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"
+        config_file = tmp_path / "config.toml"
+        live = _auth_json(email="live@test.com")          # live session, NOT in config
+        auth_file.write_text(live)
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([AccountInfo("other@test.com", "plus", "", True, "o", provider="codex")], config)
+        saved = AccountInfo("live@test.com", "plus", "", True, "live@test.com", provider="codex")
+        newacct = AccountInfo("new@test.com", "plus", "", True, "new@test.com", provider="codex")
+        mock_import.side_effect = [saved, newacct]        # 1st: preserve live; 2nd: import new login
+        mock_login.return_value = True
+        mock_kc._single_line.side_effect = lambda v: v
+
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            result = add_new_codex_account(config)
+
+        mock_login.assert_called_once()                    # the login DID open
+        assert mock_import.call_count == 2                 # preserved live, then imported new
+        assert result.email == "new@test.com"
+
+    @patch("claude_switcher.codex_core.import_current_codex_account", return_value=None)
+    @patch("claude_switcher.codex_core.run_codex_login")
+    @patch("claude_switcher.codex_core.keychain")
+    def test_refuses_to_clear_a_session_it_could_not_save(self, mock_kc, mock_login, mock_import, tmp_path):
+        config = tmp_path / "accounts.json"
+        auth_file = tmp_path / "auth.json"; config_file = tmp_path / "config.toml"
+        auth_file.write_text(_auth_json(email="live@test.com"))
+        config_file.write_text('cli_auth_credentials_store = "file"')
+        save_accounts([AccountInfo("other@test.com", "plus", "", True, "o", provider="codex")], config)
+        mock_kc._single_line.side_effect = lambda v: v
+        with patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth_file), patch.object(
+            codex_core_mod, "CODEX_CONFIG_FILE", config_file
+        ):
+            with pytest.raises(RuntimeError, match="Could not save"):
+                add_new_codex_account(config)
+        mock_login.assert_not_called()                     # never cleared/logged in
+        assert auth_file.exists()                          # live session untouched

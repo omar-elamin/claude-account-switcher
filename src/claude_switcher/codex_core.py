@@ -509,15 +509,25 @@ def add_new_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInf
         if current_creds:
             if current_email:
                 if not _saved_codex_account(current_email, config_path):
-                    return import_current_codex_account(config_path)
-                with _CODEX_LOCK:
-                    if _read_codex_credentials_for_import_raw() != raw_current_creds:
-                        raise RuntimeError("Codex credentials changed while starting account add.")
-                    keychain.write_credentials(
-                        f"{CODEX_KEYCHAIN_PREFIX}{current_email}",
-                        current_email,
-                        current_creds,
-                    )
+                    # The live session isn't saved yet. Preserve it (config row +
+                    # Keychain backup under its OWN email) and then KEEP GOING to
+                    # the login. Returning here made the first "Add" click look
+                    # like it did nothing: it silently imported the current
+                    # session and never opened a login. Refuse to continue if we
+                    # couldn't save it — never clear a session we can't restore.
+                    if import_current_codex_account(config_path) is None:
+                        raise RuntimeError(
+                            "Could not save the current Codex session before adding another."
+                        )
+                else:
+                    with _CODEX_LOCK:
+                        if _read_codex_credentials_for_import_raw() != raw_current_creds:
+                            raise RuntimeError("Codex credentials changed while starting account add.")
+                        keychain.write_credentials(
+                            f"{CODEX_KEYCHAIN_PREFIX}{current_email}",
+                            current_email,
+                            current_creds,
+                        )
         elif active:
             with _CODEX_LOCK:
                 raw_current_creds = keychain.read_credentials(

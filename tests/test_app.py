@@ -113,3 +113,49 @@ class TestPlanQuickRetry:
         should, left = app_module._plan_quick_retry(st, 1)
         assert (should, left) == (True, 0)
         assert app_module._plan_quick_retry(st, left) == (False, 0)
+
+
+class TestRefreshAndLoginRouting:
+    def _app(self, app_module):
+        # bare instance without running __init__ (avoids rumps/Cocoa)
+        app = app_module.ClaudeSwitcherApp.__new__(app_module.ClaudeSwitcherApp)
+        app._refresh_in_progress = True
+        app._refresh_requested = False
+        app._manual_refresh = False
+        app._quick_retries_left = app_module.QUICK_RETRY_BUDGET
+        app._usage_state_cache = {}
+        app._usage_cache = {}
+        return app
+
+    def test_refresh_click_during_inflight_is_queued_not_dropped(self, app_module):
+        app = self._app(app_module)
+        app._fetch_all_usage()                 # in flight -> should queue
+        assert app._refresh_requested is True
+
+    def test_manual_refresh_sets_flag_and_notifies(self, app_module):
+        app = self._app(app_module)
+        app._refresh_in_progress = True        # queue path, no thread
+        app_module.rumps.notification.reset_mock()
+        app._on_refresh_usage(None)
+        assert app._manual_refresh is True
+        assert app_module.rumps.notification.called
+        assert "Refreshing" in app_module.rumps.notification.call_args.kwargs["subtitle"]
+
+    def test_login_required_row_routes_to_login_flow(self, app_module):
+        UsageState = importlib.import_module("claude_switcher.usage_state").UsageState
+        app = self._app(app_module)
+        app._usage_state_cache[("codex", "dead@test.com")] = UsageState(available=False, display="Login required")
+        app._on_add_codex_account = MagicMock()
+        app._switch_account = MagicMock()
+        app._on_codex_account_click(SimpleNamespace(_email="dead@test.com"))
+        app._on_add_codex_account.assert_called_once()
+        app._switch_account.assert_not_called()
+
+    def test_healthy_row_still_switches(self, app_module):
+        UsageState = importlib.import_module("claude_switcher.usage_state").UsageState
+        app = self._app(app_module)
+        app._usage_state_cache[("codex", "ok@test.com")] = UsageState(available=True, display="1h 10%")
+        app._on_add_codex_account = MagicMock()
+        app._switch_account = MagicMock()
+        app._on_codex_account_click(SimpleNamespace(_email="ok@test.com"))
+        app._switch_account.assert_called_once_with("codex", "ok@test.com")

@@ -90,6 +90,8 @@ class ClaudeSwitcherApp(rumps.App):
         self._switch_in_progress: set[str] = set()
         self._quick_retries_left = QUICK_RETRY_BUDGET
         self._quick_retry_timer: threading.Timer | None = None
+        self._refresh_requested = False   # a Refresh click landed mid-flight; honour it after
+        self._manual_refresh = False      # current refresh is user-initiated -> notify when done
         self._first_launch()
         self._rebuild_menu()
         self._fetch_all_usage()
@@ -227,6 +229,12 @@ class ClaudeSwitcherApp(rumps.App):
         self._switch_account("claude", sender._email)
 
     def _on_codex_account_click(self, sender):
+        # A row showing "Login required" holds a revoked backup; switching to it
+        # can only fail. Send the user straight to the login flow instead.
+        state = self._usage_state_cache.get(("codex", sender._email))
+        if state is not None and not state.available and "Login required" in state.display:
+            self._on_add_codex_account(None)
+            return
         self._switch_account("codex", sender._email)
 
     def _switch_account(self, provider: str, email: str):
@@ -315,13 +323,21 @@ class ClaudeSwitcherApp(rumps.App):
             )
             return
 
+        # Immediate feedback: the menu closes on click, and the login opens in a
+        # separate Terminal window, so without this the click looks like a no-op.
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle="Opening Codex login…",
+            message="Sign in in the Terminal window that appears, then come back here.",
+        )
+
         def _add():
             try:
                 result = add_new_codex_account(self.config_path)
                 if result:
                     title, subtitle, message = (
                         "Claude Switcher",
-                        "Codex account added",
+                        "Signed in to Codex",
                         f"{result.email} ({result.subscription_type})",
                     )
                 else:
@@ -357,6 +373,8 @@ class ClaudeSwitcherApp(rumps.App):
     def _fetch_all_usage(self):
         """Fetch usage for all accounts in a background thread."""
         if self._refresh_in_progress:
+            # Don't silently drop the request: run again once this one finishes.
+            self._refresh_requested = True
             return
         self._refresh_in_progress = True
         accounts = load_accounts(self.config_path)
@@ -399,10 +417,23 @@ class ClaudeSwitcherApp(rumps.App):
                     self._update_usage_labels()
                     for result in auto_switch_results:
                         self._notify_auto_switch_result(result)
+                    if self._manual_refresh:
+                        # The menu closed on click, so tell the user it finished
+                        # and give them the numbers without reopening.
+                        self._manual_refresh = False
+                        rumps.notification(
+                            title="Claude Switcher",
+                            subtitle="Usage updated",
+                            message=self._active_usage_summary(),
+                        )
                     if switched:
                         self._fetch_all_usage()
                     elif should_retry:
                         self._schedule_quick_retry()
+                    elif self._refresh_requested:
+                        # A click landed while this refresh was in flight; honour it.
+                        self._refresh_requested = False
+                        self._fetch_all_usage()
 
                 _on_main_thread(_finish)
 
@@ -515,9 +546,26 @@ class ClaudeSwitcherApp(rumps.App):
             usage_text = self._usage_cache.get(key, "Usage unavailable")
             item.title = f"       \u2502  {usage_text}"
 
+    def _active_usage_summary(self) -> str:
+        """One-line usage for each provider's active account, for notifications."""
+        parts = []
+        for provider in ("claude", "codex"):
+            active = get_active_account(self.config_path, provider=provider)
+            if active:
+                text = self._usage_cache.get(account_key(active), "unavailable")
+                parts.append(f"{PROVIDER_LABELS[provider]}: {text}")
+        return "  ·  ".join(parts) or "Reopen the menu to see usage."
+
     def _on_refresh_usage(self, _):
-        """Refresh usage data for all accounts."""
+        """Refresh usage data for all accounts, with visible feedback."""
         self._quick_retries_left = QUICK_RETRY_BUDGET
+        self._manual_refresh = True
+        # The menu closes on click; without this the click looks like a no-op.
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle="Refreshing usage…",
+            message="You'll get a notice with the numbers when it's done.",
+        )
         self._fetch_all_usage()
 
     def _on_periodic_usage_refresh(self, _):
