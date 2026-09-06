@@ -758,3 +758,38 @@ class TestAddAlwaysOpensLogin:
                 add_new_codex_account(config)
         mock_login.assert_not_called()                     # never cleared/logged in
         assert auth_file.exists()                          # live session untouched
+
+
+class TestCodexLoginEarlyExitAndCancel:
+    """An abandoned Codex login must not hold the add-lease for the full 300s."""
+
+    def test_returns_false_promptly_when_codex_login_exits_without_creds(self, tmp_path):
+        import time as _time
+        done = tmp_path / "login.done"
+        def fake_launch():
+            done.write_text("1\n")           # simulates `codex login` exiting (closed/cancelled)
+        with patch.object(codex_core_mod, "_launch_codex_login_terminal", fake_launch), \
+             patch.object(codex_core_mod, "_codex_login_done_path", lambda: done), \
+             patch.object(codex_core_mod, "CODEX_AUTH_FILE", tmp_path / "missing-auth.json"), \
+             patch.object(codex_core_mod.time, "sleep", lambda s: None):
+            t0 = _time.monotonic()
+            assert codex_core_mod.run_codex_login(timeout=60) is False
+            assert _time.monotonic() - t0 < 5, "should stop early, not poll out the timeout"
+        assert not done.exists()             # marker cleaned up
+
+    def test_cancel_event_stops_the_poll(self, tmp_path):
+        with patch.object(codex_core_mod, "_launch_codex_login_terminal", lambda: codex_core_mod._login_cancel.set()), \
+             patch.object(codex_core_mod, "_codex_login_done_path", lambda: tmp_path / "never.done"), \
+             patch.object(codex_core_mod, "CODEX_AUTH_FILE", tmp_path / "missing-auth.json"), \
+             patch.object(codex_core_mod.time, "sleep", lambda s: None):
+            assert codex_core_mod.run_codex_login(timeout=60) is False
+
+    def test_success_still_wins_over_done_marker(self, tmp_path):
+        # creds present AND marker present -> success (creds are checked first)
+        done = tmp_path / "login.done"; auth = tmp_path / "auth.json"
+        auth.write_text(_auth_json(email="ok@test.com")); done.write_text("0\n")
+        with patch.object(codex_core_mod, "_launch_codex_login_terminal", lambda: None), \
+             patch.object(codex_core_mod, "_codex_login_done_path", lambda: done), \
+             patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth), \
+             patch.object(codex_core_mod.time, "sleep", lambda s: None):
+            assert codex_core_mod.run_codex_login(timeout=60) is True

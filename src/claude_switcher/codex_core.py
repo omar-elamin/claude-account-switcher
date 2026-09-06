@@ -374,6 +374,15 @@ def _restore_codex_credentials(creds: str) -> None:
 def _launch_codex_login_terminal() -> None:
     """Open Terminal.app and run an interactive Codex login command."""
     script_path = Path(tempfile.gettempdir()) / f"claude-switcher-codex-login-{os.getpid()}.command"
+    # Marker the script writes the instant `codex login` exits, so the poll can
+    # stop early (closed window / cancelled / failed) instead of waiting out
+    # the full login timeout. Same pid-derived name as run_codex_login uses.
+    done_path = _codex_login_done_path()
+    try:
+        done_path.unlink()
+    except FileNotFoundError:
+        pass
+    done_q = shlex.quote(str(done_path))
     codex_cmd = shlex.quote(_codex_cmd())
     script = f"""#!/bin/zsh
 echo "Claude Switcher - Codex login"
@@ -383,6 +392,7 @@ echo "When login succeeds, return to Claude Switcher."
 echo ""
 {codex_cmd} login -c 'cli_auth_credentials_store="file"'
 status=$?
+echo $status > {done_q}
 echo ""
 if [ $status -eq 0 ]; then
   echo "Codex login completed. You can close this window."
@@ -406,16 +416,55 @@ exit $status
         raise RuntimeError("Could not open Terminal for Codex login.")
 
 
+def _codex_login_done_path() -> Path:
+    """Marker file the login script writes when `codex login` exits."""
+    return Path(tempfile.gettempdir()) / f"claude-switcher-codex-login-{os.getpid()}.done"
+
+
+_login_cancel = threading.Event()
+
+
+def cancel_codex_login() -> None:
+    """Abort an in-progress Codex sign-in.
+
+    Stops the poll in run_codex_login and kills the `codex login` process that
+    is running inside Terminal (the app does not own that process, so it is
+    found by command line). The add flow then restores the previous credential
+    through its normal cancelled path.
+    """
+    _login_cancel.set()
+    subprocess.run(["pkill", "-f", "codex login -c"], capture_output=True, text=True)
+
+
 def run_codex_login(timeout: int = CODEX_LOGIN_TIMEOUT_SECONDS) -> bool:
-    """Open a visible Codex login flow and wait for file credentials."""
+    """Open a visible Codex login flow and wait for file credentials.
+
+    Returns False early — instead of polling out the full timeout — when the
+    user cancels or when `codex login` exits without writing credentials
+    (closed window, cancelled in the browser, failed).
+    """
+    _login_cancel.clear()
+    done_path = _codex_login_done_path()
     _launch_codex_login_terminal()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        creds = _read_codex_credentials_from_file()
-        if creds and _codex_email_from_credentials(creds):
-            return True
-        time.sleep(2)
-    return False
+    try:
+        while time.monotonic() < deadline:
+            creds = _read_codex_credentials_from_file()
+            if creds and _codex_email_from_credentials(creds):
+                return True
+            if _login_cancel.is_set():
+                return False
+            if done_path.exists():
+                # `codex login` has exited and there are no credentials: the
+                # login was abandoned. Don't hold the add-lease for 5 minutes.
+                return False
+            time.sleep(2)
+        return False
+    finally:
+        try:
+            done_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:

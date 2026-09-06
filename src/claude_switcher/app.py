@@ -176,6 +176,7 @@ class ClaudeSwitcherApp(rumps.App):
         self._add_auto_switch_menu()
         self.menu.add(rumps.MenuItem("\u271A  Add Claude account...", callback=self._on_add_claude_account))
         self.menu.add(rumps.MenuItem("\u271A  Add Codex account...", callback=self._on_add_codex_account))
+        self.menu.add(rumps.MenuItem("\u2715  Cancel sign-in", callback=self._on_cancel_signin))
         self.menu.add(rumps.MenuItem("\u21BB  Refresh usage", callback=self._on_refresh_usage))
 
         if accounts:
@@ -569,6 +570,36 @@ class ClaudeSwitcherApp(rumps.App):
         for key, item in self._usage_items.items():
             usage_text = self._usage_cache.get(key, "Usage unavailable")
             item.title = f"       \u2502  {usage_text}"
+
+    def _on_cancel_signin(self, _):
+        """Abort whichever sign-in is in progress and restore the previous login.
+
+        Each provider's add flow treats a cancelled login as its normal
+        cancelled path, so it restores the snapshot and releases the add-lease.
+        """
+        from claude_switcher.codex_core import cancel_codex_login
+        from claude_switcher.core import cancel_login as cancel_claude_login
+
+        cancelled = []
+        if _add_lease_held("claude"):
+            cancel_claude_login()
+            cancelled.append("Claude")
+        if _add_lease_held("codex"):
+            cancel_codex_login()
+            cancelled.append("Codex")
+
+        if not cancelled:
+            rumps.notification(
+                title="Claude Switcher",
+                subtitle="Nothing to cancel",
+                message="No sign-in is in progress.",
+            )
+            return
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle="Sign-in cancelled",
+            message=f"{' and '.join(cancelled)} sign-in stopped. Your previous login is being restored.",
+        )
 
     def _active_usage_summary(self) -> str:
         """One-line usage for each provider's active account, for notifications."""

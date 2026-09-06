@@ -435,3 +435,37 @@ class TestClaudeAddIdentityGuard:
             assert call.args[0] != "claude-switcher:A@test.com", (
                 "add clobbered A's backup with a non-A credential"
             )
+
+
+class TestClaudeLoginTimeoutAndCancel:
+    """An abandoned Claude login must not hold the add-lease forever."""
+
+    def test_login_times_out_and_kills_process(self):
+        proc = MagicMock()
+        proc.wait.side_effect = [core_mod.subprocess.TimeoutExpired("claude", 1), 0]
+        with patch.object(core_mod.subprocess, "Popen", return_value=proc), \
+             patch.object(core_mod, "_claude_cmd", return_value="claude"):
+            assert core_mod.run_auth_login(timeout=1) is False
+        proc.kill.assert_called_once()
+        assert core_mod._login_proc is None          # handle cleared
+
+    def test_cancel_kills_running_login(self):
+        proc = MagicMock(); proc.poll.return_value = None
+        with core_mod._login_proc_lock:
+            core_mod._login_proc = proc
+        try:
+            core_mod.cancel_login()
+        finally:
+            with core_mod._login_proc_lock:
+                core_mod._login_proc = None
+        proc.kill.assert_called_once()
+        assert core_mod._login_cancel.is_set()
+
+    def test_cancelled_login_returns_false_even_if_exit_zero(self):
+        proc = MagicMock(); proc.wait.return_value = 0
+        def popen(*a, **k):
+            core_mod._login_cancel.set()             # cancel arrives while waiting
+            return proc
+        with patch.object(core_mod.subprocess, "Popen", popen), \
+             patch.object(core_mod, "_claude_cmd", return_value="claude"):
+            assert core_mod.run_auth_login(timeout=5) is False

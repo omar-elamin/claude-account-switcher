@@ -103,10 +103,50 @@ def run_auth_logout() -> None:
     subprocess.run([_claude_cmd(), "auth", "logout"], capture_output=True, text=True)
 
 
-def run_auth_login() -> bool:
-    """Run `claude auth login`. Returns True if successful (exit code 0)."""
-    result = subprocess.run([_claude_cmd(), "auth", "login"])
-    return result.returncode == 0
+CLAUDE_LOGIN_TIMEOUT_SECONDS = 300
+_login_cancel = threading.Event()
+_login_proc: subprocess.Popen | None = None
+_login_proc_lock = threading.Lock()
+
+
+def cancel_login() -> None:
+    """Abort an in-progress Claude sign-in by killing `claude auth login`.
+
+    run_auth_login then returns False and the add flow restores the previous
+    credential through its normal cancelled path.
+    """
+    _login_cancel.set()
+    with _login_proc_lock:
+        proc = _login_proc
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+
+
+def run_auth_login(timeout: int = CLAUDE_LOGIN_TIMEOUT_SECONDS) -> bool:
+    """Run `claude auth login`, bounded by a timeout and cancellable.
+
+    This used to be a bare subprocess.run with no timeout, so an abandoned
+    login (browser tab closed, callback never arrives) held the add-lease
+    forever — until the app was restarted. Returns True only on exit code 0.
+    """
+    global _login_proc
+    _login_cancel.clear()
+    proc = subprocess.Popen([_claude_cmd(), "auth", "login"])
+    with _login_proc_lock:
+        _login_proc = proc
+    try:
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return False
+        if _login_cancel.is_set():
+            return False
+        return returncode == 0
+    finally:
+        with _login_proc_lock:
+            _login_proc = None
 
 
 def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:

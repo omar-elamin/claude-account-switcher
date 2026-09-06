@@ -199,3 +199,28 @@ class TestLeaseKeepsLastKnownUsage:
         app._fetch_usage_state.assert_not_called()                 # leased row skipped
         assert app._usage_cache[("codex", "a@test.com")] == "1h 5%" # last-known kept, not Checking…
         app._schedule_quick_retry.assert_not_called()               # no retry cycle during sign-in
+
+
+class TestCancelSignIn:
+    def _app(self, app_module):
+        return app_module.ClaudeSwitcherApp.__new__(app_module.ClaudeSwitcherApp)
+
+    def test_cancels_only_the_provider_whose_lease_is_held(self, app_module):
+        app = self._app(app_module)
+        app_module.rumps.notification.reset_mock()
+        with patch.object(app_module, "_add_lease_held", lambda p: p == "codex"), \
+             patch("claude_switcher.codex_core.cancel_codex_login") as cx, \
+             patch("claude_switcher.core.cancel_login") as cl:
+            app._on_cancel_signin(None)
+        cx.assert_called_once(); cl.assert_not_called()
+        assert app_module.rumps.notification.call_args.kwargs["subtitle"] == "Sign-in cancelled"
+
+    def test_nothing_to_cancel(self, app_module):
+        app = self._app(app_module)
+        app_module.rumps.notification.reset_mock()
+        with patch.object(app_module, "_add_lease_held", lambda p: False), \
+             patch("claude_switcher.codex_core.cancel_codex_login") as cx, \
+             patch("claude_switcher.core.cancel_login") as cl:
+            app._on_cancel_signin(None)
+        cx.assert_not_called(); cl.assert_not_called()
+        assert app_module.rumps.notification.call_args.kwargs["subtitle"] == "Nothing to cancel"
