@@ -72,6 +72,21 @@ def _plan_quick_retry(states, retries_left):
     return True, retries_left - 1
 
 
+def _add_lease_held(provider: str) -> bool:
+    """True while an interactive sign-in for this provider is in progress.
+
+    During a sign-in the provider's live credential is cleared and its
+    persistence is locked, so any usage fetch can only come back "unavailable".
+    Callers use this to keep the last known numbers on screen rather than
+    painting rows "Checking…" for the whole login window (up to 5 minutes).
+    """
+    from claude_switcher import codex_core as _codex
+    from claude_switcher import core as _core
+
+    flag = _core._add_in_progress if provider == "claude" else _codex._add_in_progress
+    return bool(flag)
+
+
 def _on_main_thread(fn):
     """Schedule fn() to run on the main thread via Cocoa's operation queue."""
     NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
@@ -388,6 +403,11 @@ class ClaudeSwitcherApp(rumps.App):
             try:
                 for account in accounts:
                     key = account_key(account)
+                    if _add_lease_held(account.provider):
+                        # Sign-in in progress for this provider: a fetch can only
+                        # return "unavailable". Keep the last known numbers; the
+                        # post-login refresh will resolve these rows.
+                        continue
                     state = self._fetch_usage_state(account, active_by_provider.get(account.provider))
                     self._usage_state_cache[key] = state
                     self._usage_cache[key] = state.display
@@ -407,6 +427,10 @@ class ClaudeSwitcherApp(rumps.App):
                     should_retry, self._quick_retries_left = _plan_quick_retry(
                         states, self._quick_retries_left
                     )
+                    if should_retry and any(_add_lease_held(a.provider) for a in accounts):
+                        # Don't cycle "Checking…"/retries while a sign-in is in
+                        # progress; the post-login refresh resolves the rows.
+                        should_retry = False
                     if should_retry:
                         # Show progress on the rows that have no data yet, rather
                         # than leaving them reading "Usage unavailable".

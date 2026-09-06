@@ -159,3 +159,43 @@ class TestRefreshAndLoginRouting:
         app._switch_account = MagicMock()
         app._on_codex_account_click(SimpleNamespace(_email="ok@test.com"))
         app._switch_account.assert_called_once_with("codex", "ok@test.com")
+
+
+class TestLeaseKeepsLastKnownUsage:
+    """Regression: while a sign-in is in progress (add-lease held), rows for that
+    provider must keep their last known numbers, not flip to 'Checking…'."""
+
+    def test_leased_provider_rows_are_skipped_and_not_retried(self, app_module):
+        UsageState = importlib.import_module("claude_switcher.usage_state").UsageState
+        AccountInfo = importlib.import_module("claude_switcher.config").AccountInfo
+        app = app_module.ClaudeSwitcherApp.__new__(app_module.ClaudeSwitcherApp)
+        app._refresh_in_progress = False
+        app._refresh_requested = False
+        app._manual_refresh = False
+        app._quick_retries_left = app_module.QUICK_RETRY_BUDGET
+        app._usage_state_cache = {("codex", "a@test.com"): UsageState(available=True, display="1h 5%")}
+        app._usage_cache = {("codex", "a@test.com"): "1h 5%"}
+        app._usage_items = {}
+        app.config_path = "unused"
+        app._schedule_quick_retry = MagicMock()
+        app._update_usage_labels = MagicMock()
+        app._rebuild_menu = MagicMock()
+        app._attempt_auto_switch = MagicMock(return_value=None)
+        app._fetch_usage_state = MagicMock(return_value=UsageState(available=False, display="Usage unavailable"))
+        accts = [AccountInfo("a@test.com", "plus", "", True, "a", provider="codex")]
+
+        # run the fetch synchronously: patch Thread to call target inline, main-thread to inline
+        import threading as _th
+        class _Inline:
+            def __init__(self, target, daemon=None): self.t = target
+            def start(self): self.t()
+        with patch.object(app_module, "load_accounts", return_value=accts), \
+             patch.object(app_module, "get_active_account", return_value=None), \
+             patch.object(app_module, "_add_lease_held", return_value=True), \
+             patch.object(app_module.threading, "Thread", _Inline), \
+             patch.object(app_module, "_on_main_thread", lambda fn: fn()):
+            app._fetch_all_usage()
+
+        app._fetch_usage_state.assert_not_called()                 # leased row skipped
+        assert app._usage_cache[("codex", "a@test.com")] == "1h 5%" # last-known kept, not Checking…
+        app._schedule_quick_retry.assert_not_called()               # no retry cycle during sign-in
