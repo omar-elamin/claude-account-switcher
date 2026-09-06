@@ -14,6 +14,7 @@ This repository is a fork of [Symbioose/claude-account-switcher](https://github.
 - Switch the active Codex CLI account the same way
 - Live usage for every saved account, shown under each row in the menu
 - Optional auto-switch, per provider, when the active account reaches its limit
+- Show, spend, and optionally auto-spend the banked Codex rate-limit resets an account holds
 - First launch imports the Claude and Codex accounts that are already signed in
 - Saved credentials live in macOS Keychain, not in a config file
 
@@ -41,9 +42,11 @@ From top to bottom:
 - A header per provider: `── Claude Code ──` and `── Codex CLI ──`.
 - Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted. (The Claude row says `Usage indisponible`, a French leftover.)
 - `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled".
+- `Auto-reset` submenu with one item, `Codex CLI`, with a checkmark when enabled. Clicking it toggles the setting, and a notification says "Enabled" or "Disabled".
 - `✚ Add Claude account...` and `✚ Add Codex account...`
 - `↻ Refresh usage`
 - `− Remove account` submenu. It lists every saved account as `[Claude] email` or `[Codex] email`, including the active one. Choosing the active account shows an alert instead of removing it: "You cannot remove the active Claude Code account. Switch first." (or "… active Codex CLI account …").
+- `↺ Reset Codex usage` submenu. It lists the Codex accounts that can apply a reset right now, as `email (N available)`. If none can, it shows one disabled item: `No reset applicable now`.
 - `⏻ Quit`
 
 ### Usage display
@@ -59,10 +62,10 @@ The first segment is the 5-hour window. The second is the 7-day window, labelled
 A Codex row looks like this:
 
 ```text
-7d 39% (2d 11h)
+7d 100% (3h 24m) · 2 resets
 ```
 
-There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window.
+There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window. When an account holds banked resets, the row ends with `· N resets` (`· 1 reset` for one). See [Rate-limit resets](#rate-limit-resets).
 
 Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
 
@@ -106,6 +109,20 @@ Auto-switch is off by default and is set per provider. When it is on for a provi
 
 The threshold is `auto_switch_threshold` in the config file (default 100).
 
+### Rate-limit resets
+
+A banked reset is a one-time Codex usage reset that OpenAI grants to a ChatGPT account (Go, Plus, Pro, and Business plans). It is stored on the account and expires 30 days after it is granted. Using one resets both the 5-hour and the weekly window of that account.
+
+Only an account that is currently at a limit can apply a reset. The app reads this from the usage API, which reports both how many resets the account holds and how many it can apply now.
+
+To use one by hand, open `↺ Reset Codex usage` and click the account. A dialog asks: "Use 1 of N banked resets for {email}? This resets that account's Codex 5-hour and weekly windows and cannot be undone." with **Reset** and **Cancel**. After you confirm, a notification reports the result: "Reset applied", "Nothing to reset", "No reset credit available", "Already redeemed", or the error. Usage then refreshes.
+
+Auto-reset is off by default and exists for Codex only. When it is on, after each usage refresh the app checks whether the active Codex account is at its limit and no other saved Codex account has room. Only then does it spend one reset: on the active account if it can apply one, otherwise on another exhausted account that can. It works whether or not Auto-switch is on. Two guards apply: at least 60 seconds between attempts, and never the same account twice within an hour, so a reset that did not take effect cannot burn a second one. Auto-reset never switches accounts by itself. If Auto-switch is on, the next refresh can move to the account that now has room.
+
+The setting is stored as `auto_reset` in the config file, next to `auto_switch`.
+
+Claude Code has no reset feature. Nothing changes for Claude accounts.
+
 ### First launch
 
 With no config file yet, the app imports the currently signed-in Claude and Codex accounts. If the Codex import fails (for example, unsupported credential storage), the app notifies you and continues.
@@ -113,6 +130,8 @@ With no config file yet, the app imports the currently signed-in Claude and Code
 ## How it works
 
 Claude Code stores its OAuth credentials in macOS Keychain under `Claude Code-credentials` and account metadata in `~/.claude.json`. Codex CLI stores its ChatGPT session in `~/.codex/auth.json` when `cli_auth_credentials_store = "file"` is set. Claude Switcher keeps one Keychain backup per saved account and copies the selected backup into the CLI's live slot on switch.
+
+A Codex reset is sent to `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`, the same endpoint the Codex CLI uses, with the same headers as the usage call and an idempotency key (a UUID). The app never sends it for an account that cannot apply a reset, and on a network timeout it retries once with the same key, so a reset is never applied twice.
 
 ```text
 macOS Keychain
@@ -193,7 +212,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 261 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 357 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
