@@ -52,8 +52,8 @@ def test_codex_add_lease_conflict_is_not_reported_as_switch_success(app_module, 
     fake_rumps.notification.reset_mock()
     fake_rumps.alert.reset_mock()
 
-    with patch.object(app_module, "get_active_account", return_value=None), patch.object(
-        app_module, "switch_codex_account", side_effect=RuntimeError("add in progress")
+    with patch.object(app_module, "get_active_account", return_value=None), patch.dict(
+        app_module.PROVIDERS["codex"], {"switch": MagicMock(side_effect=RuntimeError("add in progress"))}
     ), patch.object(app_module.threading, "Thread", ImmediateThread), patch.object(
         app_module, "_on_main_thread", side_effect=lambda fn: fn()
     ):
@@ -229,7 +229,7 @@ class TestAddRestartsInProgressSignIn:
                     events.append("wait")
                     return released
                 entry = (label, check, add, cancel, f"Sign in in the {window} window that appears, then come back here.")
-                with patch.dict(app_module.ADD_PROVIDERS, {provider: entry}), \
+                with patch.dict(app_module.PROVIDERS[provider], {"add": entry}), \
                      patch.object(app_module, "_add_lease_held", return_value=held), \
                      patch.object(app_module.time, "time", return_value=100.0), \
                      patch.object(app_module, "_wait_for_lease_release", side_effect=wait), \
@@ -282,7 +282,7 @@ class TestAddRestartsInProgressSignIn:
             (add_items[1], "Codex", "Terminal", "check_codex_cli", "add_new_codex_account", "cancel_codex_login", "Signed in to Codex"),
         ):
             provider = item._provider
-            entry = app_module.ADD_PROVIDERS[provider]
+            entry = app_module.PROVIDERS[provider]["add"]
             assert entry == (label, getattr(app_module, cli), getattr(app_module, add_name),
                              getattr(app_module, cancel_name),
                              f"Sign in in the {window} window that appears, then come back here.")
@@ -296,7 +296,7 @@ class TestAddRestartsInProgressSignIn:
                 if outcome == "error":
                     add.side_effect = RuntimeError("login failed")
                 cancel = MagicMock()
-                with patch.dict(app_module.ADD_PROVIDERS, {provider: (label, check, add, cancel, entry[4])}), \
+                with patch.dict(app_module.PROVIDERS[provider], {"add": (label, check, add, cancel, entry[4])}), \
                      patch.object(app_module, "_add_lease_held", return_value=False), \
                      patch.object(app_module.time, "time", return_value=100.0), \
                      patch.object(app_module, "_wait_for_lease_release") as wait, \
@@ -357,3 +357,148 @@ class TestAddRestartsInProgressSignIn:
             assert app._signing_in("codex") is False
         with patch.object(app_module, "_add_lease_held", lambda p: p == "claude"):
             assert app._signing_in("claude") is True
+
+
+@pytest.mark.parametrize("provider,active_fn,saved_fn,state_fn", [
+    ("claude", "fetch_active_usage", "fetch_usage_for_account", "claude_usage_state"),
+    ("codex", "fetch_active_codex_usage", "fetch_codex_usage_for_account", "codex_usage_state"),
+])
+@pytest.mark.parametrize("active_email", [None, "same@test.com", "other@test.com"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_provider_usage_selects_live_or_saved_credentials(
+    app_module, tmp_path, provider, active_fn, saved_fn, state_fn, active_email, fails
+):
+    app = _app_shell(app_module, tmp_path)
+    account = SimpleNamespace(provider=provider, email="same@test.com")
+    active = SimpleNamespace(email=active_email) if active_email else None
+    raw = object()
+    expected = app_module.UsageState(available=True, display="5h 25%")
+    entry = app_module.PROVIDERS[provider]
+    assert entry["fetch_active_usage"] is getattr(app_module, active_fn)
+    assert entry["fetch_usage"] is getattr(app_module, saved_fn)
+    assert entry["usage_state"] is getattr(app_module, state_fn)
+    live, saved, convert = MagicMock(return_value=raw), MagicMock(return_value=raw), MagicMock(return_value=expected)
+    with patch.dict(entry, {"fetch_active_usage": live, "fetch_usage": saved, "usage_state": convert}):
+        selected = live if active_email == account.email else saved
+        if fails:
+            selected.side_effect = RuntimeError("fetch failed")
+        state = app._fetch_usage_state(account, active)
+    if active_email == account.email:
+        live.assert_called_once_with()
+        saved.assert_not_called()
+    else:
+        saved.assert_called_once_with(account.email)
+        live.assert_not_called()
+    if fails:
+        assert state == app_module.UsageState(available=False, display="Usage unavailable")
+        convert.assert_not_called()
+    else:
+        assert state is expected
+        convert.assert_called_once_with(raw)
+
+
+def test_unknown_provider_usage_remains_unavailable(app_module, tmp_path):
+    app = _app_shell(app_module, tmp_path)
+    state = app._fetch_usage_state(SimpleNamespace(provider="unknown", email="a@test.com"), None)
+    assert state == app_module.UsageState(available=False, display="Usage unavailable")
+
+
+@pytest.mark.parametrize("provider,switch_fn", [
+    ("claude", "switch_account"), ("codex", "switch_codex_account"),
+])
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_provider_switch_dispatch_and_result(app_module, tmp_path, provider, switch_fn, automatic, fails):
+    app = _app_shell(app_module, tmp_path)
+    active = SimpleNamespace(provider=provider, email="active@test.com")
+    target = SimpleNamespace(provider=provider, email="target@test.com")
+    app._usage_state_cache = {(provider, active.email): app_module.UsageState(available=True, display="100%")}
+    app._last_auto_switch_attempt = {}
+    settings = SimpleNamespace(auto_switch={provider: True}, auto_switch_threshold=95)
+    fake_rumps.notification.reset_mock()
+    fake_rumps.alert.reset_mock()
+    assert app_module.PROVIDERS[provider]["switch"] is getattr(app_module, switch_fn)
+    switch = MagicMock(side_effect=RuntimeError("switch failed") if fails else None)
+    with patch.dict(app_module.PROVIDERS[provider], {"switch": switch}), \
+         patch.object(app_module, "get_active_account", return_value=active), \
+         patch.object(app_module, "load_settings", return_value=settings), \
+         patch.object(app_module, "load_accounts", return_value=[active, target]), \
+         patch.object(app_module, "should_auto_switch", return_value=True), \
+         patch.object(app_module, "choose_auto_switch_target", return_value=target), \
+         patch.object(app_module.threading, "Thread", ImmediateThread), \
+         patch.object(app_module, "_on_main_thread", side_effect=lambda fn: fn()):
+        if automatic:
+            result = app._attempt_auto_switch(provider)
+            assert result == ({"status": "error", "provider": provider, "email": active.email,
+                               "message": "switch failed"} if fails else
+                              {"status": "switched", "provider": provider, "email": target.email})
+        else:
+            app._switch_account(provider, target.email)
+            assert app._switch_in_progress == set()
+            app._rebuild_menu.assert_called_once_with()
+            app._fetch_all_usage.assert_called_once_with()
+            if fails:
+                fake_rumps.alert.assert_called_once_with(title="Error", message="switch failed")
+                fake_rumps.notification.assert_not_called()
+            else:
+                fake_rumps.alert.assert_not_called()
+                fake_rumps.notification.assert_called_once_with(
+                    title="Claude Switcher",
+                    subtitle=f"{app_module.PROVIDER_LABELS[provider]} account switched", message=target.email)
+    switch.assert_called_once_with(target.email, app.config_path)
+
+
+def test_provider_lease_reads_current_flags_independently(app_module):
+    from claude_switcher import core, codex_core
+    for claude_held, codex_held in [(False, True), (True, False), (False, False)]:
+        with patch.object(core, "_add_in_progress", claude_held), \
+             patch.object(codex_core, "_add_in_progress", codex_held):
+            assert app_module._add_lease_held("claude") is claude_held
+            assert app_module._add_lease_held("codex") is codex_held
+
+
+def test_provider_menu_preserves_groups_credentials_and_click_routing(app_module, tmp_path):
+    app = _app_shell(app_module, tmp_path)
+    app.menu = MagicMock()
+    app._usage_cache = {}
+    app._usage_state_cache = {("codex", "same@test.com"):
+                             app_module.UsageState(available=False, display="Login required")}
+    app._add_auto_switch_menu = MagicMock()
+    app._switch_account = MagicMock()
+    app._on_add = MagicMock()
+    accounts = [SimpleNamespace(provider=p, email="same@test.com", active=False, subscription_type="pro")
+                for p in ("codex", "claude")]
+    def menu_item(title, callback=None):
+        return SimpleNamespace(title=title, callback=callback, add=MagicMock(), set_callback=MagicMock())
+    with patch.object(app_module, "load_accounts", return_value=accounts), \
+         patch.object(app_module.keychain, "read_credentials", return_value="credentials") as read, \
+         patch.object(app_module.rumps, "MenuItem", side_effect=menu_item):
+        app_module.ClaudeSwitcherApp._rebuild_menu(app)
+    assert [call.args[0] for call in read.call_args_list] == [
+        "claude-switcher:same@test.com", "codex-switcher:same@test.com"]
+    items = [call.args[0] for call in app.menu.add.call_args_list]
+    assert [getattr(item, "title", None) for item in items[:7]] == [
+        "── Claude Code ──", "○  same@test.com (pro)", "       │  •••", None,
+        "── Codex CLI ──", "○  same@test.com (pro)", "       │  •••"]
+    for item in (items[1], items[5]):
+        item.callback(item)
+    app._switch_account.assert_called_once_with("claude", "same@test.com")
+    app._on_add.assert_called_once_with(items[5])
+    remove = next(item for item in items if getattr(item, "title", None) == "−  Remove account")
+    assert [(call.args[0].title, call.args[0]._provider) for call in remove.add.call_args_list] == [
+        ("[Codex] same@test.com", "codex"), ("[Claude] same@test.com", "claude")]
+
+
+def test_claude_removal_none_return_is_success(app_module, tmp_path):
+    app = _app_shell(app_module, tmp_path)
+    fake_rumps.notification.reset_mock()
+    fake_rumps.alert.reset_mock()
+    with patch.object(app_module, "get_active_account", return_value=None), \
+         patch.object(app_module, "remove_saved_account", return_value=None) as remove:
+        app._on_remove_account(SimpleNamespace(_provider="claude", _email="idle@test.com"))
+    remove.assert_called_once_with("idle@test.com", app.config_path)
+    fake_rumps.alert.assert_not_called()
+    fake_rumps.notification.assert_called_once_with(
+        title="Claude Switcher", subtitle="Claude Code account removed", message="idle@test.com")
+    app._rebuild_menu.assert_called_once_with()
+    app._fetch_all_usage.assert_called_once_with()

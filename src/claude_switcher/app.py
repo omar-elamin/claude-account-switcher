@@ -7,7 +7,7 @@ from pathlib import Path
 import rumps
 from Foundation import NSOperationQueue
 
-from claude_switcher import keychain
+from claude_switcher import codex_core, core, keychain
 from claude_switcher.auto_switch import (
     account_key,
     choose_auto_switch_target,
@@ -49,16 +49,37 @@ PROVIDER_LABELS = {
     "claude": "Claude Code",
     "codex": "Codex CLI",
 }
-# Add-flow differences: label, check_cli, add_fn, cancel_fn, login_instruction.
-ADD_PROVIDERS = {
-    "claude": (
-        "Claude", check_claude_cli, add_new_account, cancel_login,
-        "Sign in in the browser window that appears, then come back here.",
-    ),
-    "codex": (
-        "Codex", check_codex_cli, add_new_codex_account, cancel_codex_login,
-        "Sign in in the Terminal window that appears, then come back here.",
-    ),
+# Provider-specific Add inputs and app dispatch/display values.
+# add: (label, check_cli, add_fn, cancel_fn, login_instruction).
+PROVIDERS = {
+    "claude": {
+        "add": (
+            "Claude", check_claude_cli, add_new_account, cancel_login,
+            "Sign in in the browser window that appears, then come back here.",
+        ),
+        "add_success": "Claude account added",
+        "core": core,
+        "credential_prefix": "claude-switcher:",
+        "account_click": "_on_claude_account_click",
+        "switch": switch_account,
+        "fetch_active_usage": fetch_active_usage,
+        "fetch_usage": fetch_usage_for_account,
+        "usage_state": claude_usage_state,
+    },
+    "codex": {
+        "add": (
+            "Codex", check_codex_cli, add_new_codex_account, cancel_codex_login,
+            "Sign in in the Terminal window that appears, then come back here.",
+        ),
+        "add_success": "Signed in to Codex",
+        "core": codex_core,
+        "credential_prefix": "codex-switcher:",
+        "account_click": "_on_codex_account_click",
+        "switch": switch_codex_account,
+        "fetch_active_usage": fetch_active_codex_usage,
+        "fetch_usage": fetch_codex_usage_for_account,
+        "usage_state": codex_usage_state,
+    },
 }
 AUTO_SWITCH_COOLDOWN_SECONDS = 60
 
@@ -93,11 +114,8 @@ def _add_lease_held(provider: str) -> bool:
     Callers use this to keep the last known numbers on screen rather than
     painting rows "Checking…" for the whole login window (up to 5 minutes).
     """
-    from claude_switcher import codex_core as _codex
-    from claude_switcher import core as _core
-
-    flag = _core._add_in_progress if provider == "claude" else _codex._add_in_progress
-    return bool(flag)
+    entry = PROVIDERS.get(provider, PROVIDERS["codex"])
+    return bool(entry["core"]._add_in_progress)
 
 
 def _wait_for_lease_release(provider: str, timeout: float = 15.0) -> bool:
@@ -148,6 +166,7 @@ class ClaudeSwitcherApp(rumps.App):
         claude_available = check_claude_cli()
         codex_available = check_codex_cli()
 
+        # Claude import failures propagate; only Codex import failures are skipped below.
         if claude_available:
             imported = import_current_account(self.config_path)
             if imported:
@@ -158,6 +177,7 @@ class ClaudeSwitcherApp(rumps.App):
                     message=f"{imported.email} ({imported.subscription_type})",
                 )
 
+        # Codex import can reject its auth storage; notify and continue first launch.
         if codex_available:
             try:
                 imported = import_current_codex_account(self.config_path)
@@ -188,19 +208,20 @@ class ClaudeSwitcherApp(rumps.App):
         self.menu.clear()
         self._usage_items = {}
 
-        claude_accounts = [a for a in accounts if a.provider == "claude"]
-        codex_accounts = [a for a in accounts if a.provider == "codex"]
-
-        if claude_accounts:
-            self._add_provider_section("claude", claude_accounts)
-        if codex_accounts:
-            if claude_accounts:
-                self.menu.add(rumps.separator)
-            self._add_provider_section("codex", codex_accounts)
+        section_added = False
+        for provider in PROVIDERS:
+            # Keep each provider's accounts in its own section, even for shared emails.
+            provider_accounts = [a for a in accounts if a.provider == provider]
+            if provider_accounts:
+                if section_added:
+                    self.menu.add(rumps.separator)
+                self._add_provider_section(provider, provider_accounts)
+                section_added = True
 
         self.menu.add(rumps.separator)
         self._add_auto_switch_menu()
-        for provider, (label, _, _, _, _) in ADD_PROVIDERS.items():
+        for provider, entry in PROVIDERS.items():
+            label = entry["add"][0]
             item = rumps.MenuItem(f"\u271A  Add {label} account...", callback=self._on_add)
             item._provider = provider
             self.menu.add(item)
@@ -209,7 +230,7 @@ class ClaudeSwitcherApp(rumps.App):
         if accounts:
             remove_menu = rumps.MenuItem("\u2212  Remove account")
             for account in accounts:
-                provider_label = "Claude" if account.provider == "claude" else "Codex"
+                provider_label = PROVIDERS.get(account.provider, PROVIDERS["codex"])["add"][0]
                 item = rumps.MenuItem(f"[{provider_label}] {account.email}", callback=self._on_remove_account)
                 item._email = account.email
                 item._provider = account.provider
@@ -229,11 +250,7 @@ class ClaudeSwitcherApp(rumps.App):
             prefix = "\u25C9  " if account.active else "\u25CB  "
             if has_creds:
                 label = f"{prefix}{account.email} ({account.subscription_type})"
-                callback = (
-                    self._on_claude_account_click
-                    if provider == "claude"
-                    else self._on_codex_account_click
-                )
+                callback = getattr(self, PROVIDERS[provider]["account_click"])
                 item = rumps.MenuItem(label, callback=callback)
             else:
                 item = rumps.MenuItem(f"{prefix}{account.email} (unavailable)", callback=None)
@@ -261,19 +278,15 @@ class ClaudeSwitcherApp(rumps.App):
         self.menu.add(auto_menu)
 
     def _has_credentials(self, account) -> bool:
-        service = (
-            f"claude-switcher:{account.email}"
-            if account.provider == "claude"
-            else f"codex-switcher:{account.email}"
-        )
+        entry = PROVIDERS.get(account.provider, PROVIDERS["codex"])
+        service = f"{entry['credential_prefix']}{account.email}"
         return keychain.read_credentials(service) is not None
 
     def _on_claude_account_click(self, sender):
         self._switch_account("claude", sender._email)
 
     def _on_codex_account_click(self, sender):
-        # A row showing "Login required" holds a revoked backup; switching to it
-        # can only fail. Send the user straight to the login flow instead.
+        # Codex revoked backups open login instead of switching; Claude rows always switch.
         state = self._usage_state_cache.get(("codex", sender._email))
         if state is not None and not state.available and "Login required" in state.display:
             self._on_add(sender)
@@ -297,10 +310,7 @@ class ClaudeSwitcherApp(rumps.App):
         def _switch():
             error = None
             try:
-                if provider == "claude":
-                    switch_account(email, self.config_path)
-                else:
-                    switch_codex_account(email, self.config_path)
+                PROVIDERS.get(provider, PROVIDERS["codex"])["switch"](email, self.config_path)
             except Exception as exc:
                 error = str(exc)
 
@@ -324,7 +334,8 @@ class ClaudeSwitcherApp(rumps.App):
     def _on_add(self, sender):
         """Add an account through the selected provider's login flow."""
         provider = sender._provider
-        label, check_cli, add_fn, cancel_fn, login_instruction = ADD_PROVIDERS[provider]
+        entry = PROVIDERS[provider]
+        label, check_cli, add_fn, cancel_fn, login_instruction = entry["add"]
         if not check_cli():
             rumps.alert(
                 title=f"{label} CLI not found",
@@ -353,7 +364,7 @@ class ClaudeSwitcherApp(rumps.App):
                 if result:
                     title, subtitle, message = (
                         "Claude Switcher",
-                        "Claude account added" if provider == "claude" else "Signed in to Codex",
+                        entry["add_success"],
                         f"{result.email} ({result.subscription_type})",
                     )
                 else:
@@ -478,20 +489,13 @@ class ClaudeSwitcherApp(rumps.App):
 
     def _fetch_usage_state(self, account, active_account) -> UsageState:
         try:
-            if account.provider == "claude":
-                usage = (
-                    fetch_active_usage()
-                    if active_account and active_account.email == account.email
-                    else fetch_usage_for_account(account.email)
-                )
-                return claude_usage_state(usage)
-            if account.provider == "codex":
-                usage = (
-                    fetch_active_codex_usage()
-                    if active_account and active_account.email == account.email
-                    else fetch_codex_usage_for_account(account.email)
-                )
-                return codex_usage_state(usage)
+            entry = PROVIDERS[account.provider]
+            usage = (
+                entry["fetch_active_usage"]()
+                if active_account and active_account.email == account.email
+                else entry["fetch_usage"](account.email)
+            )
+            return entry["usage_state"](usage)
         except Exception:
             pass
         return UsageState(available=False, display="Usage unavailable")
@@ -529,10 +533,7 @@ class ClaudeSwitcherApp(rumps.App):
             return {"status": "no_target", "provider": provider, "email": active.email}
 
         try:
-            if provider == "claude":
-                switch_account(target.email, self.config_path)
-            else:
-                switch_codex_account(target.email, self.config_path)
+            PROVIDERS.get(provider, PROVIDERS["codex"])["switch"](target.email, self.config_path)
         except Exception as exc:
             return {
                 "status": "error",
@@ -628,6 +629,7 @@ class ClaudeSwitcherApp(rumps.App):
             return
 
         try:
+            # Claude signals failure by exception; Codex also returns False for busy/changed accounts.
             if provider == "claude":
                 remove_saved_account(email, self.config_path)
             elif not remove_codex_account(email, self.config_path):
