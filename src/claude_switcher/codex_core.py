@@ -1,11 +1,9 @@
 """Business logic for Codex CLI account management."""
 
-import base64
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -22,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10
     import tomli as tomllib
 
 from claude_switcher import keychain
+from claude_switcher.common import _EMAIL_RE, _decode_jwt_payload, _find_binary, _validate_email
 from claude_switcher.config import (
     AccountInfo,
     add_account,
@@ -53,35 +52,15 @@ _add_in_progress = False
 class CodexCredentialsExpiredError(RuntimeError):
     """Raised when Codex refresh tokens have already been consumed or revoked."""
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-_EXTRA_PATHS = [
-    Path.home() / ".local" / "bin",
-    Path("/usr/local/bin"),
-    Path("/opt/homebrew/bin"),
-]
-
-
-def _find_codex() -> str | None:
-    """Find the codex binary, checking common install locations beyond PATH."""
-    found = shutil.which("codex")
-    if found:
-        return found
-    for directory in _EXTRA_PATHS:
-        candidate = directory / "codex"
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
 
 def check_codex_cli() -> bool:
     """Check if the Codex CLI is available."""
-    return _find_codex() is not None
+    return _find_binary("codex") is not None
 
 
 def _codex_cmd() -> str:
     """Return the path to the Codex binary, or 'codex' as fallback."""
-    return _find_codex() or "codex"
+    return _find_binary("codex") or "codex"
 
 
 def get_codex_auth_status() -> dict | None:
@@ -94,13 +73,6 @@ def get_codex_auth_status() -> dict | None:
     if result.returncode != 0:
         return None
     return {"loggedIn": True, "message": result.stdout.strip() or result.stderr.strip()}
-
-
-def _validate_email(email: str) -> str:
-    """Validate email before using it in Keychain service names."""
-    if not _EMAIL_RE.match(email) or len(email) > 254:
-        raise RuntimeError(f"Invalid email format: {email}")
-    return email
 
 
 def _codex_credentials_store() -> str:
@@ -170,20 +142,6 @@ def _read_codex_credentials_for_import_raw() -> str | None:
     if store == "keyring":
         raise RuntimeError(CODEX_KEYRING_UNSUPPORTED_MESSAGE)
     return _read_codex_credentials_from_file()
-
-
-def _decode_jwt_payload(token: str) -> dict | None:
-    """Decode a JWT payload without verification."""
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        decoded = base64.urlsafe_b64decode(payload)
-        return json.loads(decoded)
-    except Exception:
-        return None
 
 
 def _credentials_data(creds_json: str | None = None) -> dict | None:

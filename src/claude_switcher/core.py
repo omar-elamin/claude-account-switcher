@@ -1,14 +1,13 @@
 """Business logic for account management."""
 
 import json
-import re
-import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 from claude_switcher import keychain
+from claude_switcher.common import _find_binary, _validate_email
 from claude_switcher.config import (
     AccountInfo,
     add_account,
@@ -23,16 +22,8 @@ from claude_switcher.config import (
 CLAUDE_SERVICE = keychain.CLAUDE_SERVICE
 CLAUDE_STATE_FILE = Path.home() / ".claude.json"
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _CLAUDE_LOCK = threading.Lock()
 _add_in_progress = False
-
-
-def _validate_email(email: str) -> str:
-    """Validate email before using it in Keychain service names."""
-    if not _EMAIL_RE.match(email) or len(email) > 254:
-        raise RuntimeError(f"Invalid email format: {email}")
-    return email
 
 
 def _read_oauth_account() -> dict | None:
@@ -54,33 +45,14 @@ def _write_oauth_account(oauth_account: dict) -> None:
     _atomic_write(CLAUDE_STATE_FILE, json.dumps(data))
 
 
-_EXTRA_PATHS = [
-    Path.home() / ".local" / "bin",
-    Path("/usr/local/bin"),
-    Path("/opt/homebrew/bin"),
-]
-
-
-def _find_claude() -> str | None:
-    """Find the claude binary, checking common install locations beyond PATH."""
-    found = shutil.which("claude")
-    if found:
-        return found
-    for d in _EXTRA_PATHS:
-        candidate = d / "claude"
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
-
 def check_claude_cli() -> bool:
     """Check if the claude CLI is available."""
-    return _find_claude() is not None
+    return _find_binary("claude") is not None
 
 
 def _claude_cmd() -> str:
     """Return the path to the claude binary, or 'claude' as fallback."""
-    return _find_claude() or "claude"
+    return _find_binary("claude") or "claude"
 
 
 def get_auth_status() -> dict | None:

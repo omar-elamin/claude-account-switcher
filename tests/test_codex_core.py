@@ -50,12 +50,12 @@ def _auth_json(email="user@test.com", plan="plus"):
 
 
 class TestCodexCLI:
-    @patch("claude_switcher.codex_core.shutil.which", return_value="/usr/local/bin/codex")
+    @patch("claude_switcher.common.shutil.which", return_value="/usr/local/bin/codex")
     def test_check_cli_found(self, mock_which):
         assert check_codex_cli() is True
 
-    @patch("claude_switcher.codex_core.Path.is_file", return_value=False)
-    @patch("claude_switcher.codex_core.shutil.which", return_value=None)
+    @patch("claude_switcher.common.Path.is_file", return_value=False)
+    @patch("claude_switcher.common.shutil.which", return_value=None)
     def test_check_cli_not_found_in_path(self, mock_which, mock_is_file):
         assert check_codex_cli() is False
 

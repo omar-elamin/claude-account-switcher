@@ -6,6 +6,7 @@ import urllib.error
 from datetime import datetime, timezone
 
 from claude_switcher import keychain
+from claude_switcher.common import _format_countdown
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
@@ -72,19 +73,7 @@ def _format_reset_delta(resets_at: str) -> str:
         now = datetime.now(timezone.utc)
         diff = int((reset_dt - now).total_seconds())
 
-        if diff <= 0:
-            return "now"
-
-        days = diff // 86400
-        hours = (diff % 86400) // 3600
-        minutes = (diff % 3600) // 60
-
-        if days > 0:
-            return f"{days}d {hours}h"
-        elif hours > 0:
-            return f"{hours}h {minutes}m"
-        else:
-            return f"{minutes}m"
+        return _format_countdown(diff)
     except (ValueError, TypeError, AttributeError):
         return "?"
 

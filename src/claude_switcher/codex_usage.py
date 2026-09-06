@@ -6,6 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from claude_switcher import keychain
+from claude_switcher.common import _decode_jwt_payload, _format_countdown
 import claude_switcher.codex_core as codex_core
 from claude_switcher.codex_core import (
     CodexCredentialsExpiredError,
@@ -20,20 +21,6 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/api/codex/usage",
 )
 CODEX_LOGIN_REQUIRED_USAGE = {"error": {"code": "login_required"}}
-
-
-def _decode_jwt_payload(token: str) -> dict | None:
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        import base64
-
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return None
 
 
 def _extract_codex_token(creds_json: str) -> tuple[str, str] | None:
@@ -193,16 +180,7 @@ def _format_reset_delta(reset_at: float) -> str:
         return "?"
 
     total_seconds = int((target - now).total_seconds())
-    if total_seconds <= 0:
-        return "now"
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
+    return _format_countdown(total_seconds)
 
 
 def codex_usage_state(usage: dict | None) -> UsageState:

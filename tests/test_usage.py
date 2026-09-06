@@ -1,6 +1,8 @@
 """Tests for the usage module."""
 
 import json
+
+import pytest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 
@@ -134,3 +136,36 @@ class TestNullResetsAt:
     def test_format_reset_delta_tolerates_non_string(self):
         assert _format_reset_delta(None) == "?"
         assert _format_reset_delta(12345) == "?"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("2026-03-19T12:00:00Z", "2h 0m"),
+    (1773921600, "?"),
+    ("1773921600", "?"),
+    (None, "?"),
+    ({}, "?"),
+    ([], "?"),
+    (12345, "?"),
+    ("12345", "?"),
+])
+def test_reset_adapter_input_contract(value, expected):
+    from claude_switcher.usage import _format_reset_delta
+
+    with patch("claude_switcher.usage.datetime", wraps=datetime) as clock:
+        clock.now.return_value = datetime(2026, 3, 19, 10, tzinfo=timezone.utc)
+        assert _format_reset_delta(value) == expected
+
+
+@pytest.mark.parametrize("seconds, expected", [
+    (-1, "now"), (0, "now"), (1, "0m"), (59, "0m"), (60, "1m"),
+    (3599, "59m"), (3600, "1h 0m"), (86399, "23h 59m"),
+    (86400, "1d 0h"), (133200, "1d 13h"),
+])
+def test_reset_adapter_countdown_boundaries(seconds, expected):
+    from claude_switcher.usage import _format_reset_delta
+
+    now = datetime(2026, 3, 19, 10, tzinfo=timezone.utc)
+    target = now + timedelta(seconds=seconds)
+    with patch("claude_switcher.usage.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        assert _format_reset_delta(target.isoformat()) == expected

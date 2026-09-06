@@ -1,6 +1,8 @@
 """Tests for Codex usage module."""
 
 import json
+
+import pytest
 import threading
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -429,3 +431,43 @@ class TestFetchActiveCodexUsageConcurrency:
         assert not add_thread.is_alive()
         assert not add_errors
         usage_refresh.assert_not_called()
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("2026-03-19T12:00:00Z", "?"),
+    (1773921600, "2h 0m"),
+    ("1773921600", "2h 0m"),
+    (None, "?"),
+    ({}, "?"),
+    ([], "?"),
+    (12345, "now"),
+    ("12345", "now"),
+])
+def test_reset_adapter_input_contract(value, expected):
+    from claude_switcher.codex_usage import _format_reset_delta
+
+    with patch("claude_switcher.codex_usage.datetime", wraps=datetime) as clock:
+        clock.now.return_value = datetime(2026, 3, 19, 10, tzinfo=timezone.utc)
+        assert _format_reset_delta(value) == expected
+
+
+@pytest.mark.parametrize("seconds, expected", [
+    (-1, "now"), (0, "now"), (1, "0m"), (59, "0m"), (60, "1m"),
+    (3599, "59m"), (3600, "1h 0m"), (86399, "23h 59m"),
+    (86400, "1d 0h"), (133200, "1d 13h"),
+])
+def test_reset_adapter_countdown_boundaries(seconds, expected):
+    from claude_switcher.codex_usage import _format_reset_delta
+
+    now = datetime(2026, 3, 19, 10, tzinfo=timezone.utc)
+    target = now + timedelta(seconds=seconds)
+    with patch("claude_switcher.codex_usage.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        assert _format_reset_delta(target.timestamp()) == expected
+
+
+def test_null_reset_keeps_codex_unknown_countdown():
+    usage = {"rate_limit": {"primary_window": {"used_percent": 3, "reset_at": None}}}
+    state = codex_usage_state(usage)
+    assert state.available is True
+    assert state.display == "1h 3% (?)"
