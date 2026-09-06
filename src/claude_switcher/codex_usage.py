@@ -183,6 +183,27 @@ def _format_reset_delta(reset_at: float) -> str:
     return _format_countdown(total_seconds)
 
 
+def _window_label(window: dict, fallback: str) -> str:
+    """Label a Codex rate-limit window by its real length.
+
+    The API's "primary" window is not always hourly: on the plans seen so far
+    it is a 7-day window (limit_window_seconds = 604800), so a fixed "1h"
+    label was wrong. Derive the label from limit_window_seconds and fall back
+    to the positional label only when the field is missing or malformed.
+    """
+    try:
+        seconds = int(window["limit_window_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+    if seconds <= 0:
+        return fallback
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{max(seconds // 60, 1)}m"
+
+
 def codex_usage_state(usage: dict | None) -> UsageState:
     """Convert Codex usage data into a normalized usage state."""
     if not usage:
@@ -198,10 +219,11 @@ def codex_usage_state(usage: dict | None) -> UsageState:
 
     parts = []
     windows = []
-    for label, key in (("1h", "primary_window"), ("7d", "secondary_window")):
+    for fallback, key in (("1h", "primary_window"), ("7d", "secondary_window")):
         window = rate_limit.get(key)
         if not isinstance(window, dict) or "used_percent" not in window:
             continue
+        label = _window_label(window, fallback)
         try:
             percent = float(window["used_percent"])
         except (TypeError, ValueError):
