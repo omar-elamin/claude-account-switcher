@@ -169,3 +169,48 @@ def test_reset_adapter_countdown_boundaries(seconds, expected):
     with patch("claude_switcher.usage.datetime", wraps=datetime) as clock:
         clock.now.return_value = now
         assert _format_reset_delta(target.isoformat()) == expected
+
+
+class TestModelScopedWeeklyLimit:
+    """The Anthropic usage API reports model-scoped weekly limits (e.g. Fable)
+    in the `limits` array, self-described by scope.model.display_name."""
+
+    def _usage(self, fable_pct=32, five=40.0, seven=20.0):
+        return {
+            "five_hour": {"utilization": five, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": seven, "resets_at": "2099-01-02T00:00:00Z"},
+            "limits": [
+                {"kind": "session", "percent": five, "resets_at": "2099-01-01T00:00:00Z", "scope": None},
+                {"kind": "weekly_all", "percent": seven, "resets_at": "2099-01-02T00:00:00Z", "scope": None},
+                {"kind": "weekly_scoped", "percent": fable_pct, "resets_at": "2099-01-02T00:00:00Z",
+                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+            ],
+        }
+
+    def test_fable_window_is_shown_by_its_own_name(self):
+        st = claude_usage_state(self._usage())
+        assert st.available
+        assert "Fable 32%" in st.display
+        assert st.display.startswith("5h 40%")          # account-wide windows come first
+        labels = [w.label for w in st.windows]
+        assert labels == ["5h", "7j", "Fable"]
+
+    def test_scoped_window_does_not_trigger_exhaustion(self):
+        # Fable at 100% but the account's own windows have room: not exhausted.
+        st = claude_usage_state(self._usage(fable_pct=100))
+        assert st.is_exhausted(100.0) is False
+        assert st.max_percent == 40.0                     # scoped window excluded
+
+    def test_account_window_still_triggers_exhaustion(self):
+        st = claude_usage_state(self._usage(five=100.0))
+        assert st.is_exhausted(100.0) is True
+
+    def test_missing_or_malformed_limits_are_ignored(self):
+        u = self._usage(); del u["limits"]
+        assert "Fable" not in claude_usage_state(u).display
+        u = self._usage(); u["limits"] = None
+        assert "Fable" not in claude_usage_state(u).display
+        u = self._usage(); u["limits"] = [{"kind": "weekly_scoped", "percent": "x", "scope": {"model": {"display_name": "Fable"}}}]
+        assert "Fable" not in claude_usage_state(u).display  # bad percent skipped, no crash
+        u = self._usage(); u["limits"][2]["scope"] = None
+        assert "Fable" not in claude_usage_state(u).display  # no model name -> skipped

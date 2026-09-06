@@ -104,6 +104,25 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         parts.append(f"{label} {percent:.0f}%{reset_suffix}")
         windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
 
+    # Model-scoped weekly limits (e.g. "Fable") arrive in the `limits` array,
+    # self-described by scope.model.display_name, with `percent` rather than
+    # `utilization`. Show each by its own name after the account-wide windows.
+    for entry in usage.get("limits") or []:
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        model = ((entry.get("scope") or {}).get("model") or {}).get("display_name")
+        if not model:
+            continue
+        try:
+            percent = float(entry["percent"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        resets_at = entry.get("resets_at")
+        reset = _format_reset_delta(resets_at) if resets_at else None
+        reset_suffix = f" ({reset})" if reset else ""
+        parts.append(f"{model} {percent:.0f}%{reset_suffix}")
+        windows.append(UsageWindow(label=model, percent=percent, resets_in=reset, scoped=True))
+
     if not parts:
         return UsageState(available=False, display="Usage indisponible")
 
