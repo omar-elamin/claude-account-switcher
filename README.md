@@ -1,106 +1,142 @@
-# Claude/Codex Account Switcher
+# Claude Switcher
 
-[![Downloads](https://img.shields.io/github/downloads/Symbioose/claude-account-switcher/total?style=flat-square&label=downloads)](https://github.com/Symbioose/claude-account-switcher/releases)
-[![Latest release](https://img.shields.io/github/v/release/Symbioose/claude-account-switcher?style=flat-square)](https://github.com/Symbioose/claude-account-switcher/releases/latest)
-[![macOS](https://img.shields.io/badge/macOS-12%2B-000?style=flat-square&logo=apple)](#requirements)
-[![Homebrew](https://img.shields.io/badge/Homebrew-cask-fbb040?style=flat-square&logo=homebrew)](#install)
+A macOS menu-bar app that keeps several Claude Code and Codex CLI accounts signed in at once and switches the active one from the menu bar. Version 0.4.3. MIT license.
 
-Switch between multiple Claude Code and Codex CLI accounts from your macOS menu bar.
+The app lives in the menu bar only. It has no Dock icon and no Cmd-Tab entry. Claude and Codex are handled independently: switching one never changes the other. The same email can exist once for Claude and once for Codex.
 
-Claude Switcher keeps separate account sessions for Claude Code and Codex CLI, shows live usage, and can automatically switch to another saved account when a provider reaches its limit.
+This repository is a fork of [Symbioose/claude-account-switcher](https://github.com/Symbioose/claude-account-switcher). Upstream publishes a Homebrew cask (`brew install --cask Symbioose/tap/claude-switcher`) and zip releases. Those are upstream builds and do not contain this fork's fixes. This fork is built from source with `./build_local.sh` (see [Build from source](#build-from-source)).
 
 ![Claude Switcher screenshot](screenshot.png)
 
-## Why use it?
-
-AI coding CLIs are great until you need to jump between personal, work, team, or backup accounts. Without this app, switching usually means logging out, opening a browser, logging back in, and interrupting whatever you were doing in the terminal.
-
-Claude Switcher stores account backups in macOS Keychain and swaps the active CLI session in one click. Claude and Codex are handled independently, so the active Claude account never changes your active Codex account.
-
 ## Features
 
-- **Claude Code account switching** - swap saved Claude Code sessions instantly
-- **Codex CLI account switching** - save and restore Codex `auth.json` sessions
-- **Provider-separated state** - same email can exist once for Claude and once for Codex
-- **Live usage in the menu bar** - Claude 5-hour/7-day windows and Codex primary/secondary windows
-- **Optional auto-switch** - per-provider failover when active usage reaches 100%
-- **First-launch import** - imports the currently logged-in Claude and Codex accounts when available
-- **macOS Keychain backups** - saved credentials are stored in Keychain, not plaintext config
-- **Standalone `.app` build** - no Python install required for normal users
+- Switch the active Claude Code account without logging out and back in
+- Switch the active Codex CLI account the same way
+- Live usage for every saved account, shown under each row in the menu
+- Optional auto-switch, per provider, when the active account reaches its limit
+- First launch imports the Claude and Codex accounts that are already signed in
+- Saved credentials live in macOS Keychain, not in a config file
 
 ## Install
 
-### Homebrew
+There are no releases for this fork. Build it from source:
 
 ```bash
-brew install --cask Symbioose/tap/claude-switcher
+git clone https://github.com/omar-elamin/claude-account-switcher.git
+cd claude-account-switcher
+./build_local.sh
+# Output: dist/Claude Switcher.app
 ```
 
-Then launch **Claude Switcher** from Spotlight or `/Applications`.
+Drag `dist/Claude Switcher.app` to `/Applications` and launch it. It appears as a menu bar icon.
 
-### GitHub release
-
-1. Open the [latest release](https://github.com/Symbioose/claude-account-switcher/releases/latest)
-2. Download `Claude-Switcher-vX.Y.Z.zip`
-3. Unzip it and drag **Claude Switcher.app** to `/Applications`
-4. Launch it. The app appears as a menu bar icon.
-
-On first launch, macOS may block the app because it is not signed. Open **System Settings -> Privacy & Security** and click **Open Anyway**.
+The app is not notarized, so macOS may block it on first launch. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
 ## Usage
 
-Open the menu bar icon to:
+### The menu
 
-- click any Claude or Codex account to make it active
-- add a Claude account with `claude auth login`
-- add a Codex account with a visible Terminal-based `codex login` flow
-- refresh live usage manually
-- enable or disable auto-switch separately for Claude and Codex
-- remove saved inactive accounts from Keychain
+From top to bottom:
 
-After switching Claude, verify from any terminal:
+- A header per provider: `── Claude Code ──` and `── Codex CLI ──`.
+- Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted. (The Claude row says `Usage indisponible`, a French leftover.)
+- `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled".
+- `✚ Add Claude account...` and `✚ Add Codex account...`
+- `↻ Refresh usage`
+- `− Remove account` submenu. It lists every saved account as `[Claude] email` or `[Codex] email`, including the active one. Choosing the active account shows an alert instead of removing it: "You cannot remove the active Claude Code account. Switch first." (or "… active Codex CLI account …").
+- `⏻ Quit`
+
+### Usage display
+
+A Claude row looks like this:
+
+```text
+5h 40% (2h 1m) | 7j 20% (1d 5h) | Fable 32% (1d 5h)
+```
+
+The first segment is the 5-hour window. The second is the 7-day window, labelled `7j`. After that comes one segment for each model-scoped weekly limit the API reports, labelled with the model's own name (today: `Fable`). The value in parentheses is the time until that window resets. Model-scoped windows are informational only and never trigger auto-switch.
+
+A Codex row looks like this:
+
+```text
+7d 39% (2d 11h)
+```
+
+There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window.
+
+Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
+
+Usage refreshes at launch, every 5 minutes, after adding or switching an account, and when you click `↻ Refresh usage`. If any row is unavailable, the app retries quickly up to 3 times, 6 seconds apart.
+
+macOS closes the menu when you click any item, so `↻ Refresh usage` shows a "Refreshing usage…" notification, then "Usage updated" with the numbers when done. Reopen the menu to see the rows.
+
+### Adding an account
+
+- Claude: the app runs `claude auth login`. Sign in in the browser window that appears.
+- Codex: the app opens a Terminal window running `codex login -c 'cli_auth_credentials_store="file"'`. Sign in there.
+
+Before the login starts, the app backs up the current session to Keychain:
+
+- Claude: the app backs up the current session under the active account only if the `oauthAccount` email in `~/.claude.json` matches it. If they differ, it skips the backup rather than overwrite another account's backup.
+- Codex: the app backs up the current session under the email embedded in the live `~/.codex/auth.json`. If that email was not saved yet, it is imported as a new saved account.
+
+In both cases the app then clears the live credential slot.
+
+The app does not run `claude auth logout` or `codex logout`. Those commands revoke the previous account's session on the server, which would make its backup unusable. The previous account's server session stays valid, so you can switch back later.
+
+A login times out after 5 minutes. If a login is cancelled, fails, or times out, the previous session is restored.
+
+Clicking Add while a sign-in for that provider is still open cancels it and starts a fresh one ("Restarting … login"). Only one add per provider runs at a time. Switching or removing during an add reports the account as busy; try again in a moment.
+
+### Switching
+
+- Claude: the current live token is backed up to Keychain under `claude-switcher:{email}` (with the same identity check as above). The target's backup is written into Claude Code's credential slot `Claude Code-credentials`, and the `oauthAccount` object in `~/.claude.json` is swapped.
+- Codex: the current `~/.codex/auth.json` is backed up under `codex-switcher:{email}`. The target's saved session is written to `~/.codex/auth.json` with `0600` permissions.
+
+Verify after switching:
 
 ```bash
 claude auth status
-```
-
-After switching Codex, verify with:
-
-```bash
 codex login status
 ```
 
+### Auto-switch
+
+Auto-switch is off by default and is set per provider. When it is on for a provider and the active account's own window reaches 100% (Claude: the 5-hour or 7-day window; Codex: its rate-limit windows), the app switches to another saved account of the same provider that still has room. It prefers accounts whose usage is known over accounts whose usage is unknown. It never crosses providers. There is a 60-second cooldown between auto-switch attempts per provider, including attempts that find no target.
+
+The threshold is `auto_switch_threshold` in the config file (default 100).
+
+### First launch
+
+With no config file yet, the app imports the currently signed-in Claude and Codex accounts. If the Codex import fails (for example, unsupported credential storage), the app notifies you and continues.
+
 ## How it works
 
-Claude Code stores OAuth credentials in macOS Keychain under `Claude Code-credentials` and account metadata in `~/.claude.json`. Claude Switcher backs up each saved Claude account under `claude-switcher:{email}`, then restores the selected backup into Claude Code's active credential slot and updates `~/.claude.json`.
-
-Codex CLI stores ChatGPT authentication in `~/.codex/auth.json` when `cli_auth_credentials_store = "file"` is used. Claude Switcher backs up each saved Codex session under `codex-switcher:{email}` and restores the selected session back to `~/.codex/auth.json` with `0600` permissions.
-
-Auto-switch is disabled by default. When enabled, usage refreshes in the background and the app switches only within the same provider. A full Claude account switches to another Claude account; a full Codex account switches to another Codex account.
-
-### Architecture
+Claude Code stores its OAuth credentials in macOS Keychain under `Claude Code-credentials` and account metadata in `~/.claude.json`. Codex CLI stores its ChatGPT session in `~/.codex/auth.json` when `cli_auth_credentials_store = "file"` is set. Claude Switcher keeps one Keychain backup per saved account and copies the selected backup into the CLI's live slot on switch.
 
 ```text
 macOS Keychain
 ├── Claude Code-credentials       active Claude token
-├── claude-switcher:user1@...     saved Claude account
-├── claude-switcher:user2@...     saved Claude account
-├── codex-switcher:user1@...      saved Codex auth.json
-└── codex-switcher:user2@...      saved Codex auth.json
+├── claude-switcher:{email}       saved Claude accounts
+└── codex-switcher:{email}        saved Codex sessions
 
 ~/.claude.json
-└── oauthAccount                  swapped on Claude account switch
+└── oauthAccount                  swapped on Claude switch
 
 ~/.codex/auth.json
-└── tokens                        swapped on Codex account switch
+└── tokens                        swapped on Codex switch
 
 ~/.config/claude-switcher/accounts.json
 └── provider, email, plan, active state, settings
 ```
 
-## Codex setup note
+## Codex note
 
-Codex keyring storage is detected but not switched in this release. When adding a Codex account, the app opens Terminal and runs Codex login with file-mode credentials. You can also configure file mode explicitly:
+Only Codex file-mode credentials are supported. If `cli_auth_credentials_store` is `keyring`, the app reports:
+
+> Codex keyring credential storage is not supported yet. Set cli_auth_credentials_store = "file" in ~/.codex/config.toml and run codex login.
+
+To switch to file mode:
 
 ```toml
 # ~/.codex/config.toml
@@ -113,68 +149,54 @@ Then run:
 codex login
 ```
 
-If a saved Codex session expires because its refresh token was already rotated, the app refuses to restore that stale session and shows **Login required** for usage. Add that Codex account again to refresh the saved Keychain backup.
+If a saved Codex session has expired because its refresh token was already rotated, the app does not restore it. The row shows `Login required`. Click the row (or Add) to sign that account in again.
 
 ## Security
 
-- Saved account backups are stored in macOS Keychain
-- The app config stores metadata only and is written with `0600` permissions
-- The config directory is written with `0700` permissions
-- Email validation prevents Keychain service-name injection
-- Subprocess calls do not use `shell=True`
-- Network usage checks run with short timeouts in background workers
-- Keychain reads/writes use short timeouts so the menu bar UI does not hang indefinitely
+- Saved credentials live in macOS Keychain. The config file stores metadata only. It is written atomically with `0600` permissions in a `0700` directory. A corrupt config is backed up rather than overwritten.
+- Writes to Keychain pass the secret to `security add-generic-password` as a hex string via `-X`. The plaintext is never on the command line, but the hex is briefly visible in `ps`, so this reduces process-argument exposure rather than eliminating it. The alternative, piping the secret to the tool's prompt, silently truncates at 128 characters and corrupted real credentials, which is why it is not used.
+- Emails are validated before being used in Keychain service names.
+- Subprocess calls never use `shell=True`.
+- Keychain operations time out after 5 seconds. Usage checks run in background threads with timeouts, so the menu never hangs.
+- The app never backs up a live credential under an account name it cannot confirm it belongs to.
 
 ## Requirements
 
-- macOS 12 or later
-- Claude Code CLI for Claude account switching
-- Codex CLI for Codex account switching
-- Codex file-mode credentials for Codex switching in this version
+- macOS (upstream states 12 or later)
+- Claude Code CLI, for Claude switching
+- Codex CLI with file-mode credentials, for Codex switching
+- Python 3.10 or later, to build from source (built and tested here with 3.13)
 
 ## Build from source
 
 ```bash
-git clone https://github.com/Symbioose/claude-account-switcher.git
+git clone https://github.com/omar-elamin/claude-account-switcher.git
 cd claude-account-switcher
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-```
-
-Run directly:
-
-```bash
-claude-switcher
-```
-
-Build the standalone app:
-
-```bash
-bash build_app.sh
+./build_local.sh
 # Output: dist/Claude Switcher.app
 ```
 
-Run tests:
+`build_local.sh` creates a `.venv`, installs the package in editable mode, runs py2app, then copies the `@rpath` dylibs that py2app skips (libffi, libssl, libcrypto and their dependencies) into the bundle and re-signs it ad hoc. Without that step the app either fails to launch (libffi) or cannot make HTTPS calls and shows "Usage unavailable". `build_app.sh` runs the same py2app step on its own. `build_local.sh` does not call it; it repeats that step and adds the editable install and the dylib copying around it.
+
+To run from source instead of building the app:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+claude-switcher
+```
+
+Run the tests:
 
 ```bash
 pytest tests/ -q
 ```
 
-## Release artifact
+There are 261 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
-The Homebrew cask expects release assets named:
-
-```text
-Claude-Switcher-vX.Y.Z.zip
-```
-
-The app bundle inside the zip must be:
-
-```text
-Claude Switcher.app
-```
+The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
 ## License
 
-MIT
+MIT, as declared in `pyproject.toml`. The repository does not yet include a LICENSE file.
