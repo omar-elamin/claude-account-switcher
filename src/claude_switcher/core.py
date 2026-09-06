@@ -130,7 +130,8 @@ def run_auth_login(timeout: int = CLAUDE_LOGIN_TIMEOUT_SECONDS) -> bool:
     forever — until the app was restarted. Returns True only on exit code 0.
     """
     global _login_proc
-    _login_cancel.clear()
+    # Do NOT clear _login_cancel here; it is armed at lease-acquire in
+    # add_new_account so a pre-login Cancel is honoured.
     proc = subprocess.Popen([_claude_cmd(), "auth", "login"])
     with _login_proc_lock:
         _login_proc = proc
@@ -248,6 +249,10 @@ def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | No
         if _add_in_progress:
             raise RuntimeError("A Claude account add is already in progress.")
         _add_in_progress = True
+        # Arm cancellation here, at lease-acquire, not inside run_auth_login:
+        # a Cancel clicked during the pre-login snapshot/keychain work must
+        # still take effect, not be wiped when the login starts.
+        _login_cancel.clear()
 
     try:
         active = get_active_account(config_path)

@@ -424,16 +424,35 @@ def _codex_login_done_path() -> Path:
 _login_cancel = threading.Event()
 
 
+_CODEX_LOGIN_PATTERN = "codex login -c"   # matches the login the app launches; not `codex login status`
+
+
+def _kill_codex_login() -> None:
+    """Terminate the `codex login` process running inside Terminal.
+
+    The app does not own that process (Terminal does), so it is found by its
+    command line. SIGTERM first; if it is still alive a moment later, SIGKILL,
+    so an orphaned login can never later write ~/.codex/auth.json over a
+    credential the add flow has already restored.
+    """
+    subprocess.run(["pkill", "-f", _CODEX_LOGIN_PATTERN], capture_output=True, text=True)
+    time.sleep(0.5)
+    still_alive = subprocess.run(
+        ["pgrep", "-f", _CODEX_LOGIN_PATTERN], capture_output=True, text=True
+    ).returncode == 0
+    if still_alive:
+        subprocess.run(["pkill", "-9", "-f", _CODEX_LOGIN_PATTERN], capture_output=True, text=True)
+
+
 def cancel_codex_login() -> None:
     """Abort an in-progress Codex sign-in.
 
-    Stops the poll in run_codex_login and kills the `codex login` process that
-    is running inside Terminal (the app does not own that process, so it is
-    found by command line). The add flow then restores the previous credential
-    through its normal cancelled path.
+    Stops the poll in run_codex_login and kills the `codex login` process. The
+    add flow then restores the previous credential through its normal
+    cancelled path.
     """
     _login_cancel.set()
-    subprocess.run(["pkill", "-f", "codex login -c"], capture_output=True, text=True)
+    _kill_codex_login()
 
 
 def run_codex_login(timeout: int = CODEX_LOGIN_TIMEOUT_SECONDS) -> bool:
@@ -443,7 +462,8 @@ def run_codex_login(timeout: int = CODEX_LOGIN_TIMEOUT_SECONDS) -> bool:
     user cancels or when `codex login` exits without writing credentials
     (closed window, cancelled in the browser, failed).
     """
-    _login_cancel.clear()
+    # Do NOT clear _login_cancel here; it is armed at lease-acquire in
+    # add_new_codex_account so a pre-login Cancel is honoured.
     done_path = _codex_login_done_path()
     _launch_codex_login_terminal()
     deadline = time.monotonic() + timeout
@@ -459,6 +479,10 @@ def run_codex_login(timeout: int = CODEX_LOGIN_TIMEOUT_SECONDS) -> bool:
                 # login was abandoned. Don't hold the add-lease for 5 minutes.
                 return False
             time.sleep(2)
+        # Timed out: kill the lingering login so it can't later write a stale
+        # done-marker (aborting a fresh attempt) or overwrite a restored
+        # credential in ~/.codex/auth.json.
+        _kill_codex_login()
         return False
     finally:
         try:
@@ -539,6 +563,9 @@ def add_new_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInf
         if _add_in_progress:
             raise RuntimeError("A Codex account add is already in progress.")
         _add_in_progress = True
+        # Arm cancellation at lease-acquire (not inside run_codex_login) so a
+        # Cancel clicked during the pre-login backup work is honoured.
+        _login_cancel.clear()
 
     try:
         active = get_active_account(config_path, provider="codex")

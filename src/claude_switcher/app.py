@@ -595,10 +595,13 @@ class ClaudeSwitcherApp(rumps.App):
                 message="No sign-in is in progress.",
             )
             return
+        # Say "cancelling", not "cancelled": if the login completed in the same
+        # instant, the add flow's own outcome notification ("Signed in…" or
+        # "Cancelled") is the truth, and it follows this one.
         rumps.notification(
             title="Claude Switcher",
-            subtitle="Sign-in cancelled",
-            message=f"{' and '.join(cancelled)} sign-in stopped. Your previous login is being restored.",
+            subtitle="Cancelling sign-in…",
+            message=f"Stopping the {' and '.join(cancelled)} sign-in. The result will follow.",
         )
 
     def _active_usage_summary(self) -> str:

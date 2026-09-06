@@ -213,7 +213,7 @@ class TestCancelSignIn:
              patch("claude_switcher.core.cancel_login") as cl:
             app._on_cancel_signin(None)
         cx.assert_called_once(); cl.assert_not_called()
-        assert app_module.rumps.notification.call_args.kwargs["subtitle"] == "Sign-in cancelled"
+        assert app_module.rumps.notification.call_args.kwargs["subtitle"] == "Cancelling sign-in…"
 
     def test_nothing_to_cancel(self, app_module):
         app = self._app(app_module)

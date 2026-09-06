@@ -469,3 +469,32 @@ class TestClaudeLoginTimeoutAndCancel:
         with patch.object(core_mod.subprocess, "Popen", popen), \
              patch.object(core_mod, "_claude_cmd", return_value="claude"):
             assert core_mod.run_auth_login(timeout=5) is False
+
+
+class TestPreLoginCancelIsHonoured:
+    """F1: a Cancel that lands after the lease is taken but before the login
+    process starts must not be wiped by run_auth_login."""
+
+    def test_pre_armed_cancel_makes_login_return_false(self):
+        proc = MagicMock(); proc.wait.return_value = 0        # login would have succeeded
+        core_mod._login_cancel.set()                            # cancel arrived pre-login
+        with patch.object(core_mod.subprocess, "Popen", return_value=proc), \
+             patch.object(core_mod, "_claude_cmd", return_value="claude"):
+            assert core_mod.run_auth_login(timeout=5) is False
+
+    def test_lease_acquire_arms_a_fresh_cancel(self, tmp_path):
+        # a stale cancel from an earlier attempt must not abort a NEW add
+        from claude_switcher.config import add_account
+        config_path = tmp_path / "accounts.json"
+        add_account(AccountInfo("a@test.com", "pro", "", True, "uA"), config_path)
+        core_mod._login_cancel.set()                            # stale
+        with patch.object(core_mod, "keychain") as mock_kc, \
+             patch.object(core_mod, "run_auth_login", return_value=False) as mock_login, \
+             patch.object(core_mod, "import_current_account", return_value=None), \
+             patch.object(core_mod, "_read_oauth_account", return_value={"emailAddress": "a@test.com"}):
+            mock_kc.snapshot_credentials.return_value = ("uA", "pw")
+            mock_kc._single_line.side_effect = lambda v: v
+            mock_kc.delete_credentials.return_value = False
+            add_new_account(config_path)
+        assert not core_mod._login_cancel.is_set()              # cleared at lease-acquire
+        mock_login.assert_called_once()

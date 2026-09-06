@@ -793,3 +793,22 @@ class TestCodexLoginEarlyExitAndCancel:
              patch.object(codex_core_mod, "CODEX_AUTH_FILE", auth), \
              patch.object(codex_core_mod.time, "sleep", lambda s: None):
             assert codex_core_mod.run_codex_login(timeout=60) is True
+
+
+class TestCodexPreLoginCancelIsHonoured:
+    def test_pre_armed_cancel_stops_poll_immediately(self, tmp_path):
+        codex_core_mod._login_cancel.set()                       # cancel arrived pre-login
+        with patch.object(codex_core_mod, "_launch_codex_login_terminal", lambda: None), \
+             patch.object(codex_core_mod, "_codex_login_done_path", lambda: tmp_path / "never.done"), \
+             patch.object(codex_core_mod, "CODEX_AUTH_FILE", tmp_path / "missing-auth.json"), \
+             patch.object(codex_core_mod.time, "sleep", lambda s: None):
+            assert codex_core_mod.run_codex_login(timeout=60) is False
+
+    def test_timeout_kills_lingering_login(self, tmp_path):
+        with patch.object(codex_core_mod, "_launch_codex_login_terminal", lambda: None), \
+             patch.object(codex_core_mod, "_codex_login_done_path", lambda: tmp_path / "never.done"), \
+             patch.object(codex_core_mod, "CODEX_AUTH_FILE", tmp_path / "missing-auth.json"), \
+             patch.object(codex_core_mod.time, "sleep", lambda s: None), \
+             patch.object(codex_core_mod, "_kill_codex_login") as kill:
+            assert codex_core_mod.run_codex_login(timeout=0) is False   # deadline already passed
+        kill.assert_called_once()
