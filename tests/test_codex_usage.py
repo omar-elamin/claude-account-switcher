@@ -471,3 +471,37 @@ def test_null_reset_keeps_codex_unknown_countdown():
     state = codex_usage_state(usage)
     assert state.available is True
     assert state.display == "1h 3% (?)"
+
+
+class TestWindowLabelFromLength:
+    """Codex windows are labelled by their real length, not by position."""
+
+    def _usage(self, primary_secs, secondary=None):
+        rl = {"primary_window": {"used_percent": 39, "limit_window_seconds": primary_secs,
+                                 "reset_at": 4102444800}}
+        if secondary is not None:
+            rl["secondary_window"] = secondary
+        return {"rate_limit": rl}
+
+    def test_seven_day_primary_window_is_labelled_7d_not_1h(self):
+        # Live API on Plus/Team plans: primary_window.limit_window_seconds == 604800.
+        st = codex_usage_state(self._usage(604800))
+        assert st.display.startswith("7d 39%")
+        assert st.windows[0].label == "7d"
+
+    def test_five_hour_and_one_hour_windows(self):
+        assert codex_usage_state(self._usage(18000)).windows[0].label == "5h"
+        assert codex_usage_state(self._usage(3600)).windows[0].label == "1h"
+
+    def test_missing_or_bad_length_keeps_positional_fallback(self):
+        u = self._usage(604800); del u["rate_limit"]["primary_window"]["limit_window_seconds"]
+        assert codex_usage_state(u).windows[0].label == "1h"
+        u = self._usage("weekly")
+        assert codex_usage_state(u).windows[0].label == "1h"
+        u = self._usage(0)
+        assert codex_usage_state(u).windows[0].label == "1h"
+        st = codex_usage_state(self._usage(3600, secondary={"used_percent": 5}))
+        assert [w.label for w in st.windows] == ["1h", "7d"]
+
+    def test_sub_hour_window(self):
+        assert codex_usage_state(self._usage(1800)).windows[0].label == "30m"
