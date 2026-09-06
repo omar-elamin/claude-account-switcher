@@ -6,6 +6,7 @@ import urllib.error
 from datetime import datetime, timezone
 
 from claude_switcher import keychain
+from claude_switcher.common import _format_countdown
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
@@ -72,20 +73,8 @@ def _format_reset_delta(resets_at: str) -> str:
         now = datetime.now(timezone.utc)
         diff = int((reset_dt - now).total_seconds())
 
-        if diff <= 0:
-            return "now"
-
-        days = diff // 86400
-        hours = (diff % 86400) // 3600
-        minutes = (diff % 3600) // 60
-
-        if days > 0:
-            return f"{days}d {hours}h"
-        elif hours > 0:
-            return f"{hours}h {minutes}m"
-        else:
-            return f"{minutes}m"
-    except (ValueError, TypeError):
+        return _format_countdown(diff)
+    except (ValueError, TypeError, AttributeError):
         return "?"
 
 
@@ -107,10 +96,32 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         except (TypeError, ValueError):
             continue
 
-        reset = _format_reset_delta(window["resets_at"]) if "resets_at" in window else None
+        # The API returns resets_at: null when nothing is scheduled (e.g. a freshly
+        # logged-in account with no usage). Key presence is not enough; check the value.
+        resets_at = window.get("resets_at")
+        reset = _format_reset_delta(resets_at) if resets_at else None
         reset_suffix = f" ({reset})" if reset else ""
         parts.append(f"{label} {percent:.0f}%{reset_suffix}")
         windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
+
+    # Model-scoped weekly limits (e.g. "Fable") arrive in the `limits` array,
+    # self-described by scope.model.display_name, with `percent` rather than
+    # `utilization`. Show each by its own name after the account-wide windows.
+    for entry in usage.get("limits") or []:
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        model = ((entry.get("scope") or {}).get("model") or {}).get("display_name")
+        if not model:
+            continue
+        try:
+            percent = float(entry["percent"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        resets_at = entry.get("resets_at")
+        reset = _format_reset_delta(resets_at) if resets_at else None
+        reset_suffix = f" ({reset})" if reset else ""
+        parts.append(f"{model} {percent:.0f}%{reset_suffix}")
+        windows.append(UsageWindow(label=model, percent=percent, resets_in=reset, scoped=True))
 
     if not parts:
         return UsageState(available=False, display="Usage indisponible")

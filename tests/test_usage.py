@@ -1,6 +1,8 @@
 """Tests for the usage module."""
 
 import json
+
+import pytest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 
@@ -116,3 +118,99 @@ class TestFetchUsageForAccount:
     def test_returns_none_when_no_creds(self, mock_read):
         mock_read.return_value = None
         assert fetch_usage_for_account("test@test.com") is None
+
+
+class TestNullResetsAt:
+    """Regression: the API returns resets_at: null for an account with no
+    scheduled reset. That crashed the Claude parser (None.replace) and the
+    whole row showed 'Usage unavailable' instead of the percentage."""
+
+    def test_null_resets_at_does_not_crash_and_keeps_percent(self):
+        u = {"five_hour": {"utilization": 0.0, "resets_at": None},
+             "seven_day": {"utilization": 3.0, "resets_at": None}}
+        st = claude_usage_state(u)
+        assert st.available is True
+        assert "0%" in st.display and "3%" in st.display
+        assert "?" not in st.display          # no bogus countdown either
+
+    def test_format_reset_delta_tolerates_non_string(self):
+        assert _format_reset_delta(None) == "?"
+        assert _format_reset_delta(12345) == "?"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("2026-03-19T12:00:00Z", "2h 0m"),
+    (1773921600, "?"),
+    ("1773921600", "?"),
+    (None, "?"),
+    ({}, "?"),
+    ([], "?"),
+    (12345, "?"),
+    ("12345", "?"),
+])
+def test_reset_adapter_input_contract(value, expected):
+    from claude_switcher.usage import _format_reset_delta
+
+    with patch("claude_switcher.usage.datetime", wraps=datetime) as clock:
+        clock.now.return_value = datetime(2026, 3, 19, 10, tzinfo=timezone.utc)
+        assert _format_reset_delta(value) == expected
+
+
+@pytest.mark.parametrize("seconds, expected", [
+    (-1, "now"), (0, "now"), (1, "0m"), (59, "0m"), (60, "1m"),
+    (3599, "59m"), (3600, "1h 0m"), (86399, "23h 59m"),
+    (86400, "1d 0h"), (133200, "1d 13h"),
+])
+def test_reset_adapter_countdown_boundaries(seconds, expected):
+    from claude_switcher.usage import _format_reset_delta
+
+    now = datetime(2026, 3, 19, 10, tzinfo=timezone.utc)
+    target = now + timedelta(seconds=seconds)
+    with patch("claude_switcher.usage.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        assert _format_reset_delta(target.isoformat()) == expected
+
+
+class TestModelScopedWeeklyLimit:
+    """The Anthropic usage API reports model-scoped weekly limits (e.g. Fable)
+    in the `limits` array, self-described by scope.model.display_name."""
+
+    def _usage(self, fable_pct=32, five=40.0, seven=20.0):
+        return {
+            "five_hour": {"utilization": five, "resets_at": "2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization": seven, "resets_at": "2099-01-02T00:00:00Z"},
+            "limits": [
+                {"kind": "session", "percent": five, "resets_at": "2099-01-01T00:00:00Z", "scope": None},
+                {"kind": "weekly_all", "percent": seven, "resets_at": "2099-01-02T00:00:00Z", "scope": None},
+                {"kind": "weekly_scoped", "percent": fable_pct, "resets_at": "2099-01-02T00:00:00Z",
+                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+            ],
+        }
+
+    def test_fable_window_is_shown_by_its_own_name(self):
+        st = claude_usage_state(self._usage())
+        assert st.available
+        assert "Fable 32%" in st.display
+        assert st.display.startswith("5h 40%")          # account-wide windows come first
+        labels = [w.label for w in st.windows]
+        assert labels == ["5h", "7j", "Fable"]
+
+    def test_scoped_window_does_not_trigger_exhaustion(self):
+        # Fable at 100% but the account's own windows have room: not exhausted.
+        st = claude_usage_state(self._usage(fable_pct=100))
+        assert st.is_exhausted(100.0) is False
+        assert st.max_percent == 40.0                     # scoped window excluded
+
+    def test_account_window_still_triggers_exhaustion(self):
+        st = claude_usage_state(self._usage(five=100.0))
+        assert st.is_exhausted(100.0) is True
+
+    def test_missing_or_malformed_limits_are_ignored(self):
+        u = self._usage(); del u["limits"]
+        assert "Fable" not in claude_usage_state(u).display
+        u = self._usage(); u["limits"] = None
+        assert "Fable" not in claude_usage_state(u).display
+        u = self._usage(); u["limits"] = [{"kind": "weekly_scoped", "percent": "x", "scope": {"model": {"display_name": "Fable"}}}]
+        assert "Fable" not in claude_usage_state(u).display  # bad percent skipped, no crash
+        u = self._usage(); u["limits"][2]["scope"] = None
+        assert "Fable" not in claude_usage_state(u).display  # no model name -> skipped

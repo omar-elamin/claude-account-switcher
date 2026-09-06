@@ -6,13 +6,14 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from claude_switcher import keychain
+from claude_switcher.common import _decode_jwt_payload, _format_countdown
+import claude_switcher.codex_core as codex_core
 from claude_switcher.codex_core import (
     CodexCredentialsExpiredError,
-    backup_codex_credentials,
     normalize_codex_credentials_blob,
     refresh_codex_credentials,
-    write_active_codex_credentials,
 )
+from claude_switcher.config import DEFAULT_CONFIG_PATH, get_active_account, load_accounts
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 CODEX_USAGE_URLS = (
@@ -20,20 +21,6 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/api/codex/usage",
 )
 CODEX_LOGIN_REQUIRED_USAGE = {"error": {"code": "login_required"}}
-
-
-def _decode_jwt_payload(token: str) -> dict | None:
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        import base64
-
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return None
 
 
 def _extract_codex_token(creds_json: str) -> tuple[str, str] | None:
@@ -105,33 +92,83 @@ def fetch_codex_usage(creds_json: str) -> dict | None:
     return usage
 
 
-def fetch_codex_usage_for_account(email: str) -> dict | None:
+def fetch_codex_usage_for_account(
+    email: str, config_path=DEFAULT_CONFIG_PATH
+) -> dict | None:
     """Fetch usage for a saved Codex account stored in Keychain."""
     service = f"codex-switcher:{email}"
-    creds = keychain.read_credentials(service)
-    if not creds:
+    raw_creds = keychain.read_credentials(service)
+    if not raw_creds:
         return None
-    usage, refreshed = fetch_codex_usage_with_refresh(creds)
-    if refreshed:
+    creds = normalize_codex_credentials_blob(raw_creds) or raw_creds
+    usage = _fetch_codex_usage_once(creds)
+    if usage is not None:
+        return usage
+
+    with codex_core._CODEX_LOCK:
+        if codex_core._add_in_progress:
+            return None
+        current = keychain.read_credentials(service)
+        if current != raw_creds:
+            return None
+        account = next(
+            (
+                account for account in load_accounts(config_path)
+                if account.provider == "codex" and account.email == email
+            ),
+            None,
+        )
+        if account is None or account.active:
+            return None
+        try:
+            refreshed = refresh_codex_credentials(
+                normalize_codex_credentials_blob(current) or current
+            )
+        except CodexCredentialsExpiredError:
+            return CODEX_LOGIN_REQUIRED_USAGE
+        if not refreshed:
+            return None
         keychain.write_credentials(service, email, refreshed)
-    return usage
+
+    return _fetch_codex_usage_once(refreshed)
 
 
-def fetch_active_codex_usage() -> dict | None:
+def fetch_active_codex_usage(config_path=DEFAULT_CONFIG_PATH) -> dict | None:
     """Fetch usage for the currently active Codex session."""
     try:
-        from claude_switcher.codex_core import read_codex_credentials
-
-        creds = read_codex_credentials()
+        raw_creds = codex_core._read_codex_credentials_for_import_raw()
     except RuntimeError:
         return None
-    if not creds:
+    if not raw_creds:
         return None
-    usage, refreshed = fetch_codex_usage_with_refresh(creds)
-    if refreshed:
-        write_active_codex_credentials(refreshed)
-        backup_codex_credentials(refreshed)
-    return usage
+    creds = normalize_codex_credentials_blob(raw_creds) or raw_creds
+    email = codex_core._codex_email_from_credentials(creds)
+    usage = _fetch_codex_usage_once(creds)
+    if usage is not None:
+        return usage
+
+    with codex_core._CODEX_LOCK:
+        if codex_core._add_in_progress:
+            return None
+        current = codex_core._read_codex_credentials_for_import_raw()
+        if current != raw_creds:
+            return None
+        active = get_active_account(config_path, provider="codex")
+        if not email or not active or active.email != email:
+            return None
+        try:
+            refreshed = refresh_codex_credentials(
+                normalize_codex_credentials_blob(current) or current
+            )
+        except CodexCredentialsExpiredError:
+            return CODEX_LOGIN_REQUIRED_USAGE
+        if not refreshed:
+            return None
+        codex_core._write_codex_credentials(refreshed)
+        codex_core._validate_email(email)
+        keychain.write_credentials(f"codex-switcher:{email}", email, refreshed)
+
+    return _fetch_codex_usage_once(refreshed)
 
 
 def _format_reset_delta(reset_at: float) -> str:
@@ -143,16 +180,7 @@ def _format_reset_delta(reset_at: float) -> str:
         return "?"
 
     total_seconds = int((target - now).total_seconds())
-    if total_seconds <= 0:
-        return "now"
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
+    return _format_countdown(total_seconds)
 
 
 def codex_usage_state(usage: dict | None) -> UsageState:

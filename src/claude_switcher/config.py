@@ -2,12 +2,15 @@
 
 import json
 import os
+import tempfile
+import threading
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "claude-switcher" / "accounts.json"
 CONFIG_VERSION = 2
 DEFAULT_PROVIDERS = ("claude", "codex")
+_LOCK = threading.RLock()
 
 
 @dataclass
@@ -39,21 +42,78 @@ def _read_config_data(path: Path = DEFAULT_CONFIG_PATH) -> dict:
         return {"version": CONFIG_VERSION, "settings": _default_settings_dict(), "accounts": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError):
         return {"version": CONFIG_VERSION, "settings": _default_settings_dict(), "accounts": []}
     if not isinstance(data, dict):
         return {"version": CONFIG_VERSION, "settings": _default_settings_dict(), "accounts": []}
     return data
 
 
+def _atomic_write(path: Path, content: str | bytes, mode: int = 0o600) -> None:
+    """Atomically replace a file through a private temp file beside its referent."""
+    target = Path(os.path.realpath(path))
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    raw = content.encode("utf-8") if isinstance(content, str) else content
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", delete=False, dir=target.parent
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(raw)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _backup_corrupt_config(path: Path) -> None:
+    """Preserve damaged config bytes once before replacing them."""
+    try:
+        original = path.read_bytes()
+    except FileNotFoundError:
+        return
+
+    corrupt = False
+    try:
+        raw_data = json.loads(original.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        corrupt = True
+    else:
+        if not isinstance(raw_data, dict):
+            corrupt = True
+        elif "accounts" in raw_data and not isinstance(raw_data["accounts"], list):
+            corrupt = True
+        elif isinstance(raw_data.get("accounts"), list) and len(load_accounts(path)) < len(
+            raw_data["accounts"]
+        ):
+            corrupt = True
+
+    if not corrupt:
+        return
+
+    backup = path.with_name(f"{path.name}.corrupt")
+    suffix = 1
+    while os.path.lexists(backup):
+        backup = path.with_name(f"{path.name}.corrupt.{suffix}")
+        suffix += 1
+    _atomic_write(backup, original)
+
+
 def _write_config_data(data: dict, path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Write raw config JSON with private file permissions."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _backup_corrupt_config(path)
     data.setdefault("version", CONFIG_VERSION)
     data.setdefault("settings", _default_settings_dict())
     data.setdefault("accounts", [])
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.chmod(path, 0o600)
+    _atomic_write(path, json.dumps(data, indent=2))
 
 
 def _settings_from_dict(data: dict | None) -> AppSettings:
@@ -98,29 +158,32 @@ def load_accounts(path: Path = DEFAULT_CONFIG_PATH) -> list[AccountInfo]:
 
 def save_accounts(accounts: list[AccountInfo], path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Save accounts to JSON file, preserving app settings."""
-    data = _read_config_data(path)
-    data["version"] = CONFIG_VERSION
-    data["settings"] = asdict(_settings_from_dict(data.get("settings")))
-    data["accounts"] = [asdict(acc) for acc in accounts]
-    _write_config_data(data, path)
+    with _LOCK:
+        data = _read_config_data(path)
+        data["version"] = CONFIG_VERSION
+        data["settings"] = asdict(_settings_from_dict(data.get("settings")))
+        data["accounts"] = [asdict(acc) for acc in accounts]
+        _write_config_data(data, path)
 
 
 def add_account(account: AccountInfo, path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Add or update an account, matched by email and provider."""
-    accounts = load_accounts(path)
-    accounts = [
-        a for a in accounts
-        if not (a.email == account.email and a.provider == account.provider)
-    ]
-    accounts.append(account)
-    save_accounts(accounts, path)
+    with _LOCK:
+        accounts = load_accounts(path)
+        accounts = [
+            a for a in accounts
+            if not (a.email == account.email and a.provider == account.provider)
+        ]
+        accounts.append(account)
+        save_accounts(accounts, path)
 
 
 def remove_account(email: str, path: Path = DEFAULT_CONFIG_PATH, provider: str = "claude") -> None:
     """Remove an account by email and provider."""
-    accounts = load_accounts(path)
-    accounts = [a for a in accounts if not (a.email == email and a.provider == provider)]
-    save_accounts(accounts, path)
+    with _LOCK:
+        accounts = load_accounts(path)
+        accounts = [a for a in accounts if not (a.email == email and a.provider == provider)]
+        save_accounts(accounts, path)
 
 
 def get_active_account(
@@ -137,11 +200,12 @@ def set_active_account(
     email: str, path: Path = DEFAULT_CONFIG_PATH, provider: str = "claude"
 ) -> None:
     """Set an account active within a provider, deactivating only that provider."""
-    accounts = load_accounts(path)
-    for acc in accounts:
-        if acc.provider == provider:
-            acc.active = (acc.email == email)
-    save_accounts(accounts, path)
+    with _LOCK:
+        accounts = load_accounts(path)
+        for acc in accounts:
+            if acc.provider == provider:
+                acc.active = (acc.email == email)
+        save_accounts(accounts, path)
 
 
 def load_settings(path: Path = DEFAULT_CONFIG_PATH) -> AppSettings:
@@ -152,11 +216,12 @@ def load_settings(path: Path = DEFAULT_CONFIG_PATH) -> AppSettings:
 
 def save_settings(settings: AppSettings, path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Persist app settings without modifying accounts."""
-    data = _read_config_data(path)
-    data["version"] = CONFIG_VERSION
-    data["settings"] = asdict(settings)
-    data["accounts"] = data.get("accounts", [])
-    _write_config_data(data, path)
+    with _LOCK:
+        data = _read_config_data(path)
+        data["version"] = CONFIG_VERSION
+        data["settings"] = asdict(settings)
+        data["accounts"] = data.get("accounts", [])
+        _write_config_data(data, path)
 
 
 def is_auto_switch_enabled(provider: str, path: Path = DEFAULT_CONFIG_PATH) -> bool:
@@ -169,6 +234,7 @@ def set_auto_switch_enabled(
     provider: str, enabled: bool, path: Path = DEFAULT_CONFIG_PATH
 ) -> None:
     """Enable or disable auto-switch for one provider."""
-    settings = load_settings(path)
-    settings.auto_switch[provider] = bool(enabled)
-    save_settings(settings, path)
+    with _LOCK:
+        settings = load_settings(path)
+        settings.auto_switch[provider] = bool(enabled)
+        save_settings(settings, path)

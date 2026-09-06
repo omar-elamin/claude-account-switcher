@@ -1,13 +1,12 @@
 """Business logic for Codex CLI account management."""
 
-import base64
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,13 +20,13 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10
     import tomli as tomllib
 
 from claude_switcher import keychain
+from claude_switcher.common import _EMAIL_RE, _decode_jwt_payload, _find_binary, _validate_email
 from claude_switcher.config import (
     AccountInfo,
     add_account,
     get_active_account,
     load_accounts,
     remove_account,
-    save_accounts,
     set_active_account,
     DEFAULT_CONFIG_PATH,
 )
@@ -46,40 +45,22 @@ CODEX_KEYRING_UNSUPPORTED_MESSAGE = (
 CODEX_SESSION_EXPIRED_MESSAGE = (
     "This saved Codex session has expired. Please add the Codex account again to sign in."
 )
+_CODEX_LOCK = threading.Lock()
+_add_in_progress = False
 
 
 class CodexCredentialsExpiredError(RuntimeError):
     """Raised when Codex refresh tokens have already been consumed or revoked."""
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-_EXTRA_PATHS = [
-    Path.home() / ".local" / "bin",
-    Path("/usr/local/bin"),
-    Path("/opt/homebrew/bin"),
-]
-
-
-def _find_codex() -> str | None:
-    """Find the codex binary, checking common install locations beyond PATH."""
-    found = shutil.which("codex")
-    if found:
-        return found
-    for directory in _EXTRA_PATHS:
-        candidate = directory / "codex"
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
 
 def check_codex_cli() -> bool:
     """Check if the Codex CLI is available."""
-    return _find_codex() is not None
+    return _find_binary("codex") is not None
 
 
 def _codex_cmd() -> str:
     """Return the path to the Codex binary, or 'codex' as fallback."""
-    return _find_codex() or "codex"
+    return _find_binary("codex") or "codex"
 
 
 def get_codex_auth_status() -> dict | None:
@@ -92,13 +73,6 @@ def get_codex_auth_status() -> dict | None:
     if result.returncode != 0:
         return None
     return {"loggedIn": True, "message": result.stdout.strip() or result.stderr.strip()}
-
-
-def _validate_email(email: str) -> str:
-    """Validate email before using it in Keychain service names."""
-    if not _EMAIL_RE.match(email) or len(email) > 254:
-        raise RuntimeError(f"Invalid email format: {email}")
-    return email
 
 
 def _codex_credentials_store() -> str:
@@ -159,24 +133,15 @@ def read_codex_credentials() -> str | None:
 
 def _read_codex_credentials_for_import() -> str | None:
     """Read file-mode credentials without treating a missing file as a hard failure."""
+    return normalize_codex_credentials_blob(_read_codex_credentials_for_import_raw())
+
+
+def _read_codex_credentials_for_import_raw() -> str | None:
+    """Read raw file-mode credentials for compare-and-set operations."""
     store = _codex_credentials_store()
     if store == "keyring":
         raise RuntimeError(CODEX_KEYRING_UNSUPPORTED_MESSAGE)
-    return normalize_codex_credentials_blob(_read_codex_credentials_from_file())
-
-
-def _decode_jwt_payload(token: str) -> dict | None:
-    """Decode a JWT payload without verification."""
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        decoded = base64.urlsafe_b64decode(payload)
-        return json.loads(decoded)
-    except Exception:
-        return None
+    return _read_codex_credentials_from_file()
 
 
 def _credentials_data(creds_json: str | None = None) -> dict | None:
@@ -241,7 +206,10 @@ def backup_codex_credentials(creds: str) -> str | None:
     if not email:
         return None
     _validate_email(email)
-    backup_codex_credentials(creds)
+    with _CODEX_LOCK:
+        if _add_in_progress:
+            return None
+        keychain.write_credentials(f"{CODEX_KEYCHAIN_PREFIX}{email}", email, creds)
     return email
 
 
@@ -292,7 +260,8 @@ def _saved_codex_account(email: str, config_path: Path) -> AccountInfo | None:
 
 def import_current_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Import the currently logged-in Codex account."""
-    creds = _read_codex_credentials_for_import()
+    raw_creds = _read_codex_credentials_for_import_raw()
+    creds = normalize_codex_credentials_blob(raw_creds)
     if not creds or get_codex_auth_status() is None:
         return None
 
@@ -300,8 +269,6 @@ def import_current_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> Acc
     if not email:
         return None
     _validate_email(email)
-
-    keychain.write_credentials(f"{CODEX_KEYCHAIN_PREFIX}{email}", email, creds)
 
     account = AccountInfo(
         email=email,
@@ -311,8 +278,12 @@ def import_current_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> Acc
         keychain_account=email,
         provider="codex",
     )
-    add_account(account, config_path)
-    set_active_account(email, config_path, provider="codex")
+    with _CODEX_LOCK:
+        if _read_codex_credentials_for_import_raw() != raw_creds:
+            return None
+        keychain.write_credentials(f"{CODEX_KEYCHAIN_PREFIX}{email}", email, creds)
+        add_account(account, config_path)
+        set_active_account(email, config_path, provider="codex")
     return account
 
 
@@ -328,7 +299,10 @@ def _write_codex_credentials(creds: str) -> None:
 
 def write_active_codex_credentials(creds: str) -> None:
     """Write the active Codex auth.json with validation."""
-    _write_codex_credentials(creds)
+    with _CODEX_LOCK:
+        if _add_in_progress:
+            return
+        _write_codex_credentials(creds)
 
 
 def run_codex_logout() -> None:
@@ -342,13 +316,31 @@ def _clear_codex_credentials_file() -> None:
         CODEX_AUTH_FILE.unlink()
     except FileNotFoundError:
         pass
-    except OSError:
-        pass
+
+
+def _restore_codex_credentials(creds: str) -> None:
+    """Idempotently restore the active Codex credential file."""
+    desired = normalize_codex_credentials_blob(creds) or creds
+    with _CODEX_LOCK:
+        if _read_codex_credentials_from_file() == desired:
+            return
+        CODEX_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CODEX_AUTH_FILE.write_text(desired, encoding="utf-8")
+        CODEX_AUTH_FILE.chmod(0o600)
 
 
 def _launch_codex_login_terminal() -> None:
     """Open Terminal.app and run an interactive Codex login command."""
     script_path = Path(tempfile.gettempdir()) / f"claude-switcher-codex-login-{os.getpid()}.command"
+    # Marker the script writes the instant `codex login` exits, so the poll can
+    # stop early (closed window / cancelled / failed) instead of waiting out
+    # the full login timeout. Same pid-derived name as run_codex_login uses.
+    done_path = _codex_login_done_path()
+    try:
+        done_path.unlink()
+    except FileNotFoundError:
+        pass
+    done_q = shlex.quote(str(done_path))
     codex_cmd = shlex.quote(_codex_cmd())
     script = f"""#!/bin/zsh
 echo "Claude Switcher - Codex login"
@@ -358,6 +350,7 @@ echo "When login succeeds, return to Claude Switcher."
 echo ""
 {codex_cmd} login -c 'cli_auth_credentials_store="file"'
 status=$?
+echo $status > {done_q}
 echo ""
 if [ $status -eq 0 ]; then
   echo "Codex login completed. You can close this window."
@@ -381,101 +374,252 @@ exit $status
         raise RuntimeError("Could not open Terminal for Codex login.")
 
 
+def _codex_login_done_path() -> Path:
+    """Marker file the login script writes when `codex login` exits."""
+    return Path(tempfile.gettempdir()) / f"claude-switcher-codex-login-{os.getpid()}.done"
+
+
+_login_cancel = threading.Event()
+
+
+_CODEX_LOGIN_PATTERN = "codex login -c"   # matches the login the app launches; not `codex login status`
+
+
+def _kill_codex_login() -> None:
+    """Terminate the `codex login` process running inside Terminal.
+
+    The app does not own that process (Terminal does), so it is found by its
+    command line. SIGTERM first; if it is still alive a moment later, SIGKILL,
+    so an orphaned login can never later write ~/.codex/auth.json over a
+    credential the add flow has already restored.
+    """
+    subprocess.run(["pkill", "-f", _CODEX_LOGIN_PATTERN], capture_output=True, text=True)
+    time.sleep(0.5)
+    still_alive = subprocess.run(
+        ["pgrep", "-f", _CODEX_LOGIN_PATTERN], capture_output=True, text=True
+    ).returncode == 0
+    if still_alive:
+        subprocess.run(["pkill", "-9", "-f", _CODEX_LOGIN_PATTERN], capture_output=True, text=True)
+
+
+def cancel_codex_login() -> None:
+    """Abort an in-progress Codex sign-in.
+
+    Stops the poll in run_codex_login and kills the `codex login` process. The
+    add flow then restores the previous credential through its normal
+    cancelled path.
+    """
+    _login_cancel.set()
+    _kill_codex_login()
+
+
 def run_codex_login(timeout: int = CODEX_LOGIN_TIMEOUT_SECONDS) -> bool:
-    """Open a visible Codex login flow and wait for file credentials."""
+    """Open a visible Codex login flow and wait for file credentials.
+
+    Returns False early — instead of polling out the full timeout — when the
+    user cancels or when `codex login` exits without writing credentials
+    (closed window, cancelled in the browser, failed).
+    """
+    # Do NOT clear _login_cancel here; it is armed at lease-acquire in
+    # add_new_codex_account so a pre-login Cancel is honoured.
+    done_path = _codex_login_done_path()
     _launch_codex_login_terminal()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        creds = _read_codex_credentials_from_file()
-        if creds and _codex_email_from_credentials(creds):
-            return True
-        time.sleep(2)
-    return False
+    try:
+        while time.monotonic() < deadline:
+            creds = _read_codex_credentials_from_file()
+            if creds and _codex_email_from_credentials(creds):
+                return True
+            if _login_cancel.is_set():
+                return False
+            if done_path.exists():
+                # `codex login` has exited and there are no credentials: the
+                # login was abandoned. Don't hold the add-lease for 5 minutes.
+                return False
+            time.sleep(2)
+        # Timed out: kill the lingering login so it can't later write a stale
+        # done-marker (aborting a fresh attempt) or overwrite a restored
+        # credential in ~/.codex/auth.json.
+        _kill_codex_login()
+        return False
+    finally:
+        try:
+            done_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def switch_codex_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Switch to a different Codex account, saving current credentials first."""
-    active = get_active_account(config_path, provider="codex")
+    _validate_email(target_email)
+    with _CODEX_LOCK:
+        if _add_in_progress:
+            raise RuntimeError("A Codex account add is in progress. Try again in a moment.")
 
-    if active:
-        current_creds = _read_codex_credentials_for_import()
-        if current_creds:
+        active = get_active_account(config_path, provider="codex")
+        if active:
+            current_creds = _read_codex_credentials_for_import()
+            # Back up the live credential ONLY if it actually belongs to the
+            # account config marks active. If config's active has drifted from
+            # what is really in ~/.codex/auth.json (e.g. after a bare `codex
+            # login`, or a prior mis-save), writing it under active.email would
+            # overwrite a DIFFERENT account's backup with these credentials —
+            # the exact corruption that clobbered a real user's account. Verify
+            # the blob's embedded identity; skip the save on any mismatch.
+            live_email = (
+                _codex_email_from_credentials(current_creds) if current_creds else None
+            )
+            if current_creds and live_email == active.email:
+                keychain.write_credentials(
+                    f"{CODEX_KEYCHAIN_PREFIX}{active.email}",
+                    active.keychain_account,
+                    current_creds,
+                )
+
+        raw_target_creds = keychain.read_credentials(
+            f"{CODEX_KEYCHAIN_PREFIX}{target_email}"
+        )
+        if not raw_target_creds:
+            raise RuntimeError(f"Credentials not found for Codex account {target_email}")
+        target_creds = normalize_codex_credentials_blob(raw_target_creds) or raw_target_creds
+
+        accounts = load_accounts(config_path)
+        target_account = next(
+            (a for a in accounts if a.email == target_email and a.provider == "codex"),
+            None,
+        )
+        if not target_account:
+            raise RuntimeError(f"Codex account {target_email} not found in config")
+
+        try:
+            refreshed = refresh_codex_credentials(target_creds)
+        except CodexCredentialsExpiredError as exc:
+            raise RuntimeError(
+                f"Saved Codex session for {target_email} expired. "
+                "Use Add Codex account to sign in again."
+            ) from exc
+
+        target_account = _saved_codex_account(target_email, config_path)
+        if not target_account:
+            raise RuntimeError(f"Codex account {target_email} not found in config")
+        if refreshed:
+            target_creds = refreshed
             keychain.write_credentials(
-                f"{CODEX_KEYCHAIN_PREFIX}{active.email}",
-                active.keychain_account,
-                current_creds,
+                f"{CODEX_KEYCHAIN_PREFIX}{target_email}",
+                target_account.keychain_account,
+                target_creds,
             )
 
-    _validate_email(target_email)
-    target_creds = keychain.read_credentials(f"{CODEX_KEYCHAIN_PREFIX}{target_email}")
-    if not target_creds:
-        raise RuntimeError(f"Credentials not found for Codex account {target_email}")
-    target_creds = normalize_codex_credentials_blob(target_creds) or target_creds
-
-    accounts = load_accounts(config_path)
-    target_account = next(
-        (a for a in accounts if a.email == target_email and a.provider == "codex"),
-        None,
-    )
-    if not target_account:
-        raise RuntimeError(f"Codex account {target_email} not found in config")
-
-    try:
-        refreshed = refresh_codex_credentials(target_creds)
-    except CodexCredentialsExpiredError as exc:
-        raise RuntimeError(
-            f"Saved Codex session for {target_email} expired. "
-            "Use Add Codex account to sign in again."
-        ) from exc
-    if refreshed:
-        target_creds = refreshed
-        keychain.write_credentials(
-            f"{CODEX_KEYCHAIN_PREFIX}{target_email}",
-            target_account.keychain_account,
-            target_creds,
-        )
-
-    _write_codex_credentials(target_creds)
-    for account in accounts:
-        if account.provider == "codex":
-            account.active = account.email == target_email
-    save_accounts(accounts, config_path)
+        _write_codex_credentials(target_creds)
+        set_active_account(target_email, config_path, provider="codex")
 
 
 def add_new_codex_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Add a Codex account via `codex login`."""
-    active = get_active_account(config_path, provider="codex")
-    current_creds = _read_codex_credentials_for_import()
-    current_email = _codex_email_from_credentials(current_creds)
-
-    if current_creds and current_email:
-        if not _saved_codex_account(current_email, config_path):
-            return import_current_codex_account(config_path)
-        keychain.write_credentials(
-            f"{CODEX_KEYCHAIN_PREFIX}{current_email}",
-            current_email,
-            current_creds,
-        )
-    elif active:
-        current_creds = keychain.read_credentials(f"{CODEX_KEYCHAIN_PREFIX}{active.email}")
-
-    run_codex_logout()
-    _clear_codex_credentials_file()
-
-    if not run_codex_login():
-        if current_creds:
-            _write_codex_credentials(current_creds)
-        return None
+    global _add_in_progress
+    with _CODEX_LOCK:
+        if _add_in_progress:
+            raise RuntimeError("A Codex account add is already in progress.")
+        _add_in_progress = True
+        # Arm cancellation at lease-acquire (not inside run_codex_login) so a
+        # Cancel clicked during the pre-login backup work is honoured.
+        _login_cancel.clear()
 
     try:
-        return import_current_codex_account(config_path)
-    except Exception:
+        active = get_active_account(config_path, provider="codex")
+        store = _codex_credentials_store()
+        if store == "keyring":
+            raise RuntimeError(CODEX_KEYRING_UNSUPPORTED_MESSAGE)
+        try:
+            raw_current_creds = CODEX_AUTH_FILE.read_text(encoding="utf-8").strip() or None
+        except FileNotFoundError:
+            raw_current_creds = None
+
+        if raw_current_creds is not None:
+            keychain._single_line(raw_current_creds)
+        current_creds = normalize_codex_credentials_blob(raw_current_creds)
+        current_email = _codex_email_from_credentials(current_creds)
+
         if current_creds:
-            _write_codex_credentials(current_creds)
-        return None
+            if current_email:
+                if not _saved_codex_account(current_email, config_path):
+                    # The live session isn't saved yet. Preserve it (config row +
+                    # Keychain backup under its OWN email) and then KEEP GOING to
+                    # the login. Returning here made the first "Add" click look
+                    # like it did nothing: it silently imported the current
+                    # session and never opened a login. Refuse to continue if we
+                    # couldn't save it — never clear a session we can't restore.
+                    if import_current_codex_account(config_path) is None:
+                        raise RuntimeError(
+                            "Could not save the current Codex session before adding another."
+                        )
+                else:
+                    with _CODEX_LOCK:
+                        if _read_codex_credentials_for_import_raw() != raw_current_creds:
+                            raise RuntimeError("Codex credentials changed while starting account add.")
+                        keychain.write_credentials(
+                            f"{CODEX_KEYCHAIN_PREFIX}{current_email}",
+                            current_email,
+                            current_creds,
+                        )
+        elif active:
+            with _CODEX_LOCK:
+                raw_current_creds = keychain.read_credentials(
+                    f"{CODEX_KEYCHAIN_PREFIX}{active.email}"
+                )
+            if raw_current_creds is not None:
+                keychain._single_line(raw_current_creds)
+            current_creds = normalize_codex_credentials_blob(raw_current_creds)
+
+        result = None
+        try:
+            # Do NOT run `codex logout` here. It revokes the *previous* account's
+            # session server-side, invalidating the backup we just saved for it,
+            # so adding a new Codex account would kill the old one. Clearing the
+            # local auth.json below is all the fresh login needs.
+            _clear_codex_credentials_file()
+            if run_codex_login():
+                result = import_current_codex_account(config_path)
+        except BaseException as original:
+            if current_creds:
+                try:
+                    _restore_codex_credentials(current_creds)
+                except BaseException as restore_error:
+                    raise original from restore_error
+            raise
+
+        if result is None and current_creds:
+            _restore_codex_credentials(current_creds)
+        return result
+    finally:
+        with _CODEX_LOCK:
+            _add_in_progress = False
 
 
-def remove_codex_account(email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+def remove_codex_account(email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> bool:
     """Remove a saved Codex account from config and Keychain."""
-    keychain.delete_credentials(f"{CODEX_KEYCHAIN_PREFIX}{email}")
-    remove_account(email, config_path, provider="codex")
+    if not _CODEX_LOCK.acquire(blocking=False):
+        return False
+    try:
+        if _add_in_progress:
+            return False
+        active = get_active_account(config_path, provider="codex")
+        if active and active.email == email:
+            return False
+        service = f"{CODEX_KEYCHAIN_PREFIX}{email}"
+        snapshot = keychain.snapshot_credentials(service)
+        if snapshot is not None:
+            keychain._single_line(snapshot[1])
+        try:
+            keychain.delete_credentials(service)
+            remove_account(email, config_path, provider="codex")
+        except BaseException as original:
+            if snapshot is not None:
+                try:
+                    keychain.restore_credentials(service, snapshot)
+                except BaseException as restore_error:
+                    raise original from restore_error
+            raise
+        return True
+    finally:
+        _CODEX_LOCK.release()

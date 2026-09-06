@@ -7,7 +7,7 @@ from pathlib import Path
 import rumps
 from Foundation import NSOperationQueue
 
-from claude_switcher import keychain
+from claude_switcher import codex_core, core, keychain
 from claude_switcher.auto_switch import (
     account_key,
     choose_auto_switch_target,
@@ -15,6 +15,7 @@ from claude_switcher.auto_switch import (
 )
 from claude_switcher.codex_core import (
     check_codex_cli,
+    cancel_codex_login,
     import_current_codex_account,
     switch_codex_account,
     add_new_codex_account,
@@ -34,6 +35,7 @@ from claude_switcher.config import (
 )
 from claude_switcher.core import (
     check_claude_cli,
+    cancel_login,
     import_current_account,
     switch_account,
     add_new_account,
@@ -47,7 +49,85 @@ PROVIDER_LABELS = {
     "claude": "Claude Code",
     "codex": "Codex CLI",
 }
+# Provider-specific Add inputs and app dispatch/display values.
+# add: (label, check_cli, add_fn, cancel_fn, login_instruction).
+PROVIDERS = {
+    "claude": {
+        "add": (
+            "Claude", check_claude_cli, add_new_account, cancel_login,
+            "Sign in in the browser window that appears, then come back here.",
+        ),
+        "add_success": "Claude account added",
+        "core": core,
+        "credential_prefix": "claude-switcher:",
+        "account_click": "_on_claude_account_click",
+        "switch": switch_account,
+        "fetch_active_usage": fetch_active_usage,
+        "fetch_usage": fetch_usage_for_account,
+        "usage_state": claude_usage_state,
+    },
+    "codex": {
+        "add": (
+            "Codex", check_codex_cli, add_new_codex_account, cancel_codex_login,
+            "Sign in in the Terminal window that appears, then come back here.",
+        ),
+        "add_success": "Signed in to Codex",
+        "core": codex_core,
+        "credential_prefix": "codex-switcher:",
+        "account_click": "_on_codex_account_click",
+        "switch": switch_codex_account,
+        "fetch_active_usage": fetch_active_codex_usage,
+        "fetch_usage": fetch_codex_usage_for_account,
+        "usage_state": codex_usage_state,
+    },
+}
 AUTO_SWITCH_COOLDOWN_SECONDS = 60
+
+# When a usage refresh comes back unavailable (e.g. the first fetch races a macOS
+# Keychain-access prompt, which blocks `security` past its timeout), retry a few
+# times on a short delay instead of leaving stale text until the 300s timer.
+QUICK_RETRY_BUDGET = 3
+QUICK_RETRY_DELAY_SECONDS = 6
+
+
+def _plan_quick_retry(states, retries_left):
+    """Decide whether to schedule a quick usage retry.
+
+    Returns (should_retry, new_retries_left). Retry while any usage window is
+    unavailable and budget remains; refill the budget once everything is
+    available so a later transient failure gets a fresh set of quick retries.
+    A missing state (None) counts as unavailable.
+    """
+    any_unavailable = any(state is None or not state.available for state in states)
+    if not any_unavailable:
+        return False, QUICK_RETRY_BUDGET
+    if retries_left <= 0:
+        return False, 0
+    return True, retries_left - 1
+
+
+def _add_lease_held(provider: str) -> bool:
+    """True while an interactive sign-in for this provider is in progress.
+
+    During a sign-in the provider's live credential is cleared and its
+    persistence is locked, so any usage fetch can only come back "unavailable".
+    Callers use this to keep the last known numbers on screen rather than
+    painting rows "Checking…" for the whole login window (up to 5 minutes).
+    """
+    entry = PROVIDERS.get(provider, PROVIDERS["codex"])
+    return bool(entry["core"]._add_in_progress)
+
+
+def _wait_for_lease_release(provider: str, timeout: float = 15.0) -> bool:
+    """After cancelling a sign-in, wait for its add flow to restore the snapshot
+    and release the lease, so a fresh add can take it. Polls; never blocks the UI
+    (callers run this on the add's background thread)."""
+    deadline = time.monotonic() + timeout
+    while _add_lease_held(provider):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
 
 
 def _on_main_thread(fn):
@@ -66,6 +146,11 @@ class ClaudeSwitcherApp(rumps.App):
         self._last_auto_switch_attempt: dict[str, float] = {}
         self._refresh_in_progress = False
         self._switch_in_progress: set[str] = set()
+        self._quick_retries_left = QUICK_RETRY_BUDGET
+        self._quick_retry_timer: threading.Timer | None = None
+        self._refresh_requested = False   # a Refresh click landed mid-flight; honour it after
+        self._manual_refresh = False      # current refresh is user-initiated -> notify when done
+        self._signing_in_since: dict[str, float] = {}  # provider -> time.time() Add was clicked
         self._first_launch()
         self._rebuild_menu()
         self._fetch_all_usage()
@@ -81,6 +166,7 @@ class ClaudeSwitcherApp(rumps.App):
         claude_available = check_claude_cli()
         codex_available = check_codex_cli()
 
+        # Claude import failures propagate; only Codex import failures are skipped below.
         if claude_available:
             imported = import_current_account(self.config_path)
             if imported:
@@ -91,6 +177,7 @@ class ClaudeSwitcherApp(rumps.App):
                     message=f"{imported.email} ({imported.subscription_type})",
                 )
 
+        # Codex import can reject its auth storage; notify and continue first launch.
         if codex_available:
             try:
                 imported = import_current_codex_account(self.config_path)
@@ -121,26 +208,29 @@ class ClaudeSwitcherApp(rumps.App):
         self.menu.clear()
         self._usage_items = {}
 
-        claude_accounts = [a for a in accounts if a.provider == "claude"]
-        codex_accounts = [a for a in accounts if a.provider == "codex"]
-
-        if claude_accounts:
-            self._add_provider_section("claude", claude_accounts)
-        if codex_accounts:
-            if claude_accounts:
-                self.menu.add(rumps.separator)
-            self._add_provider_section("codex", codex_accounts)
+        section_added = False
+        for provider in PROVIDERS:
+            # Keep each provider's accounts in its own section, even for shared emails.
+            provider_accounts = [a for a in accounts if a.provider == provider]
+            if provider_accounts:
+                if section_added:
+                    self.menu.add(rumps.separator)
+                self._add_provider_section(provider, provider_accounts)
+                section_added = True
 
         self.menu.add(rumps.separator)
         self._add_auto_switch_menu()
-        self.menu.add(rumps.MenuItem("\u271A  Add Claude account...", callback=self._on_add_claude_account))
-        self.menu.add(rumps.MenuItem("\u271A  Add Codex account...", callback=self._on_add_codex_account))
+        for provider, entry in PROVIDERS.items():
+            label = entry["add"][0]
+            item = rumps.MenuItem(f"\u271A  Add {label} account...", callback=self._on_add)
+            item._provider = provider
+            self.menu.add(item)
         self.menu.add(rumps.MenuItem("\u21BB  Refresh usage", callback=self._on_refresh_usage))
 
         if accounts:
             remove_menu = rumps.MenuItem("\u2212  Remove account")
             for account in accounts:
-                provider_label = "Claude" if account.provider == "claude" else "Codex"
+                provider_label = PROVIDERS.get(account.provider, PROVIDERS["codex"])["add"][0]
                 item = rumps.MenuItem(f"[{provider_label}] {account.email}", callback=self._on_remove_account)
                 item._email = account.email
                 item._provider = account.provider
@@ -160,11 +250,7 @@ class ClaudeSwitcherApp(rumps.App):
             prefix = "\u25C9  " if account.active else "\u25CB  "
             if has_creds:
                 label = f"{prefix}{account.email} ({account.subscription_type})"
-                callback = (
-                    self._on_claude_account_click
-                    if provider == "claude"
-                    else self._on_codex_account_click
-                )
+                callback = getattr(self, PROVIDERS[provider]["account_click"])
                 item = rumps.MenuItem(label, callback=callback)
             else:
                 item = rumps.MenuItem(f"{prefix}{account.email} (unavailable)", callback=None)
@@ -192,17 +278,19 @@ class ClaudeSwitcherApp(rumps.App):
         self.menu.add(auto_menu)
 
     def _has_credentials(self, account) -> bool:
-        service = (
-            f"claude-switcher:{account.email}"
-            if account.provider == "claude"
-            else f"codex-switcher:{account.email}"
-        )
+        entry = PROVIDERS.get(account.provider, PROVIDERS["codex"])
+        service = f"{entry['credential_prefix']}{account.email}"
         return keychain.read_credentials(service) is not None
 
     def _on_claude_account_click(self, sender):
         self._switch_account("claude", sender._email)
 
     def _on_codex_account_click(self, sender):
+        # Codex revoked backups open login instead of switching; Claude rows always switch.
+        state = self._usage_state_cache.get(("codex", sender._email))
+        if state is not None and not state.available and "Login required" in state.display:
+            self._on_add(sender)
+            return
         self._switch_account("codex", sender._email)
 
     def _switch_account(self, provider: str, email: str):
@@ -222,10 +310,7 @@ class ClaudeSwitcherApp(rumps.App):
         def _switch():
             error = None
             try:
-                if provider == "claude":
-                    switch_account(email, self.config_path)
-                else:
-                    switch_codex_account(email, self.config_path)
+                PROVIDERS.get(provider, PROVIDERS["codex"])["switch"](email, self.config_path)
             except Exception as exc:
                 error = str(exc)
 
@@ -246,58 +331,40 @@ class ClaudeSwitcherApp(rumps.App):
 
         threading.Thread(target=_switch, daemon=True).start()
 
-    def _on_add_claude_account(self, _):
-        """Add a new Claude Code account via claude auth login."""
-        if not check_claude_cli():
+    def _on_add(self, sender):
+        """Add an account through the selected provider's login flow."""
+        provider = sender._provider
+        entry = PROVIDERS[provider]
+        label, check_cli, add_fn, cancel_fn, login_instruction = entry["add"]
+        if not check_cli():
             rumps.alert(
-                title="Claude CLI not found",
-                message="Please install Claude Code before adding an account.",
+                title=f"{label} CLI not found",
+                message=f"Please install {PROVIDER_LABELS[provider]} before adding an account.",
             )
             return
+        # Clicking Add while a sign-in is already open means "start over":
+        # cancel the old one (its snapshot is restored by its own cancelled
+        # path) and begin a fresh login. One button, obvious intent.
+        restarting = self._signing_in(provider)
+        if restarting:
+            cancel_fn()
+
+        self._signing_in_since[provider] = time.time()
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle=f"Restarting {label} login…" if restarting else f"Opening {label} login…",
+            message=login_instruction,
+        )
 
         def _add():
             try:
-                result = add_new_account(self.config_path)
+                if restarting and not _wait_for_lease_release(provider):
+                    raise RuntimeError(f"The previous {label} sign-in did not stop in time. Try again.")
+                result = add_fn(self.config_path)
                 if result:
                     title, subtitle, message = (
                         "Claude Switcher",
-                        "Claude account added",
-                        f"{result.email} ({result.subscription_type})",
-                    )
-                else:
-                    title, subtitle, message = (
-                        "Claude Switcher",
-                        "Cancelled",
-                        "Login was cancelled or failed.",
-                    )
-            except Exception as exc:
-                title, subtitle, message = "Claude Switcher", "Error", str(exc)
-
-            def _finish():
-                rumps.notification(title=title, subtitle=subtitle, message=message)
-                self._rebuild_menu()
-                self._fetch_all_usage()
-
-            _on_main_thread(_finish)
-
-        threading.Thread(target=_add, daemon=True).start()
-
-    def _on_add_codex_account(self, _):
-        """Add a new Codex CLI account via codex login."""
-        if not check_codex_cli():
-            rumps.alert(
-                title="Codex CLI not found",
-                message="Please install Codex CLI before adding an account.",
-            )
-            return
-
-        def _add():
-            try:
-                result = add_new_codex_account(self.config_path)
-                if result:
-                    title, subtitle, message = (
-                        "Claude Switcher",
-                        "Codex account added",
+                        entry["add_success"],
                         f"{result.email} ({result.subscription_type})",
                     )
                 else:
@@ -333,6 +400,8 @@ class ClaudeSwitcherApp(rumps.App):
     def _fetch_all_usage(self):
         """Fetch usage for all accounts in a background thread."""
         if self._refresh_in_progress:
+            # Don't silently drop the request: run again once this one finishes.
+            self._refresh_requested = True
             return
         self._refresh_in_progress = True
         accounts = load_accounts(self.config_path)
@@ -346,6 +415,11 @@ class ClaudeSwitcherApp(rumps.App):
             try:
                 for account in accounts:
                     key = account_key(account)
+                    if _add_lease_held(account.provider):
+                        # Sign-in in progress for this provider: a fetch can only
+                        # return "unavailable". Keep the last known numbers; the
+                        # post-login refresh will resolve these rows.
+                        continue
                     state = self._fetch_usage_state(account, active_by_provider.get(account.provider))
                     self._usage_state_cache[key] = state
                     self._usage_cache[key] = state.display
@@ -357,34 +431,71 @@ class ClaudeSwitcherApp(rumps.App):
             finally:
                 def _finish():
                     self._refresh_in_progress = False
-                    if any(result["status"] == "switched" for result in auto_switch_results):
+                    switched = any(r["status"] == "switched" for r in auto_switch_results)
+                    if switched:
                         self._rebuild_menu()
+
+                    states = [self._usage_state_cache.get(account_key(a)) for a in accounts]
+                    should_retry, self._quick_retries_left = _plan_quick_retry(
+                        states, self._quick_retries_left
+                    )
+                    if should_retry and any(_add_lease_held(a.provider) for a in accounts):
+                        # Don't cycle "Checking…"/retries while a sign-in is in
+                        # progress; the post-login refresh resolves the rows.
+                        should_retry = False
+                    if should_retry:
+                        # Show progress on the rows that have no data yet, rather
+                        # than leaving them reading "Usage unavailable".
+                        for account, state in zip(accounts, states):
+                            if state is None or not state.available:
+                                self._usage_cache[account_key(account)] = "Checking…"
+
                     self._update_usage_labels()
                     for result in auto_switch_results:
                         self._notify_auto_switch_result(result)
-                    if any(result["status"] == "switched" for result in auto_switch_results):
+                    if self._manual_refresh:
+                        # The menu closed on click, so tell the user it finished
+                        # and give them the numbers without reopening.
+                        self._manual_refresh = False
+                        rumps.notification(
+                            title="Claude Switcher",
+                            subtitle="Usage updated",
+                            message=self._active_usage_summary(),
+                        )
+                    if switched:
+                        self._fetch_all_usage()
+                    elif should_retry:
+                        self._schedule_quick_retry()
+                    elif self._refresh_requested:
+                        # A click landed while this refresh was in flight; honour it.
+                        self._refresh_requested = False
                         self._fetch_all_usage()
 
                 _on_main_thread(_finish)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
+    def _schedule_quick_retry(self):
+        """Refetch usage after a short delay, on the main thread. One pending at a time."""
+        if self._quick_retry_timer is not None:
+            self._quick_retry_timer.cancel()
+
+        def _fire():
+            _on_main_thread(self._fetch_all_usage)
+
+        self._quick_retry_timer = threading.Timer(QUICK_RETRY_DELAY_SECONDS, _fire)
+        self._quick_retry_timer.daemon = True
+        self._quick_retry_timer.start()
+
     def _fetch_usage_state(self, account, active_account) -> UsageState:
         try:
-            if account.provider == "claude":
-                usage = (
-                    fetch_active_usage()
-                    if active_account and active_account.email == account.email
-                    else fetch_usage_for_account(account.email)
-                )
-                return claude_usage_state(usage)
-            if account.provider == "codex":
-                usage = (
-                    fetch_active_codex_usage()
-                    if active_account and active_account.email == account.email
-                    else fetch_codex_usage_for_account(account.email)
-                )
-                return codex_usage_state(usage)
+            entry = PROVIDERS[account.provider]
+            usage = (
+                entry["fetch_active_usage"]()
+                if active_account and active_account.email == account.email
+                else entry["fetch_usage"](account.email)
+            )
+            return entry["usage_state"](usage)
         except Exception:
             pass
         return UsageState(available=False, display="Usage unavailable")
@@ -422,10 +533,7 @@ class ClaudeSwitcherApp(rumps.App):
             return {"status": "no_target", "provider": provider, "email": active.email}
 
         try:
-            if provider == "claude":
-                switch_account(target.email, self.config_path)
-            else:
-                switch_codex_account(target.email, self.config_path)
+            PROVIDERS.get(provider, PROVIDERS["codex"])["switch"](target.email, self.config_path)
         except Exception as exc:
             return {
                 "status": "error",
@@ -464,11 +572,47 @@ class ClaudeSwitcherApp(rumps.App):
             usage_text = self._usage_cache.get(key, "Usage unavailable")
             item.title = f"       \u2502  {usage_text}"
 
+    _SIGNIN_GRACE_SECONDS = 3.0
+
+    def _signing_in(self, provider: str) -> bool:
+        """True while a sign-in for this provider is in progress.
+
+        The real truth is the provider's add-lease. It is taken on a background
+        thread a moment after Add is clicked, so for a short grace after the
+        click we also treat the provider as signing in — that lets the Cancel
+        item appear instantly and lets a double-click be refused, without
+        racing the thread. Once the lease is released the grace has long
+        expired, so the finish rebuild hides the item.
+        """
+        if _add_lease_held(provider):
+            return True
+        since = self._signing_in_since.get(provider)
+        return since is not None and (time.time() - since) < self._SIGNIN_GRACE_SECONDS
+
+    def _active_usage_summary(self) -> str:
+        """One-line usage for each provider's active account, for notifications."""
+        parts = []
+        for provider in ("claude", "codex"):
+            active = get_active_account(self.config_path, provider=provider)
+            if active:
+                text = self._usage_cache.get(account_key(active), "unavailable")
+                parts.append(f"{PROVIDER_LABELS[provider]}: {text}")
+        return "  ·  ".join(parts) or "Reopen the menu to see usage."
+
     def _on_refresh_usage(self, _):
-        """Refresh usage data for all accounts."""
+        """Refresh usage data for all accounts, with visible feedback."""
+        self._quick_retries_left = QUICK_RETRY_BUDGET
+        self._manual_refresh = True
+        # The menu closes on click; without this the click looks like a no-op.
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle="Refreshing usage…",
+            message="You'll get a notice with the numbers when it's done.",
+        )
         self._fetch_all_usage()
 
     def _on_periodic_usage_refresh(self, _):
+        self._quick_retries_left = QUICK_RETRY_BUDGET
         self._fetch_all_usage()
 
     def _on_remove_account(self, sender):
@@ -484,10 +628,21 @@ class ClaudeSwitcherApp(rumps.App):
             )
             return
 
-        if provider == "claude":
-            remove_saved_account(email, self.config_path)
-        else:
-            remove_codex_account(email, self.config_path)
+        try:
+            # Claude signals failure by exception; Codex also returns False for busy/changed accounts.
+            if provider == "claude":
+                remove_saved_account(email, self.config_path)
+            elif not remove_codex_account(email, self.config_path):
+                rumps.alert(
+                    title="Account busy",
+                    message="The Codex account changed or is busy. Please try again in a moment.",
+                )
+                self._rebuild_menu()
+                return
+        except RuntimeError as exc:
+            rumps.alert(title="Account busy", message=str(exc))
+            self._rebuild_menu()
+            return
         rumps.notification(
             title="Claude Switcher",
             subtitle=f"{PROVIDER_LABELS[provider]} account removed",
