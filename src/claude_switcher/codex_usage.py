@@ -1,9 +1,12 @@
 """Codex CLI usage fetching via ChatGPT backend APIs."""
 
 import json
+import logging
 from datetime import datetime, timezone
+from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from claude_switcher import keychain
 from claude_switcher.common import _decode_jwt_payload, _format_countdown
@@ -21,6 +24,9 @@ CODEX_USAGE_URLS = (
     "https://chatgpt.com/backend-api/api/codex/usage",
 )
 CODEX_LOGIN_REQUIRED_USAGE = {"error": {"code": "login_required"}}
+CODEX_RESET_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+RESET_CODES = frozenset({"reset", "nothing_to_reset", "no_credit", "already_redeemed"})
+logger = logging.getLogger(__name__)
 
 
 def _extract_codex_token(creds_json: str) -> tuple[str, str] | None:
@@ -171,6 +177,91 @@ def fetch_active_codex_usage(config_path=DEFAULT_CONFIG_PATH) -> dict | None:
     return _fetch_codex_usage_once(refreshed)
 
 
+def _reset_counts(usage: dict | None) -> tuple[int, int]:
+    """Read only integer reset counts from the usage payload."""
+    credits = usage.get("rate_limit_reset_credits") if isinstance(usage, dict) else None
+    if not isinstance(credits, dict):
+        return 0, 0
+    available = credits.get("available_count")
+    applicable = credits.get("applicable_available_count")
+    return (
+        available if type(available) is int else 0,
+        applicable if type(applicable) is int else 0,
+    )
+
+
+def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH) -> str:
+    """Recheck usage, then redeem one reset with an idempotent network retry."""
+    key = str(uuid4())
+    busy_message = "A Codex account add is in progress. Try again in a moment."
+    if codex_core._add_in_progress:
+        logger.info("Codex reset email=%s key=%s outcome=add_in_progress", email, key)
+        raise RuntimeError(busy_message)
+
+    active = get_active_account(config_path, provider="codex")
+    is_active = active is not None and active.email == email
+    usage = (
+        fetch_active_codex_usage(config_path)
+        if is_active else fetch_codex_usage_for_account(email, config_path)
+    )
+    if _reset_counts(usage)[1] <= 0:
+        logger.info("Codex reset email=%s key=%s outcome=no_credit", email, key)
+        return "no_credit"
+
+    # Read after the existing fetcher's refresh/write-back. Keep a switch or add
+    # from replacing the live source between this read and the consumption.
+    with codex_core._CODEX_LOCK:
+        if codex_core._add_in_progress:
+            logger.info("Codex reset email=%s key=%s outcome=add_in_progress", email, key)
+            raise RuntimeError(busy_message)
+        if is_active:
+            current = get_active_account(config_path, provider="codex")
+            if current is None or current.email != email:
+                logger.info("Codex reset email=%s key=%s outcome=account_changed", email, key)
+                raise RuntimeError("The active Codex account changed. Try again.")
+            blob = codex_core._read_codex_credentials_for_import_raw()
+        else:
+            blob = keychain.read_credentials(f"codex-switcher:{email}")
+        tokens = _extract_codex_token(blob) if blob else None
+        if tokens is None:
+            logger.info("Codex reset email=%s key=%s outcome=credentials_unavailable", email, key)
+            raise RuntimeError("Codex credentials unavailable. Sign in again.")
+        token, account_id = tokens
+        req = Request(CODEX_RESET_CONSUME_URL, method="POST",
+                      data=json.dumps({"redeem_request_id": key}).encode())
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("ChatGPT-Account-Id", account_id)
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", "claude-switcher/0.4.3")
+        req.add_header("Content-Type", "application/json")
+
+        for attempt in range(2):
+            status = None
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    status = resp.status
+                    payload = json.loads(resp.read().decode())
+                code = payload.get("code") if isinstance(payload, dict) else None
+                code = code.lower() if isinstance(code, str) else None
+                if code not in RESET_CODES:
+                    raise ValueError("Unknown reset code")
+            except HTTPError as exc:
+                logger.info("Codex reset email=%s key=%s outcome=http_%s", email, key, exc.code)
+                raise RuntimeError(f"Codex reset failed (HTTP {exc.code}).") from exc
+            except (URLError, TimeoutError, ConnectionError, IncompleteRead) as exc:
+                status_text = f" (HTTP {status})" if isinstance(status, int) else ""
+                logger.info("Codex reset email=%s key=%s outcome=network_error%s", email, key, status_text)
+                if attempt == 0:
+                    continue
+                raise RuntimeError(f"Codex reset failed: connection error or timeout{status_text}.") from exc
+            except (ValueError, OSError) as exc:
+                status_text = f" (HTTP {status})" if isinstance(status, int) else ""
+                logger.info("Codex reset email=%s key=%s outcome=invalid_response%s", email, key, status_text)
+                raise RuntimeError(f"Codex reset failed: invalid response{status_text}.") from exc
+            logger.info("Codex reset email=%s key=%s outcome=%s", email, key, code)
+            return code
+
+
 def _format_reset_delta(reset_at: float) -> str:
     """Convert a Unix timestamp to a human-readable countdown."""
     try:
@@ -235,7 +326,10 @@ def codex_usage_state(usage: dict | None) -> UsageState:
 
     if not parts:
         return UsageState(available=False, display="Usage unavailable")
-    return UsageState(available=True, display=" | ".join(parts), windows=tuple(windows))
+    available, applicable = _reset_counts(usage)
+    suffix = f" · {available} reset{'s' if available != 1 else ''}" if available > 0 else ""
+    return UsageState(available=True, display=" | ".join(parts) + suffix, windows=tuple(windows),
+                      reset_credits=available, reset_applicable=applicable)
 
 
 def format_codex_usage(usage: dict | None) -> str:

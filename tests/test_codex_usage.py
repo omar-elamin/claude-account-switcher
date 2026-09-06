@@ -505,3 +505,184 @@ class TestWindowLabelFromLength:
 
     def test_sub_hour_window(self):
         assert codex_usage_state(self._usage(1800)).windows[0].label == "30m"
+
+
+@pytest.mark.parametrize("count", [0, 1, 4])
+def test_reset_credit_fields_and_suffix(count):
+    state = codex_usage_state({
+        "rate_limit": {"primary_window": {"used_percent": 100, "limit_window_seconds": 604800}},
+        "rate_limit_reset_credits": {"available_count": count, "applicable_available_count": count},
+    })
+    assert (state.reset_credits, state.reset_applicable) == (count, count)
+    assert state.display == "7d 100%" + (f" · {count} reset" + ("s" if count != 1 else "") if count else "")
+
+
+@pytest.mark.parametrize("credits", [None, [], "bad", 3, {},
+    {"available_count": "2", "applicable_available_count": 1.5},
+    {"available_count": True, "applicable_available_count": False}])
+def test_malformed_reset_credits_are_zero(credits):
+    state = codex_usage_state({"rate_limit": {"primary_window": {"used_percent": 10}},
+                               "rate_limit_reset_credits": credits})
+    assert (state.reset_credits, state.reset_applicable) == (0, 0)
+    assert state.display == "1h 10%"
+
+
+@pytest.mark.parametrize("usage", [None, {}, {"error": {"code": "login_required"}}, {"rate_limit": {}}])
+def test_unavailable_usage_has_no_reset_credits(usage):
+    if usage is not None:
+        usage = dict(usage, rate_limit_reset_credits={"available_count": 2, "applicable_available_count": 2})
+    state = codex_usage_state(usage)
+    assert (state.reset_credits, state.reset_applicable) == (0, 0)
+    assert "reset" not in state.display
+
+
+@pytest.fixture
+def reset_transport(tmp_path):
+    from types import SimpleNamespace
+    config = tmp_path / "accounts.json"
+    account = AccountInfo("user@test.com", "plus", "", False, "user", provider="codex")
+    save_accounts([account], config)
+    usage = {"rate_limit_reset_credits": {"available_count": 3, "applicable_available_count": 2}}
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.read.return_value = b'{"code":"reset","windows_reset":2}'
+    with patch.object(codex_usage_mod, "fetch_codex_usage_for_account", return_value=usage) as saved, \
+         patch.object(codex_usage_mod, "fetch_active_codex_usage", return_value=usage) as active, \
+         patch.object(codex_usage_mod.keychain, "read_credentials", return_value=FAKE_CREDS_NESTED) as read, \
+         patch.object(codex_core_mod, "_read_codex_credentials_for_import_raw", return_value=FAKE_CREDS_NESTED) as live, \
+         patch.object(codex_usage_mod, "urlopen", return_value=response) as post:
+        yield SimpleNamespace(config=config, account=account, usage=usage, response=response,
+                              saved=saved, active=active, read=read, live=live, post=post)
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("code", ["reset", "nothing_to_reset", "no_credit", "already_redeemed",
+                                  "RESET", "Nothing_To_Reset", "NO_CREDIT", "Already_Redeemed"])
+def test_consume_reset_contract(reset_transport, active, code, caplog):
+    from uuid import UUID
+    t = reset_transport
+    t.account.active = active
+    save_accounts([t.account], t.config)
+    t.response.read.return_value = json.dumps({"code": code, "windows_reset": 2}).encode()
+    with caplog.at_level("INFO"):
+        assert codex_usage_mod.consume_reset_credit(t.account.email, t.config) == code.lower()
+    selected, unused = (t.active, t.saved) if active else (t.saved, t.active)
+    selected.assert_called_once_with(*((t.config,) if active else (t.account.email, t.config)))
+    unused.assert_not_called()
+    (t.live if active else t.read).assert_called_once_with(*(() if active else ("codex-switcher:user@test.com",)))
+    req = t.post.call_args.args[0]
+    assert req.full_url == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+    assert req.get_method() == "POST"
+    assert dict((k.lower(), v) for k, v in req.header_items()) == {
+        "authorization": "Bearer sk-test-token", "chatgpt-account-id": "acc-123",
+        "accept": "application/json", "user-agent": "claude-switcher/0.4.3", "content-type": "application/json"}
+    body = json.loads(req.data)
+    assert set(body) == {"redeem_request_id"}
+    assert UUID(body["redeem_request_id"]).version == 4
+    assert t.post.call_args.kwargs == {"timeout": 10}
+    assert t.account.email in caplog.text and body["redeem_request_id"] in caplog.text and code.lower() in caplog.text
+
+
+@pytest.mark.parametrize("status", [400, 401, 429, 500, 503])
+def test_consume_http_errors_never_retry(reset_transport, status):
+    t = reset_transport
+    t.post.side_effect = urllib.error.HTTPError("url", status, "failure", {}, None)
+    with pytest.raises(RuntimeError, match=str(status)):
+        codex_usage_mod.consume_reset_credit(t.account.email, t.config)
+    assert t.post.call_count == 1
+
+
+@pytest.mark.parametrize("error", [TimeoutError(), ConnectionResetError(), urllib.error.URLError("connection failed")])
+@pytest.mark.parametrize("recovers", [False, True])
+def test_consume_network_retry_reuses_key(reset_transport, error, recovers, caplog):
+    t = reset_transport
+    t.post.side_effect = [error, t.response if recovers else error]
+    with caplog.at_level("INFO"):
+        if recovers:
+            assert codex_usage_mod.consume_reset_credit(t.account.email, t.config) == "reset"
+        else:
+            with pytest.raises(RuntimeError):
+                codex_usage_mod.consume_reset_credit(t.account.email, t.config)
+    assert t.post.call_count == 2
+    bodies = [json.loads(c.args[0].data) for c in t.post.call_args_list]
+    assert bodies[0] == bodies[1]
+    assert len([r for r in caplog.records if bodies[0]["redeem_request_id"] in r.message]) == 2
+
+
+@pytest.mark.parametrize("body", [b'not json', b'\xff', b'[]', b'{}', b'{"code":1}', b'{"code":"unexpected"}'])
+def test_consume_invalid_response_never_retries(reset_transport, body):
+    t = reset_transport
+    t.response.read.return_value = body
+    with pytest.raises(RuntimeError):
+        codex_usage_mod.consume_reset_credit(t.account.email, t.config)
+    assert t.post.call_count == 1
+
+
+def test_consume_busy_add_does_no_work(reset_transport):
+    t = reset_transport
+    with patch.object(codex_core_mod, "_add_in_progress", True), pytest.raises(
+        RuntimeError, match="A Codex account add is in progress. Try again in a moment."):
+        codex_usage_mod.consume_reset_credit(t.account.email, t.config)
+    t.post.assert_not_called()
+    t.saved.assert_not_called()
+    t.active.assert_not_called()
+
+
+@pytest.mark.parametrize("credits", [None, {}, {"applicable_available_count": 0}, {"applicable_available_count": "1"}])
+def test_consume_inapplicable_does_not_post(reset_transport, credits):
+    t = reset_transport
+    t.usage["rate_limit_reset_credits"] = credits
+    assert codex_usage_mod.consume_reset_credit(t.account.email, t.config) == "no_credit"
+    t.post.assert_not_called()
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_consume_uses_real_usage_refresh_writeback(tmp_path, active):
+    config = tmp_path / "accounts.json"
+    email = "user@test.com"
+    save_accounts([AccountInfo(email, "plus", "", active, email, provider="codex")], config)
+    stale = json.dumps({"email": email, "tokens": {"access_token": "stale", "account_id": "account", "refresh_token": "refresh"}})
+    fresh = json.dumps({"email": email, "tokens": {"access_token": "fresh", "account_id": "account", "refresh_token": "new-refresh"}})
+    storage = {"live": stale, "saved": stale}
+    requests = []
+
+    def transport(req, timeout):
+        requests.append(req)
+        assert timeout == 10
+        if req.get_method() == "GET" and req.get_header("Authorization") == "Bearer stale":
+            raise urllib.error.HTTPError(req.full_url, 401, "expired", {}, None)
+        assert req.get_header("Authorization") == "Bearer fresh"
+        assert req.get_header("Chatgpt-account-id") == "account"
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = json.dumps(
+            {"rate_limit_reset_credits": {"available_count": 3, "applicable_available_count": 2}}
+            if req.get_method() == "GET" else {"code": "reset", "windows_reset": 2}
+        ).encode()
+        return response
+
+    with patch.object(codex_core_mod, "_read_codex_credentials_for_import_raw", side_effect=lambda: storage["live"]), \
+         patch.object(codex_core_mod, "_write_codex_credentials", side_effect=lambda blob: storage.update(live=blob)), \
+         patch.object(codex_usage_mod.keychain, "read_credentials", side_effect=lambda service: storage["saved"]), \
+         patch.object(codex_usage_mod.keychain, "write_credentials", side_effect=lambda service, email, blob: storage.update(saved=blob)), \
+         patch.object(codex_usage_mod, "refresh_codex_credentials", return_value=fresh) as refresh, \
+         patch.object(codex_usage_mod, "urlopen", side_effect=transport):
+        assert codex_usage_mod.consume_reset_credit(email, config) == "reset"
+    refresh.assert_called_once_with(stale)
+    assert storage["saved"] == fresh
+    assert storage["live"] == (fresh if active else stale)
+    assert [r.get_method() for r in requests] == ["GET", "GET", "GET", "POST"]
+    assert all(r.full_url in codex_usage_mod.CODEX_USAGE_URLS for r in requests[:-1])
+
+
+@pytest.mark.parametrize("failure", ["timeout", "truncated"])
+def test_consume_response_read_failure_retries_and_reports_status(reset_transport, failure):
+    from http.client import IncompleteRead
+    t = reset_transport
+    t.response.status = 200
+    t.response.read.side_effect = TimeoutError() if failure == "timeout" else IncompleteRead(b'{"code":')
+    with pytest.raises(RuntimeError, match="HTTP 200"):
+        codex_usage_mod.consume_reset_credit(t.account.email, t.config)
+    assert t.post.call_count == 2
+    assert t.post.call_args_list[0].args[0].data == t.post.call_args_list[1].args[0].data

@@ -19,6 +19,8 @@ class UsageState:
     available: bool
     display: str
     windows: tuple[UsageWindow, ...] = ()
+    reset_credits: int = 0
+    reset_applicable: int = 0
 
     @property
     def max_percent(self) -> float | None:

@@ -30,6 +30,7 @@ class AppSettings:
         default_factory=lambda: {provider: False for provider in DEFAULT_PROVIDERS}
     )
     auto_switch_threshold: float = 100.0
+    auto_reset: dict[str, bool] = field(default_factory=lambda: {"codex": False})
 
 
 def _default_settings_dict() -> dict:
@@ -134,7 +135,14 @@ def _settings_from_dict(data: dict | None) -> AppSettings:
     except (TypeError, ValueError):
         threshold = defaults.auto_switch_threshold
 
-    return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold)
+    auto_reset = dict(defaults.auto_reset)
+    raw_auto_reset = data.get("auto_reset")
+    if isinstance(raw_auto_reset, dict):
+        for provider, enabled in raw_auto_reset.items():
+            if isinstance(provider, str):
+                auto_reset[provider] = bool(enabled)
+
+    return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold, auto_reset=auto_reset)
 
 
 def load_accounts(path: Path = DEFAULT_CONFIG_PATH) -> list[AccountInfo]:
@@ -237,4 +245,19 @@ def set_auto_switch_enabled(
     with _LOCK:
         settings = load_settings(path)
         settings.auto_switch[provider] = bool(enabled)
+        save_settings(settings, path)
+
+
+def is_auto_reset_enabled(provider: str, path: Path = DEFAULT_CONFIG_PATH) -> bool:
+    """Return whether auto-reset is enabled for a provider."""
+    return bool(load_settings(path).auto_reset.get(provider, False))
+
+
+def set_auto_reset_enabled(
+    provider: str, enabled: bool, path: Path = DEFAULT_CONFIG_PATH
+) -> None:
+    """Enable or disable auto-reset for one provider."""
+    with _LOCK:
+        settings = load_settings(path)
+        settings.auto_reset[provider] = bool(enabled)
         save_settings(settings, path)
