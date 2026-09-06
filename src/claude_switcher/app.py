@@ -87,6 +87,18 @@ def _add_lease_held(provider: str) -> bool:
     return bool(flag)
 
 
+def _wait_for_lease_release(provider: str, timeout: float = 15.0) -> bool:
+    """After cancelling a sign-in, wait for its add flow to restore the snapshot
+    and release the lease, so a fresh add can take it. Polls; never blocks the UI
+    (callers run this on the add's background thread)."""
+    deadline = time.monotonic() + timeout
+    while _add_lease_held(provider):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
 def _on_main_thread(fn):
     """Schedule fn() to run on the main thread via Cocoa's operation queue."""
     NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
@@ -177,11 +189,6 @@ class ClaudeSwitcherApp(rumps.App):
         self._add_auto_switch_menu()
         self.menu.add(rumps.MenuItem("\u271A  Add Claude account...", callback=self._on_add_claude_account))
         self.menu.add(rumps.MenuItem("\u271A  Add Codex account...", callback=self._on_add_codex_account))
-        for provider, cb in (("claude", self._on_cancel_claude_signin), ("codex", self._on_cancel_codex_signin)):
-            if self._signing_in(provider):
-                self.menu.add(rumps.MenuItem(
-                    f"\u2715  Cancel {PROVIDER_LABELS[provider]} sign-in", callback=cb
-                ))
         self.menu.add(rumps.MenuItem("\u21BB  Refresh usage", callback=self._on_refresh_usage))
 
         if accounts:
@@ -307,24 +314,25 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Claude Code before adding an account.",
             )
             return
-        if self._signing_in("claude"):
-            rumps.notification(
-                title="Claude Switcher",
-                subtitle="Claude sign-in already in progress",
-                message="Finish it in the browser, or use Cancel Claude Code sign-in.",
-            )
-            return
+        # Clicking Add while a sign-in is already open means "start over":
+        # cancel the old one (its snapshot is restored by its own cancelled
+        # path) and begin a fresh login. One button, obvious intent.
+        restarting = self._signing_in("claude")
+        if restarting:
+            from claude_switcher.core import cancel_login
+            cancel_login()
 
         self._signing_in_since["claude"] = time.time()
-        self._rebuild_menu()          # shows "Cancel Claude Code sign-in" immediately
         rumps.notification(
             title="Claude Switcher",
-            subtitle="Opening Claude login…",
+            subtitle="Restarting Claude login…" if restarting else "Opening Claude login…",
             message="Sign in in the browser window that appears, then come back here.",
         )
 
         def _add():
             try:
+                if restarting and not _wait_for_lease_release("claude"):
+                    raise RuntimeError("The previous Claude sign-in did not stop in time. Try again.")
                 result = add_new_account(self.config_path)
                 if result:
                     title, subtitle, message = (
@@ -358,27 +366,27 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Codex CLI before adding an account.",
             )
             return
-        if self._signing_in("codex"):
-            rumps.notification(
-                title="Claude Switcher",
-                subtitle="Codex sign-in already in progress",
-                message="Finish it in the Terminal window, or use Cancel Codex CLI sign-in.",
-            )
-            return
+        # Clicking Add while a sign-in is already open means "start over":
+        # cancel the old one (its snapshot is restored) and begin a fresh login.
+        restarting = self._signing_in("codex")
+        if restarting:
+            from claude_switcher.codex_core import cancel_codex_login
+            cancel_codex_login()
 
         self._signing_in_since["codex"] = time.time()
-        self._rebuild_menu()          # shows "Cancel Codex CLI sign-in" immediately
 
         # Immediate feedback: the menu closes on click, and the login opens in a
         # separate Terminal window, so without this the click looks like a no-op.
         rumps.notification(
             title="Claude Switcher",
-            subtitle="Opening Codex login…",
+            subtitle="Restarting Codex login…" if restarting else "Opening Codex login…",
             message="Sign in in the Terminal window that appears, then come back here.",
         )
 
         def _add():
             try:
+                if restarting and not _wait_for_lease_release("codex"):
+                    raise RuntimeError("The previous Codex sign-in did not stop in time. Try again.")
                 result = add_new_codex_account(self.config_path)
                 if result:
                     title, subtitle, message = (
@@ -617,31 +625,6 @@ class ClaudeSwitcherApp(rumps.App):
             return True
         since = self._signing_in_since.get(provider)
         return since is not None and (time.time() - since) < self._SIGNIN_GRACE_SECONDS
-
-    def _cancel_signin(self, provider: str, cancel):
-        if not _add_lease_held(provider):
-            rumps.notification(
-                title="Claude Switcher",
-                subtitle="Nothing to cancel",
-                message=f"No {PROVIDER_LABELS[provider]} sign-in is in progress.",
-            )
-            return
-        cancel()
-        # Say "cancelling", not "cancelled": if the login completed in the same
-        # instant, the add flow's own outcome notification is the truth.
-        rumps.notification(
-            title="Claude Switcher",
-            subtitle=f"Cancelling {PROVIDER_LABELS[provider]} sign-in…",
-            message="Stopping the sign-in. The result will follow.",
-        )
-
-    def _on_cancel_claude_signin(self, _):
-        from claude_switcher.core import cancel_login
-        self._cancel_signin("claude", cancel_login)
-
-    def _on_cancel_codex_signin(self, _):
-        from claude_switcher.codex_core import cancel_codex_login
-        self._cancel_signin("codex", cancel_codex_login)
 
     def _active_usage_summary(self) -> str:
         """One-line usage for each provider's active account, for notifications."""

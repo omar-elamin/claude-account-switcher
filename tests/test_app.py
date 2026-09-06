@@ -201,49 +201,55 @@ class TestLeaseKeepsLastKnownUsage:
         app._schedule_quick_retry.assert_not_called()               # no retry cycle during sign-in
 
 
-class TestCancelSignInPerProvider:
+class TestAddRestartsInProgressSignIn:
+    """Add while a sign-in for that provider is open = "start over": cancel the
+    old one, wait for its lease to release, start fresh. No separate Cancel UI."""
+
     def _app(self, app_module):
         app = app_module.ClaudeSwitcherApp.__new__(app_module.ClaudeSwitcherApp)
-        app._signing_in_since = {}
+        app._signing_in_since = {}; app.config_path = "unused"
+        app._rebuild_menu = MagicMock(); app._fetch_all_usage = MagicMock()
         return app
 
-    def test_cancel_codex_only_when_codex_lease_held(self, app_module):
+    def test_add_while_signing_in_cancels_then_starts_fresh(self, app_module):
         app = self._app(app_module); app_module.rumps.notification.reset_mock()
-        with patch.object(app_module, "_add_lease_held", lambda p: p == "codex"), \
-             patch("claude_switcher.codex_core.cancel_codex_login") as cx:
-            app._on_cancel_codex_signin(None)
-        cx.assert_called_once()
-        assert app_module.rumps.notification.call_args.kwargs["subtitle"] == "Cancelling Codex CLI sign-in…"
+        with patch.object(app_module, "check_codex_cli", return_value=True), \
+             patch.object(app_module, "_add_lease_held", lambda p: p == "codex"), \
+             patch("claude_switcher.codex_core.cancel_codex_login") as cancel, \
+             patch.object(app_module.threading, "Thread") as thread:
+            app._on_add_codex_account(None)
+        cancel.assert_called_once()                       # old sign-in cancelled
+        thread.assert_called_once()                       # fresh login started (not refused)
+        assert "Restarting" in app_module.rumps.notification.call_args.kwargs["subtitle"]
 
-    def test_cancel_claude_with_no_lease_says_nothing_to_cancel(self, app_module):
+    def test_add_when_idle_does_not_cancel(self, app_module):
         app = self._app(app_module); app_module.rumps.notification.reset_mock()
-        with patch.object(app_module, "_add_lease_held", lambda p: False), \
-             patch("claude_switcher.core.cancel_login") as cl:
-            app._on_cancel_claude_signin(None)
-        cl.assert_not_called()
-        assert app_module.rumps.notification.call_args.kwargs["subtitle"] == "Nothing to cancel"
+        with patch.object(app_module, "check_codex_cli", return_value=True), \
+             patch.object(app_module, "_add_lease_held", lambda p: False), \
+             patch("claude_switcher.codex_core.cancel_codex_login") as cancel, \
+             patch.object(app_module.threading, "Thread") as thread:
+            app._on_add_codex_account(None)
+        cancel.assert_not_called(); thread.assert_called_once()
+        assert "Opening" in app_module.rumps.notification.call_args.kwargs["subtitle"]
 
-    def test_signing_in_true_during_grace_after_click_even_before_lease(self, app_module):
+    def test_wait_for_lease_release_returns_when_lease_clears(self, app_module):
+        held = {"v": True}
+        with patch.object(app_module, "_add_lease_held", lambda p: held["v"]), \
+             patch.object(app_module.time, "sleep", lambda s: held.__setitem__("v", False)):
+            assert app_module._wait_for_lease_release("codex", timeout=5) is True
+
+    def test_wait_for_lease_release_times_out(self, app_module):
+        with patch.object(app_module, "_add_lease_held", lambda p: True), \
+             patch.object(app_module.time, "sleep", lambda s: None):
+            assert app_module._wait_for_lease_release("codex", timeout=0.0) is False
+
+    def test_signing_in_grace_and_lease(self, app_module):
         app = self._app(app_module)
         with patch.object(app_module, "_add_lease_held", lambda p: False):
             assert app._signing_in("codex") is False
             app._signing_in_since["codex"] = app_module.time.time()
-            assert app._signing_in("codex") is True           # optimistic, pre-lease
+            assert app._signing_in("codex") is True
             app._signing_in_since["codex"] = app_module.time.time() - 60
-            assert app._signing_in("codex") is False          # grace expired, no lease -> hidden
-
-    def test_signing_in_true_while_lease_held_regardless_of_grace(self, app_module):
-        app = self._app(app_module)
+            assert app._signing_in("codex") is False
         with patch.object(app_module, "_add_lease_held", lambda p: p == "claude"):
             assert app._signing_in("claude") is True
-            assert app._signing_in("codex") is False
-
-    def test_second_add_click_is_refused_not_opened(self, app_module):
-        app = self._app(app_module); app_module.rumps.notification.reset_mock()
-        app._rebuild_menu = MagicMock()
-        with patch.object(app_module, "check_codex_cli", return_value=True), \
-             patch.object(app_module, "_add_lease_held", lambda p: p == "codex"), \
-             patch.object(app_module.threading, "Thread") as thread:
-            app._on_add_codex_account(None)
-        thread.assert_not_called()                                   # no second login started
-        assert "already in progress" in app_module.rumps.notification.call_args.kwargs["subtitle"]
