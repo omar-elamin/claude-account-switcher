@@ -18,6 +18,31 @@ def should_auto_switch(active_usage: UsageState, enabled: bool, threshold: float
     return enabled and active_usage.available and active_usage.is_exhausted(threshold)
 
 
+def should_auto_reset(active_usage: UsageState, enabled: bool, threshold: float) -> bool:
+    """Return whether the active account should trigger an auto-reset."""
+    return should_auto_switch(active_usage, enabled, threshold)
+
+
+def choose_auto_reset_target(
+    accounts: list[AccountInfo],
+    active_email: str,
+    usage_by_account: dict[AccountKey, UsageState],
+) -> AccountInfo | None:
+    """Prefer the active Codex account, then an exhausted saved account."""
+    candidates = []
+    for account in accounts:
+        if account.provider != "codex":
+            continue
+        state = usage_by_account.get(account_key(account))
+        if state is None or state.reset_applicable <= 0:
+            continue
+        if account.email == active_email:
+            return account
+        if state.is_exhausted():
+            candidates.append(account)
+    return candidates[0] if candidates else None
+
+
 def choose_auto_switch_target(
     provider: str,
     accounts: list[AccountInfo],
