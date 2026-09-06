@@ -155,6 +155,7 @@ class ClaudeSwitcherApp(rumps.App):
         self._usage_state_cache: dict[tuple[str, str], UsageState] = {}
         self._usage_items: dict[tuple[str, str], rumps.MenuItem] = {}
         self._last_auto_switch_attempt: dict[str, float] = {}
+        self._last_reset_eligible: frozenset[str] = frozenset()
         self._last_auto_reset_attempt: dict[str, float] = {}
         self._last_auto_reset_by_account: dict[str, float] = {}
         self._refresh_in_progress = False
@@ -215,8 +216,17 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Claude Code or Codex CLI before using Claude Switcher.",
             )
 
+    def _reset_eligible_emails(self) -> frozenset[str]:
+        """Codex accounts that can apply a rate-limit reset now, per cached usage."""
+        cache = getattr(self, "_usage_state_cache", {}) or {}
+        return frozenset(
+            email for (provider, email), state in cache.items()
+            if provider == "codex" and state is not None and state.reset_applicable > 0
+        )
+
     def _rebuild_menu(self):
         """Rebuild the menu from current account state."""
+        self._last_reset_eligible = self._reset_eligible_emails()
         accounts = load_accounts(self.config_path)
         self.menu.clear()
         self._usage_items = {}
@@ -352,7 +362,7 @@ class ClaudeSwitcherApp(rumps.App):
         try:
             code = consume_reset_credit(email, self.config_path)
             return {"code": code, "email": email, "credits": credits}
-        except RuntimeError as exc:
+        except Exception as exc:  # noqa: BLE001 - a dead thread would hide the failure
             return {"code": "error", "email": email, "message": str(exc)}
 
     def _notify_reset_result(self, result: dict, automatic: bool = False):
@@ -538,8 +548,13 @@ class ClaudeSwitcherApp(rumps.App):
                             if state is None or not state.available:
                                 self._usage_cache[account_key(account)] = "Checking…"
 
-                    # Reset eligibility can change on every usage fetch.
-                    self._rebuild_menu()
+                    # Rebuild only when the menu's structure changed: a switch, or
+                    # the set of Codex accounts that can apply a reset. Rebuilding on
+                    # every 5-minute tick would flicker an open menu and re-run the
+                    # per-account keychain reads on the main thread.
+                    last_eligible = getattr(self, "_last_reset_eligible", frozenset())
+                    if switched or self._reset_eligible_emails() != last_eligible:
+                        self._rebuild_menu()
                     self._update_usage_labels()
                     for result in auto_switch_results:
                         self._notify_auto_switch_result(result)

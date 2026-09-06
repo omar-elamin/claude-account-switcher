@@ -686,3 +686,35 @@ def test_consume_response_read_failure_retries_and_reports_status(reset_transpor
         codex_usage_mod.consume_reset_credit(t.account.email, t.config)
     assert t.post.call_count == 2
     assert t.post.call_args_list[0].args[0].data == t.post.call_args_list[1].args[0].data
+
+
+class TestConsumeResetPrecheckMessages:
+    """A missing usage fetch or an expired session must not read as 'no credit'."""
+
+    def _run(self, usage, monkeypatch):
+        import claude_switcher.codex_usage as cu
+        from types import SimpleNamespace
+        monkeypatch.setattr(cu, "get_active_account", lambda *a, **k: SimpleNamespace(email="x@test.com"))
+        monkeypatch.setattr(cu, "fetch_active_codex_usage", lambda *a, **k: usage)
+        posts = []
+        monkeypatch.setattr(cu, "urlopen", lambda *a, **k: posts.append(a) or (_ for _ in ()).throw(AssertionError("must not POST")))
+        return cu, posts
+
+    def test_usage_unavailable_raises_not_no_credit(self, monkeypatch):
+        import pytest
+        cu, posts = self._run(None, monkeypatch)
+        with pytest.raises(RuntimeError, match="Usage unavailable"):
+            cu.consume_reset_credit("x@test.com")
+        assert posts == []
+
+    def test_login_required_raises_not_no_credit(self, monkeypatch):
+        import pytest
+        cu, posts = self._run({"error": {"code": "login_required"}}, monkeypatch)
+        with pytest.raises(RuntimeError, match="Login required"):
+            cu.consume_reset_credit("x@test.com")
+        assert posts == []
+
+    def test_zero_applicable_still_no_credit_without_post(self, monkeypatch):
+        cu, posts = self._run({"rate_limit_reset_credits": {"available_count": 3, "applicable_available_count": 0}}, monkeypatch)
+        assert cu.consume_reset_credit("x@test.com") == "no_credit"
+        assert posts == []

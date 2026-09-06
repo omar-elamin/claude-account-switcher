@@ -204,6 +204,13 @@ def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH) -> str:
         fetch_active_codex_usage(config_path)
         if is_active else fetch_codex_usage_for_account(email, config_path)
     )
+    if not usage:
+        logger.info("Codex reset email=%s key=%s outcome=usage_unavailable", email, key)
+        raise RuntimeError(f"Usage unavailable for {email}. Cannot confirm a reset can be applied.")
+    error = usage.get("error")
+    if isinstance(error, dict) and error.get("code") == "login_required":
+        logger.info("Codex reset email=%s key=%s outcome=login_required", email, key)
+        raise RuntimeError(f"Login required for {email}. Add the account again first.")
     if _reset_counts(usage)[1] <= 0:
         logger.info("Codex reset email=%s key=%s outcome=no_credit", email, key)
         return "no_credit"

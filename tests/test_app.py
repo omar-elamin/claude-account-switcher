@@ -713,3 +713,31 @@ def test_refresh_runs_auto_reset_after_switch_and_refreshes_on_main(app_module, 
         assert app_module.rumps.notification.call_args.kwargs["message"] == "active: windows reset (2 left)"
     app._fetch_all_usage.assert_called_once()
     app._rebuild_menu.assert_called_once()
+
+
+class TestResetMenuRebuildPolicy:
+    """The menu is rebuilt only when its structure changes, not on every refresh."""
+
+    def _app(self, app_module):
+        app = app_module.ClaudeSwitcherApp.__new__(app_module.ClaudeSwitcherApp)
+        app._usage_state_cache = {}
+        app._last_reset_eligible = frozenset()
+        return app
+
+    def test_eligible_set_reads_only_codex_applicable(self, app_module):
+        from claude_switcher.usage_state import UsageState
+        app = self._app(app_module)
+        app._usage_state_cache = {
+            ("codex", "a@t"): UsageState(True, "x", reset_credits=3, reset_applicable=2),
+            ("codex", "b@t"): UsageState(True, "x", reset_credits=3, reset_applicable=0),
+            ("claude", "c@t"): UsageState(True, "x", reset_credits=9, reset_applicable=9),
+            ("codex", "d@t"): None,
+        }
+        assert app._reset_eligible_emails() == frozenset({"a@t"})
+
+    def test_consume_wrapper_reports_any_exception(self, app_module, monkeypatch):
+        app = self._app(app_module)
+        app.config_path = "unused"
+        monkeypatch.setattr(app_module, "consume_reset_credit", lambda *a, **k: (_ for _ in ()).throw(OSError("keychain down")))
+        result = app._consume_reset("a@t", 2)
+        assert result["code"] == "error" and "keychain down" in result["message"]
