@@ -107,6 +107,7 @@ class ClaudeSwitcherApp(rumps.App):
         self._quick_retry_timer: threading.Timer | None = None
         self._refresh_requested = False   # a Refresh click landed mid-flight; honour it after
         self._manual_refresh = False      # current refresh is user-initiated -> notify when done
+        self._signing_in_since: dict[str, float] = {}  # provider -> time.time() Add was clicked
         self._first_launch()
         self._rebuild_menu()
         self._fetch_all_usage()
@@ -176,7 +177,11 @@ class ClaudeSwitcherApp(rumps.App):
         self._add_auto_switch_menu()
         self.menu.add(rumps.MenuItem("\u271A  Add Claude account...", callback=self._on_add_claude_account))
         self.menu.add(rumps.MenuItem("\u271A  Add Codex account...", callback=self._on_add_codex_account))
-        self.menu.add(rumps.MenuItem("\u2715  Cancel sign-in", callback=self._on_cancel_signin))
+        for provider, cb in (("claude", self._on_cancel_claude_signin), ("codex", self._on_cancel_codex_signin)):
+            if self._signing_in(provider):
+                self.menu.add(rumps.MenuItem(
+                    f"\u2715  Cancel {PROVIDER_LABELS[provider]} sign-in", callback=cb
+                ))
         self.menu.add(rumps.MenuItem("\u21BB  Refresh usage", callback=self._on_refresh_usage))
 
         if accounts:
@@ -302,6 +307,21 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Claude Code before adding an account.",
             )
             return
+        if self._signing_in("claude"):
+            rumps.notification(
+                title="Claude Switcher",
+                subtitle="Claude sign-in already in progress",
+                message="Finish it in the browser, or use Cancel Claude Code sign-in.",
+            )
+            return
+
+        self._signing_in_since["claude"] = time.time()
+        self._rebuild_menu()          # shows "Cancel Claude Code sign-in" immediately
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle="Opening Claude login…",
+            message="Sign in in the browser window that appears, then come back here.",
+        )
 
         def _add():
             try:
@@ -338,6 +358,16 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Codex CLI before adding an account.",
             )
             return
+        if self._signing_in("codex"):
+            rumps.notification(
+                title="Claude Switcher",
+                subtitle="Codex sign-in already in progress",
+                message="Finish it in the Terminal window, or use Cancel Codex CLI sign-in.",
+            )
+            return
+
+        self._signing_in_since["codex"] = time.time()
+        self._rebuild_menu()          # shows "Cancel Codex CLI sign-in" immediately
 
         # Immediate feedback: the menu closes on click, and the login opens in a
         # separate Terminal window, so without this the click looks like a no-op.
@@ -571,38 +601,47 @@ class ClaudeSwitcherApp(rumps.App):
             usage_text = self._usage_cache.get(key, "Usage unavailable")
             item.title = f"       \u2502  {usage_text}"
 
-    def _on_cancel_signin(self, _):
-        """Abort whichever sign-in is in progress and restore the previous login.
+    _SIGNIN_GRACE_SECONDS = 3.0
 
-        Each provider's add flow treats a cancelled login as its normal
-        cancelled path, so it restores the snapshot and releases the add-lease.
+    def _signing_in(self, provider: str) -> bool:
+        """True while a sign-in for this provider is in progress.
+
+        The real truth is the provider's add-lease. It is taken on a background
+        thread a moment after Add is clicked, so for a short grace after the
+        click we also treat the provider as signing in — that lets the Cancel
+        item appear instantly and lets a double-click be refused, without
+        racing the thread. Once the lease is released the grace has long
+        expired, so the finish rebuild hides the item.
         """
-        from claude_switcher.codex_core import cancel_codex_login
-        from claude_switcher.core import cancel_login as cancel_claude_login
+        if _add_lease_held(provider):
+            return True
+        since = self._signing_in_since.get(provider)
+        return since is not None and (time.time() - since) < self._SIGNIN_GRACE_SECONDS
 
-        cancelled = []
-        if _add_lease_held("claude"):
-            cancel_claude_login()
-            cancelled.append("Claude")
-        if _add_lease_held("codex"):
-            cancel_codex_login()
-            cancelled.append("Codex")
-
-        if not cancelled:
+    def _cancel_signin(self, provider: str, cancel):
+        if not _add_lease_held(provider):
             rumps.notification(
                 title="Claude Switcher",
                 subtitle="Nothing to cancel",
-                message="No sign-in is in progress.",
+                message=f"No {PROVIDER_LABELS[provider]} sign-in is in progress.",
             )
             return
+        cancel()
         # Say "cancelling", not "cancelled": if the login completed in the same
-        # instant, the add flow's own outcome notification ("Signed in…" or
-        # "Cancelled") is the truth, and it follows this one.
+        # instant, the add flow's own outcome notification is the truth.
         rumps.notification(
             title="Claude Switcher",
-            subtitle="Cancelling sign-in…",
-            message=f"Stopping the {' and '.join(cancelled)} sign-in. The result will follow.",
+            subtitle=f"Cancelling {PROVIDER_LABELS[provider]} sign-in…",
+            message="Stopping the sign-in. The result will follow.",
         )
+
+    def _on_cancel_claude_signin(self, _):
+        from claude_switcher.core import cancel_login
+        self._cancel_signin("claude", cancel_login)
+
+    def _on_cancel_codex_signin(self, _):
+        from claude_switcher.codex_core import cancel_codex_login
+        self._cancel_signin("codex", cancel_codex_login)
 
     def _active_usage_summary(self) -> str:
         """One-line usage for each provider's active account, for notifications."""
