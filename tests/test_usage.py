@@ -116,3 +116,21 @@ class TestFetchUsageForAccount:
     def test_returns_none_when_no_creds(self, mock_read):
         mock_read.return_value = None
         assert fetch_usage_for_account("test@test.com") is None
+
+
+class TestNullResetsAt:
+    """Regression: the API returns resets_at: null for an account with no
+    scheduled reset. That crashed the Claude parser (None.replace) and the
+    whole row showed 'Usage unavailable' instead of the percentage."""
+
+    def test_null_resets_at_does_not_crash_and_keeps_percent(self):
+        u = {"five_hour": {"utilization": 0.0, "resets_at": None},
+             "seven_day": {"utilization": 3.0, "resets_at": None}}
+        st = claude_usage_state(u)
+        assert st.available is True
+        assert "0%" in st.display and "3%" in st.display
+        assert "?" not in st.display          # no bogus countdown either
+
+    def test_format_reset_delta_tolerates_non_string(self):
+        assert _format_reset_delta(None) == "?"
+        assert _format_reset_delta(12345) == "?"

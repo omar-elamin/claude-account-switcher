@@ -85,7 +85,7 @@ def _format_reset_delta(resets_at: str) -> str:
             return f"{hours}h {minutes}m"
         else:
             return f"{minutes}m"
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return "?"
 
 
@@ -107,7 +107,10 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         except (TypeError, ValueError):
             continue
 
-        reset = _format_reset_delta(window["resets_at"]) if "resets_at" in window else None
+        # The API returns resets_at: null when nothing is scheduled (e.g. a freshly
+        # logged-in account with no usage). Key presence is not enough; check the value.
+        resets_at = window.get("resets_at")
+        reset = _format_reset_delta(resets_at) if resets_at else None
         reset_suffix = f" ({reset})" if reset else ""
         parts.append(f"{label} {percent:.0f}%{reset_suffix}")
         windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
