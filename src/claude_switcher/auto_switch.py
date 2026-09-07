@@ -3,7 +3,7 @@
 from collections.abc import Callable
 
 from claude_switcher.config import AccountInfo
-from claude_switcher.usage_state import UsageState
+from claude_switcher.usage_state import UsageState, UsageWindow
 
 AccountKey = tuple[str, str]
 
@@ -74,3 +74,46 @@ def choose_auto_switch_target(
     if unknown_usage:
         return unknown_usage[0]
     return None
+
+
+def target_window(state: UsageState | None, provider: str) -> UsageWindow | None:
+    """Return Codex's first window or Claude's Fable window, falling back to 7d."""
+    if state is None or not state.available or not state.windows:
+        return None
+    if provider == "codex":
+        return state.windows[0]
+    if provider == "claude":
+        for label in ("Fable", "7d"):
+            for window in state.windows:
+                if window.label == label:
+                    return window
+    return None
+
+
+def fefo_key(state: UsageState | None, provider: str) -> tuple[float, float]:
+    """Sort by earliest target reset, then most quota left; missing targets last."""
+    target = target_window(state, provider)
+    if target is None:
+        return (float("inf"), float("inf"))
+    return (target.resets_at if target.resets_at is not None else float("inf"),
+            -(100 - target.percent))
+
+
+def choose_fefo_target(
+    provider: str,
+    accounts: list[AccountInfo],
+    usage_by_account: dict[AccountKey, UsageState],
+    has_credentials: Callable[[AccountInfo], bool],
+    threshold: float = 100.0,
+) -> AccountInfo | None:
+    """Choose a usable account by reset time, including active; ties keep list order."""
+    candidates = []
+    for account in accounts:
+        if account.provider != provider or not has_credentials(account):
+            continue
+        state = usage_by_account.get(account_key(account))
+        if state is not None and state.available and not state.is_exhausted(threshold):
+            candidates.append(account)
+    return min(candidates,
+               key=lambda account: fefo_key(usage_by_account[account_key(account)], provider),
+               default=None)

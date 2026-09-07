@@ -360,3 +360,39 @@ def test_old_config_load_does_not_change_file(tmp_path):
     assert settings.auto_switch["codex"] is True
     assert settings.auto_switch_threshold == 95
     assert path.read_text() == original
+
+
+def test_proactive_switch_defaults_and_old_settings(tmp_path):
+    path = tmp_path / "accounts.json"
+    assert AppSettings().proactive_switch is True
+    assert load_settings(path).proactive_switch is True
+    path.write_text('{"settings": {"auto_switch": {"claude": true}}, "accounts": []}')
+    assert load_settings(path).proactive_switch is True
+    assert load_settings(path).auto_switch["claude"] is True
+
+
+@pytest.mark.parametrize("raw", [None, [], "invalid"])
+def test_proactive_switch_invalid_settings_default_true(tmp_path, raw):
+    path = tmp_path / "accounts.json"
+    path.write_text(json.dumps({"settings": raw}))
+    assert load_settings(path).proactive_switch is True
+
+
+def test_proactive_switch_false_and_setter_roundtrip(tmp_path):
+    from claude_switcher.config import set_proactive_switch_enabled
+    path = tmp_path / "accounts.json"
+    path.write_text('{"settings": {"proactive_switch": false}, "accounts": []}')
+    assert load_settings(path).proactive_switch is False
+    for enabled in (True, False):
+        set_proactive_switch_enabled(enabled, path)
+        assert load_settings(path).proactive_switch is enabled
+        assert json.loads(path.read_text())["settings"]["proactive_switch"] is enabled
+
+
+def test_proactive_switch_string_false_in_hand_edited_config_reads_false(tmp_path):
+    from claude_switcher.config import _settings_from_dict
+    assert _settings_from_dict({"proactive_switch": "false"}).proactive_switch is False
+    assert _settings_from_dict({"proactive_switch": "0"}).proactive_switch is False
+    assert _settings_from_dict({"proactive_switch": "true"}).proactive_switch is True
+    assert _settings_from_dict({"proactive_switch": False}).proactive_switch is False
+    assert _settings_from_dict({}).proactive_switch is True

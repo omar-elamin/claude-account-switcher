@@ -31,6 +31,7 @@ class AppSettings:
     )
     auto_switch_threshold: float = 100.0
     auto_reset: dict[str, bool] = field(default_factory=lambda: {"codex": False})
+    proactive_switch: bool = True
 
 
 def _default_settings_dict() -> dict:
@@ -142,7 +143,15 @@ def _settings_from_dict(data: dict | None) -> AppSettings:
             if isinstance(provider, str):
                 auto_reset[provider] = bool(enabled)
 
-    return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold, auto_reset=auto_reset)
+    proactive_switch = data.get("proactive_switch", defaults.proactive_switch)
+    if not isinstance(proactive_switch, (bool, int, float, str)):
+        proactive_switch = defaults.proactive_switch
+    if isinstance(proactive_switch, str):
+        # A hand-edited config may hold "false"/"0"; bool("false") is True.
+        proactive_switch = proactive_switch.strip().lower() not in ("false", "0", "no", "off", "")
+
+    return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold,
+                       auto_reset=auto_reset, proactive_switch=bool(proactive_switch))
 
 
 def load_accounts(path: Path = DEFAULT_CONFIG_PATH) -> list[AccountInfo]:
@@ -260,4 +269,14 @@ def set_auto_reset_enabled(
     with _LOCK:
         settings = load_settings(path)
         settings.auto_reset[provider] = bool(enabled)
+        save_settings(settings, path)
+
+
+def set_proactive_switch_enabled(
+    enabled: bool, path: Path = DEFAULT_CONFIG_PATH
+) -> None:
+    """Enable or disable switching before the active account is exhausted."""
+    with _LOCK:
+        settings = load_settings(path)
+        settings.proactive_switch = bool(enabled)
         save_settings(settings, path)

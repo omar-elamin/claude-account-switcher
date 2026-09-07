@@ -42,6 +42,7 @@ def _app_shell(app_mod, tmp_path):
     app = object.__new__(app_mod.ClaudeSwitcherApp)
     app.config_path = tmp_path / "accounts.json"
     app._switch_in_progress = set()
+    app._manual_pin = {}
     app._rebuild_menu = MagicMock()
     app._fetch_all_usage = MagicMock()
     return app
@@ -425,12 +426,15 @@ def test_provider_switch_dispatch_and_result(app_module, tmp_path, provider, swi
          patch.object(app_module, "get_active_account", return_value=active), \
          patch.object(app_module, "load_settings", return_value=settings), \
          patch.object(app_module, "load_accounts", return_value=[active, target]), \
+         patch.object(app, "_has_credentials", return_value=True), \
          patch.object(app_module, "should_auto_switch", return_value=True), \
          patch.object(app_module, "choose_auto_switch_target", return_value=target), \
          patch.object(app_module.threading, "Thread", ImmediateThread), \
          patch.object(app_module, "_on_main_thread", side_effect=lambda fn: fn()):
         if automatic:
             result = app._attempt_auto_switch(provider)
+            if not fails:
+                assert result.pop("reason") == "exhausted"
             assert result == ({"status": "error", "provider": provider, "email": active.email,
                                "message": "switch failed"} if fails else
                               {"status": "switched", "provider": provider, "email": target.email})
@@ -741,3 +745,127 @@ class TestResetMenuRebuildPolicy:
         monkeypatch.setattr(app_module, "consume_reset_credit", lambda *a, **k: (_ for _ in ()).throw(OSError("keychain down")))
         result = app._consume_reset("a@t", 2)
         assert result["code"] == "error" and "keychain down" in result["message"]
+
+
+@pytest.fixture(params=["claude", "codex"])
+def fefo_app(app_module, tmp_path, request, monkeypatch):
+    from claude_switcher.config import AccountInfo, save_accounts, set_auto_switch_enabled
+    from claude_switcher.usage_state import UsageState, UsageWindow
+    provider = request.param
+    app = _reset_app(app_module, tmp_path)
+    accounts = [AccountInfo(n, "pro", "", n == "active", n, provider=provider)
+                for n in ("active", "later", "earliest", "unknown")]
+    save_accounts(accounts, app.config_path)
+    set_auto_switch_enabled(provider, True, app.config_path)
+    app._usage_state_cache = {
+        (provider, a.email): UsageState(True, "", (UsageWindow("7d", 20, resets_at=reset),))
+        for a, reset in zip(accounts, (300, 200, 100))
+    }
+    app._has_credentials = lambda a: True
+    switch = MagicMock()
+    monkeypatch.setitem(app_module.PROVIDERS[provider], "switch", switch)
+    monkeypatch.setattr(app_module.time, "time", lambda: 1000)
+    return app, provider, switch
+
+
+def test_proactive_switch_chooses_earliest(fefo_app):
+    app, provider, switch = fefo_app
+    assert app._attempt_auto_switch(provider) == {
+        "status": "switched", "reason": "proactive", "provider": provider, "email": "earliest"}
+    switch.assert_called_once_with("earliest", app.config_path)
+
+
+@pytest.mark.parametrize("guard", ["off", "pin", "active-best", "cooldown", "disabled", "missing", "unavailable", "no-best"])
+def test_proactive_switch_guards(fefo_app, guard):
+    from claude_switcher.config import set_proactive_switch_enabled, set_auto_switch_enabled
+    from claude_switcher.usage_state import UsageState, UsageWindow
+    app, provider, switch = fefo_app
+    if guard == "off":
+        set_proactive_switch_enabled(False, app.config_path)
+    elif guard == "pin":
+        app._manual_pin[provider] = "active"
+    elif guard == "active-best":
+        app._usage_state_cache[(provider, "active")] = UsageState(True, "", (UsageWindow("7d", 20, resets_at=50),))
+    elif guard == "cooldown":
+        app._last_auto_switch_attempt[provider] = 950
+    elif guard == "disabled":
+        set_auto_switch_enabled(provider, False, app.config_path)
+    elif guard == "missing":
+        del app._usage_state_cache[(provider, "active")]
+    elif guard == "unavailable":
+        app._usage_state_cache[(provider, "active")] = UsageState(False, "")
+    else:
+        app._has_credentials = lambda a: False
+    assert app._attempt_auto_switch(provider) is None
+    switch.assert_not_called()
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_exhausted_switch_uses_best_or_unknown_fallback(fefo_app, fallback):
+    from claude_switcher.config import set_proactive_switch_enabled
+    from claude_switcher.usage_state import UsageState, UsageWindow
+    app, provider, switch = fefo_app
+    set_proactive_switch_enabled(False, app.config_path)
+    app._manual_pin[provider] = "active"
+    full = UsageState(True, "", (UsageWindow("7d", 100, resets_at=50),))
+    app._usage_state_cache[(provider, "active")] = full
+    if fallback:
+        app._usage_state_cache = {key: full for key in app._usage_state_cache}
+    target = "unknown" if fallback else "earliest"
+    assert app._attempt_auto_switch(provider) == {
+        "status": "switched", "reason": "exhausted", "provider": provider, "email": target}
+    switch.assert_called_once_with(target, app.config_path)
+    assert app._attempt_auto_switch(provider) is None
+    assert switch.call_count == 1
+
+
+def test_old_manual_pin_does_not_block_proactive_switch(fefo_app):
+    app, provider, switch = fefo_app
+    app._manual_pin[provider] = "later"
+    assert app._attempt_auto_switch(provider)["reason"] == "proactive"
+    switch.assert_called_once_with("earliest", app.config_path)
+
+
+def test_manual_switch_sets_pin_before_starting(fefo_app, app_module):
+    app, provider, switch = fefo_app
+    def check_pin():
+        assert app._manual_pin[provider] == "earliest"
+
+    with patch.object(app_module.threading, "Thread") as thread:
+        thread.return_value.start.side_effect = check_pin
+        app._switch_account(provider, "earliest")
+    assert app._manual_pin == {provider: "earliest"}
+    thread.return_value.start.assert_called_once_with()
+
+
+@pytest.mark.parametrize("initial", [True, False])
+def test_proactive_menu_toggle_persists(app_module, tmp_path, initial):
+    from claude_switcher.config import load_settings, save_settings, AppSettings
+    app = _reset_app(app_module, tmp_path)
+    save_settings(AppSettings(proactive_switch=initial), app.config_path)
+    with patch.object(app_module.rumps, "MenuItem", ResetMenuItem):
+        app._add_auto_switch_menu()
+    menu = app.menu.add.call_args.args[0]
+    assert [i.title for i in menu.children[:2]] == ["Claude Code", "Codex CLI"]
+    assert menu.children[2] is app_module.rumps.separator
+    item = menu.children[3]
+    assert item.title == "Use expiring quota first"
+    assert item.state == int(initial)
+    item.callback(item)
+    assert load_settings(app.config_path).proactive_switch is not initial
+    assert item.state == int(not initial)
+    app_module.rumps.notification.assert_called_once_with(
+        title="Claude Switcher",
+        subtitle="Proactive switching disabled" if initial else "Proactive switching enabled",
+        message="Only switch when the active account runs out." if initial else
+                "Switch to the account whose quota expires soonest, before the active one runs out.")
+
+
+@pytest.mark.parametrize("reason", ["proactive", "exhausted"])
+def test_auto_switch_notification_reason(app_module, tmp_path, reason):
+    app = _reset_app(app_module, tmp_path)
+    app._notify_auto_switch_result({"status": "switched", "reason": reason, "provider": "claude", "email": "target"})
+    app_module.rumps.notification.assert_called_once_with(
+        title="Claude Switcher",
+        subtitle="Auto-switched Claude Code early" if reason == "proactive" else "Auto-switched Claude Code",
+        message="target: its quota expires sooner" if reason == "proactive" else "target")

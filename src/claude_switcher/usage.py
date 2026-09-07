@@ -168,6 +168,17 @@ def fetch_active_usage(config_path=None) -> dict | None:
     return fetch_usage(keychain.CLAUDE_SERVICE)
 
 
+def _parse_reset_timestamp(resets_at: str | None) -> float | None:
+    """Convert an ISO reset time to epoch seconds, or None if invalid."""
+    try:
+        reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        if reset_dt.tzinfo is None:
+            return None
+        return reset_dt.timestamp()
+    except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+        return None
+
+
 def _format_reset_delta(resets_at: str) -> str:
     """Convert an ISO 8601 resets_at timestamp to a human-readable relative time."""
     try:
@@ -212,7 +223,8 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         reset = _format_reset_delta(resets_at) if resets_at else None
         reset_suffix = f" ({reset})" if reset else ""
         parts.append(f"{label} {percent:.0f}%{reset_suffix}")
-        windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
+        windows.append(UsageWindow(label=label, percent=percent, resets_in=reset,
+                                   resets_at=_parse_reset_timestamp(resets_at)))
 
     # Model-scoped weekly limits (e.g. "Fable") arrive in the `limits` array,
     # self-described by scope.model.display_name, with `percent` rather than
@@ -231,7 +243,8 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         reset = _format_reset_delta(resets_at) if resets_at else None
         reset_suffix = f" ({reset})" if reset else ""
         parts.append(f"{model} {percent:.0f}%{reset_suffix}")
-        windows.append(UsageWindow(label=model, percent=percent, resets_in=reset, scoped=True))
+        windows.append(UsageWindow(label=model, percent=percent, resets_in=reset, scoped=True,
+                                   resets_at=_parse_reset_timestamp(resets_at)))
 
     if not parts:
         return UsageState(available=False, display="Usage unavailable")

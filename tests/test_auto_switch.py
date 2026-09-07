@@ -112,3 +112,54 @@ def test_reset_target_prefers_active_then_first_exhausted_codex():
     states[account_key(later)] = replace(credit, reset_applicable=0)
     assert choose_auto_reset_target(accounts, active.email, states) is None
     assert choose_auto_reset_target(accounts, active.email, {}) is None
+
+
+def test_target_window_uses_provider_target():
+    from claude_switcher.auto_switch import target_window, fefo_key
+    five = UsageWindow("5h", 10)
+    seven = UsageWindow("7d", 20)
+    fable = UsageWindow("Fable", 30, scoped=True)
+    state = UsageState(True, "", (five, seven, fable))
+    assert target_window(state, "claude") is fable
+    assert target_window(UsageState(True, "", (five, seven)), "claude") is seven
+    assert target_window(state, "codex") is five
+    for empty in (None, UsageState(False, "", (seven,)), UsageState(True, "")):
+        assert target_window(empty, "claude") is None
+        assert fefo_key(empty, "claude") == (float("inf"), float("inf"))
+    assert target_window(UsageState(True, "", (five,)), "claude") is None
+
+
+def _weekly(percent, reset):
+    return UsageState(True, "", (UsageWindow("7d", percent, resets_at=reset),))
+
+
+def test_fefo_earliest_reset_then_most_left_then_list_order():
+    from claude_switcher.auto_switch import choose_fefo_target, fefo_key
+    accounts = [_account(name) for name in ("late", "early", "more-left", "tie", "unknown-reset")]
+    states = dict(zip(map(account_key, accounts), [
+        _weekly(0, 200), _weekly(70, 100), _weekly(20, 100),
+        _weekly(20, 100), _weekly(0, None),
+    ]))
+    assert fefo_key(states[account_key(accounts[2])], "claude") == (100, -80)
+    assert fefo_key(states[account_key(accounts[4])], "claude") == (float("inf"), -100)
+    assert choose_fefo_target("claude", accounts, states, lambda a: True) == accounts[2]
+    assert choose_fefo_target("claude", accounts[:2], states, lambda a: True) == accounts[1]
+    assert choose_fefo_target("claude", [accounts[4], accounts[0]], states, lambda a: True) == accounts[0]
+
+
+def test_fefo_filters_unusable_accounts_and_includes_active():
+    from claude_switcher.auto_switch import choose_fefo_target
+    active = _account("active", active=True)
+    exhausted, unavailable, no_creds, unknown = [_account(n) for n in ("full", "unavailable", "no-creds", "unknown")]
+    other = _account("other", provider="codex")
+    accounts = [exhausted, unavailable, no_creds, unknown, other, active]
+    states = {account_key(a): _weekly(0, 10) for a in accounts}
+    states[account_key(exhausted)] = UsageState(True, "", (
+        UsageWindow("7d", 0, resets_at=10), UsageWindow("Fable", 95, scoped=True)))
+    states[account_key(unavailable)] = UsageState(False, "")
+    del states[account_key(unknown)]
+    states[account_key(active)] = _weekly(20, 200)
+    credentials = lambda a: a != no_creds
+    assert choose_fefo_target("claude", accounts, states, credentials, threshold=95) == active
+    assert choose_fefo_target("claude", accounts[:-1], states, credentials, threshold=95) is None
+    assert choose_fefo_target("claude", [], {}, credentials) is None

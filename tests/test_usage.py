@@ -195,11 +195,11 @@ class TestModelScopedWeeklyLimit:
         labels = [w.label for w in st.windows]
         assert labels == ["5h", "7d", "Fable"]
 
-    def test_scoped_window_does_not_trigger_exhaustion(self):
-        # Fable at 100% but the account's own windows have room: not exhausted.
+    def test_scoped_window_triggers_exhaustion(self):
+        # Fable is the target model, so its exhausted window makes the account unusable.
         st = claude_usage_state(self._usage(fable_pct=100))
-        assert st.is_exhausted(100.0) is False
-        assert st.max_percent == 40.0                     # scoped window excluded
+        assert st.is_exhausted(100.0) is True
+        assert st.max_percent == 100.0
 
     def test_account_window_still_triggers_exhaustion(self):
         st = claude_usage_state(self._usage(five=100.0))
@@ -522,3 +522,19 @@ class TestThrottledPollRepeatsRejection:
         assert first == {"error": {"code": "login_required"}}
         assert second == {"error": {"code": "login_required"}}
         assert u.claude_usage_state(second).display == "Login required"
+
+
+@pytest.mark.parametrize("reset, expected", [
+    ("2026-03-19T12:00:00Z", 1773921600.0),
+    ("2026-03-19T15:00:00+03:00", 1773921600.0),
+    (None, None), ("invalid", None), (123, None),
+])
+def test_every_claude_window_has_reset_timestamp(reset, expected):
+    state = claude_usage_state({
+        "five_hour": {"utilization": 10, "resets_at": reset},
+        "seven_day": {"utilization": 20, "resets_at": reset},
+        "limits": [{"kind": "weekly_scoped", "percent": 30, "resets_at": reset,
+                    "scope": {"model": {"display_name": "Fable"}}}],
+    })
+    assert len(state.windows) == 3
+    assert [w.resets_at for w in state.windows] == [expected] * 3
