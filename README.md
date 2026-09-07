@@ -67,7 +67,7 @@ A Codex row looks like this:
 
 There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window. When an account holds banked resets, the row ends with `· N resets` (`· 1 reset` for one). See [Rate-limit resets](#rate-limit-resets).
 
-Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
+Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. If the CLI's live session belongs to a different account than the one marked active (for example after a sign-in done outside the app), the active row shows that account's own saved-session usage rather than the live token's, and the log notes the drift. Click the account to re-sync the live session. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
 
 Usage refreshes at launch, every 5 minutes, after adding or switching an account, and when you click `↻ Refresh usage`. If any row is unavailable, the app retries quickly up to 3 times, 6 seconds apart.
 
@@ -212,7 +212,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 362 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 366 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
