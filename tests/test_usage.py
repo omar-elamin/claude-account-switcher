@@ -226,7 +226,7 @@ class TestClaudeActiveRowIdentityDrift:
         monkeypatch.setattr(config, "get_active_account", lambda *a, **k: SimpleNamespace(email=active_email))
         monkeypatch.setattr(u, "fetch_usage", lambda service: {"service": service})
         calls = []
-        monkeypatch.setattr(u, "fetch_usage_for_account", lambda e: calls.append(e) or {"saved": e})
+        monkeypatch.setattr(u, "fetch_usage_for_account", lambda e, config_path=None: calls.append(e) or {"saved": e})
         return u, calls
 
     def test_drift_uses_active_accounts_saved_session(self, monkeypatch):
@@ -262,3 +262,263 @@ class TestExpiredSavedToken:
     def test_other_http_error_is_plain_unavailable(self, monkeypatch):
         u, data = self._fetch(monkeypatch, -3600, http_code=500)
         assert data is None and u.claude_usage_state(data).display == "Usage unavailable"
+
+
+@pytest.fixture
+def saved_refresh(monkeypatch, tmp_path):
+    """Real fetch/refresh functions, with in-memory Keychain and HTTP boundaries."""
+    import io
+    import urllib.error
+    from types import SimpleNamespace
+    from claude_switcher import core, usage, config
+
+    now = 1_800_000_000
+    email = "saved@example.test"
+    service = f"claude-switcher:{email}"
+    old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh",
+                                      "expiresAt": (now - 3600) * 1000}})
+    live = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh"}})
+    state = SimpleNamespace(email=email, service=service, old=old, now=now,
+                            store={service: old, usage.keychain.CLAUDE_SERVICE: live},
+                            events=[], post_error=None, write_error=None,
+                            path=tmp_path / "accounts.json", result={"five_hour": {"utilization": 42}})
+    config.save_accounts([config.AccountInfo(email, "max", "", False, "saved-attribute")], state.path)
+    monkeypatch.setattr(core, "_add_in_progress", False)
+    monkeypatch.setattr(usage, "_last_refresh_attempt", {})
+    monkeypatch.setattr(usage.time, "time", lambda: state.now)
+
+    def read(service):
+        state.events.append(("read", service))
+        return state.store.get(service)
+
+    def write(service, account, blob):
+        assert core._CLAUDE_LOCK.locked()
+        assert service == state.service  # Never write the live slot.
+        state.events.append(("write", service, account))
+        if state.write_error:
+            raise state.write_error
+        state.store[service] = blob
+
+    def urlopen(req, timeout):
+        method = req.get_method()
+        state.events.append((method, req.get_header("Authorization")))
+        if method == "POST":
+            assert core._CLAUDE_LOCK.locked()
+            assert timeout == 10
+            if state.post_error:
+                raise state.post_error
+            data = {"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 28800}
+        elif req.get_header("Authorization") == "Bearer new-access":
+            assert json.loads(state.store[state.service])["claudeAiOauth"]["accessToken"] == "new-access"
+            data = state.result
+        else:
+            raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, io.BytesIO(b""))
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.status = 200
+        resp.read.return_value = json.dumps(data).encode()
+        return resp
+
+    monkeypatch.setattr(usage.keychain, "read_credentials", read)
+    monkeypatch.setattr(usage.keychain, "read_account_attribute", lambda service: "keychain-attribute")
+    monkeypatch.setattr(usage.keychain, "write_credentials", write)
+    monkeypatch.setattr(usage.urllib.request, "urlopen", urlopen)
+    state.fetch = lambda: usage.fetch_usage_for_account(email, state.path)
+    return state
+
+
+def _refresh_actions(state):
+    return [e[0] for e in state.events if e[0] != "read"]
+
+
+def test_saved_refresh_persists_before_using_new_token(saved_refresh):
+    from claude_switcher import usage
+
+    s = saved_refresh
+    live_before = dict(s.store)
+    assert usage.fetch_usage_for_account(s.email) == s.result
+    assert _refresh_actions(s) == ["GET", "POST", "write", "GET"]
+    assert ("GET", "Bearer old-access") in s.events
+    assert ("GET", "Bearer new-access") in s.events
+    assert ("write", s.service, "keychain-attribute") in s.events
+    assert json.loads(s.store[s.service])["claudeAiOauth"]["refreshToken"] == "new-refresh"
+    assert all(s.store[k] == v for k, v in live_before.items() if k != s.service)
+    s.events.clear()
+    assert s.fetch() == s.result
+    assert _refresh_actions(s) == ["GET"]  # Successful fast path never refreshes.
+
+
+@pytest.mark.parametrize("field", ["refreshToken", "accessToken"])
+@pytest.mark.parametrize("active", [True, False])
+def test_saved_refresh_blocks_shared_live_tokens(saved_refresh, field, active, caplog):
+    import logging
+    from claude_switcher import usage, config
+
+    s = saved_refresh
+    accounts = config.load_accounts(s.path)
+    accounts[0].active = active
+    config.save_accounts(accounts, s.path)
+    live = json.loads(s.store[usage.keychain.CLAUDE_SERVICE])
+    live["claudeAiOauth"][field] = json.loads(s.old)["claudeAiOauth"][field]
+    s.store[usage.keychain.CLAUDE_SERVICE] = json.dumps(live)
+    before = dict(s.store)
+    caplog.set_level(logging.INFO)
+    assert s.fetch() == {"error": {"code": "token_expired"}}
+    assert _refresh_actions(s) == ["GET"]
+    assert s.store == before
+    assert "shared with live session" in caplog.text
+
+
+def test_saved_refresh_blocks_add_in_progress(saved_refresh, monkeypatch):
+    from claude_switcher import core
+
+    monkeypatch.setattr(core, "_add_in_progress", True)
+    assert saved_refresh.fetch() == {"error": {"code": "token_expired"}}
+    assert _refresh_actions(saved_refresh) == ["GET"]
+
+
+def test_saved_refresh_blocks_changed_backup(saved_refresh, monkeypatch):
+    from claude_switcher import usage
+
+    s = saved_refresh
+    original_read = usage.keychain.read_credentials
+
+    def changed_read(service):
+        blob = original_read(service)
+        if service == s.service and ("GET", "Bearer old-access") in s.events:
+            return blob + " "  # Even a byte-only difference must block rotation.
+        return blob
+
+    monkeypatch.setattr(usage.keychain, "read_credentials", changed_read)
+    assert s.fetch() == {"error": {"code": "token_expired"}}
+    assert _refresh_actions(s) == ["GET"]
+
+
+def test_saved_refresh_throttle_expires_after_300_seconds(saved_refresh):
+    from urllib.error import URLError
+
+    s = saved_refresh
+    s.post_error = URLError("offline")
+    assert s.fetch() is None
+    s.events.clear()
+    s.now += 299
+    assert s.fetch() == {"error": {"code": "token_expired"}}
+    assert _refresh_actions(s) == ["GET"]
+    s.events.clear()
+    s.now += 1
+    s.post_error = None
+    assert s.fetch() == s.result
+    assert _refresh_actions(s) == ["GET", "POST", "write", "GET"]
+
+
+@pytest.mark.parametrize("status", [400, 401])
+def test_saved_refresh_invalid_grant_requires_login_without_write(saved_refresh, status):
+    import io
+    from urllib.error import HTTPError
+
+    s = saved_refresh
+    s.post_error = HTTPError("https://platform.claude.com/v1/oauth/token", status, "invalid_grant", {},
+                             io.BytesIO(b'{"error":"invalid_grant"}'))
+    assert s.fetch() == {"error": {"code": "login_required"}}
+    assert _refresh_actions(s) == ["GET", "POST"]
+    assert s.store[s.service] == s.old
+
+
+def test_saved_refresh_network_failure_is_unavailable_without_write(saved_refresh):
+    from urllib.error import URLError
+
+    s = saved_refresh
+    s.post_error = URLError("offline")
+    assert s.fetch() is None
+    assert _refresh_actions(s) == ["GET", "POST"]
+    assert s.store[s.service] == s.old
+
+
+def test_saved_refresh_write_failure_propagates_without_using_new_token(saved_refresh):
+    s = saved_refresh
+    s.write_error = RuntimeError("Keychain write failed")
+    with pytest.raises(RuntimeError, match="Keychain write failed"):
+        s.fetch()
+    assert _refresh_actions(s) == ["GET", "POST", "write"]
+    assert s.store[s.service] == s.old
+
+
+def test_saved_unexpired_401_does_not_refresh(saved_refresh):
+    s = saved_refresh
+    blob = json.loads(s.old)
+    blob["claudeAiOauth"]["expiresAt"] = (s.now + 3600) * 1000
+    s.store[s.service] = json.dumps(blob)
+    assert s.fetch() == {"error": {"code": "login_required"}}
+    assert _refresh_actions(s) == ["GET"]
+
+
+def test_saved_refresh_uses_existing_config_attribute_as_fallback(saved_refresh, monkeypatch):
+    from claude_switcher import usage
+
+    monkeypatch.setattr(usage.keychain, "read_account_attribute", lambda service: None)
+    assert saved_refresh.fetch() == saved_refresh.result
+    assert ("write", saved_refresh.service, "saved-attribute") in saved_refresh.events
+
+
+def test_active_drift_refreshes_saved_account_with_its_config(saved_refresh, monkeypatch):
+    from claude_switcher import core, config, usage
+
+    s = saved_refresh
+    config.set_active_account(s.email, s.path)
+    monkeypatch.setattr(core, "_read_oauth_account", lambda: {"emailAddress": "other@example.test"})
+    monkeypatch.setattr(usage.keychain, "read_account_attribute", lambda service: None)
+    assert usage.fetch_active_usage(s.path) == s.result
+    assert ("write", s.service, "saved-attribute") in s.events
+
+
+def test_overlapping_saved_fetches_rotate_once_and_preserve_saved_pair(saved_refresh, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from claude_switcher import usage
+
+    s = saved_refresh
+    both_using_old_token = Barrier(2)
+    original_urlopen = usage.urllib.request.urlopen
+
+    def overlapping_urlopen(req, timeout):
+        if req.get_method() == "GET" and req.get_header("Authorization") == "Bearer old-access":
+            both_using_old_token.wait(timeout=5)
+        return original_urlopen(req, timeout)
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", overlapping_urlopen)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(s.fetch) for _ in range(2)]
+        results = [f.result(timeout=10) for f in futures]
+    assert s.result in results
+    assert {"error": {"code": "token_expired"}} in results
+    actions = _refresh_actions(s)
+    assert actions.count("POST") == actions.count("write") == 1
+    saved = json.loads(s.store[s.service])["claudeAiOauth"]
+    assert saved["accessToken"] == "new-access" and saved["refreshToken"] == "new-refresh"
+
+
+def test_saved_refresh_never_invents_missing_account_attribute(saved_refresh, monkeypatch):
+    from claude_switcher import usage, config
+
+    s = saved_refresh
+    config.save_accounts([], s.path)
+    monkeypatch.setattr(usage.keychain, "read_account_attribute", lambda service: None)
+    with pytest.raises(RuntimeError, match="account attribute"):
+        s.fetch()
+    assert _refresh_actions(s) == ["GET", "POST"]
+    assert s.store[s.service] == s.old
+
+
+class TestThrottledPollRepeatsRejection:
+    def test_login_required_sticks_while_throttled(self, monkeypatch, saved_refresh):
+        """After a rejected refresh, a poll within 5 minutes must not flip back to 'Token expired'."""
+        import claude_switcher.usage as u
+        import claude_switcher.core as core
+        fx = saved_refresh
+        def rejected(blob): raise core.ClaudeCredentialsExpiredError("dead")
+        monkeypatch.setattr(core, "refresh_claude_credentials", rejected)
+        first = u.fetch_usage_for_account(fx.email)
+        second = u.fetch_usage_for_account(fx.email)
+        assert first == {"error": {"code": "login_required"}}
+        assert second == {"error": {"code": "login_required"}}
+        assert u.claude_usage_state(second).display == "Login required"

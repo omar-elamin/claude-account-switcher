@@ -1,9 +1,13 @@
 """Business logic for account management."""
 
 import json
+import logging
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+from http.client import IncompleteRead
 from pathlib import Path
 
 from claude_switcher import keychain
@@ -24,6 +28,80 @@ CLAUDE_STATE_FILE = Path.home() / ".claude.json"
 
 _CLAUDE_LOCK = threading.Lock()
 _add_in_progress = False
+
+logger = logging.getLogger(__name__)
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# The token endpoint rate-limits the generic "claude-code/2.1.11" agent (429 on
+# every request, verified live) and Cloudflare blocks requests with no agent.
+# It accepts the agent Claude Code itself sends.
+CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.263 (external, cli)"
+
+
+class ClaudeCredentialsExpiredError(RuntimeError):
+    """Raised when a saved Claude session needs a new sign-in."""
+
+
+def refresh_claude_credentials(creds_json: str) -> str | None:
+    """Refresh a saved Claude OAuth blob, preserving unrelated credential fields."""
+    try:
+        data = json.loads(creds_json)
+        tokens = data["claudeAiOauth"]
+        refresh_token = tokens["refreshToken"]
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise ValueError("Missing refresh token")
+    except (ValueError, TypeError, KeyError):
+        logger.info("Claude refresh outcome=invalid_credentials")
+        return None
+
+    req = urllib.request.Request(
+        CLAUDE_OAUTH_TOKEN_URL,
+        method="POST",
+        data=json.dumps({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        }).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": CLAUDE_CLI_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                logger.info("Claude refresh outcome=unexpected_status")
+                return None
+            refreshed = json.loads(resp.read())
+        access_token = refreshed["access_token"]
+        expires_in = refreshed["expires_in"]
+        new_refresh_token = refreshed.get("refresh_token", refresh_token)
+        if (not isinstance(access_token, str) or not access_token
+                or type(expires_in) is not int
+                or not isinstance(new_refresh_token, str) or not new_refresh_token
+                or ("scope" in refreshed and not isinstance(refreshed["scope"], str))):
+            raise ValueError("Invalid refresh response")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401):
+            logger.info("Claude refresh outcome=login_required")
+            raise ClaudeCredentialsExpiredError("This saved Claude session needs a new sign-in.") from None
+        logger.info("Claude refresh outcome=http_error")
+        return None
+    except (urllib.error.URLError, OSError, IncompleteRead):
+        logger.info("Claude refresh outcome=network_error")
+        return None
+    except (ValueError, TypeError, KeyError):
+        logger.info("Claude refresh outcome=invalid_response")
+        return None
+
+    tokens["accessToken"] = access_token
+    tokens["refreshToken"] = new_refresh_token
+    tokens["expiresAt"] = int(time.time() * 1000) + expires_in * 1000
+    if "scope" in refreshed:
+        tokens["scopes"] = refreshed["scope"].split()
+    logger.info("Claude refresh outcome=success")
+    return json.dumps(data, separators=(",", ":"))
 
 
 def _read_oauth_account() -> dict | None:

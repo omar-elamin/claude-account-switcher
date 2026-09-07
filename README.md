@@ -67,7 +67,7 @@ A Codex row looks like this:
 
 There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window. When an account holds banked resets, the row ends with `· N resets` (`· 1 reset` for one). See [Rate-limit resets](#rate-limit-resets).
 
-Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Claude access tokens last about 8 hours and only Claude Code refreshes the live one, so an inactive Claude account's row reads `Token expired (switch to refresh)` once its saved token has expired; switching to that account refreshes it. A `Login required` row means the saved session was revoked and needs a new sign-in. If the CLI's live session belongs to a different account than the one marked active (for example after a sign-in done outside the app), the active row shows that account's own saved-session usage rather than the live token's, and the log notes the drift. Click the account to re-sync the live session. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
+Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Claude access tokens last about 8 hours. Claude Code refreshes the live one. The app refreshes an inactive account's saved token itself when its usage call comes back expired, so inactive rows keep showing real usage. The row reads `Token expired (switch to refresh)` only when the app must not refresh: while an add is in progress, or when the saved token is the same pair the live session holds, or for up to 5 minutes after a refresh attempt failed (rotating it would log Claude Code out). Switching to that account then refreshes it. A `Login required` row means the refresh was rejected, so the saved session was revoked and needs a new sign-in. If the CLI's live session belongs to a different account than the one marked active (for example after a sign-in done outside the app), the active row shows that account's own saved-session usage rather than the live token's, and the log notes the drift. Click the account to re-sync the live session. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
 
 Usage refreshes at launch, every 5 minutes, after adding or switching an account, and when you click `↻ Refresh usage`. If any row is unavailable, the app retries quickly up to 3 times, 6 seconds apart.
 
@@ -133,6 +133,8 @@ Claude Code stores its OAuth credentials in macOS Keychain under `Claude Code-cr
 
 A Codex reset is sent to `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`, the same endpoint the Codex CLI uses, with the same headers as the usage call and an idempotency key (a UUID). The app never sends it for an account that cannot apply a reset, and on a network timeout it retries once with the same key, so a reset is never applied twice.
 
+A saved Claude token is refreshed with `https://platform.claude.com/v1/oauth/token`, the same endpoint and client id Claude Code uses. The app refreshes only its own backups (`claude-switcher:{email}`), never the live `Claude Code-credentials` entry. Before refreshing, it checks that the backup is not the same token pair as the live session, re-reads the backup to make sure nothing changed it meanwhile, and tries at most once per account every 5 minutes. The new tokens are written to the backup before they are used. Saved Codex tokens were already refreshed the same way.
+
 ```text
 macOS Keychain
 ├── Claude Code-credentials       active Claude token
@@ -178,6 +180,7 @@ If a saved Codex session has expired because its refresh token was already rotat
 - Subprocess calls never use `shell=True`.
 - Keychain operations time out after 5 seconds. Usage checks run in background threads with timeouts, so the menu never hangs.
 - The app never backs up a live credential under an account name it cannot confirm it belongs to.
+- Token refreshes never write Claude Code's live credential entry. They touch only the app's own backups, and a backup that shares its token pair with the live session is never refreshed.
 
 ## Requirements
 
@@ -212,7 +215,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 366 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 405 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
