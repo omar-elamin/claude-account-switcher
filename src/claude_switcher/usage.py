@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
 _last_refresh_attempt: dict[str, float] = {}
+# Last refresh rejection per email, so a throttled poll repeats "Login required"
+# instead of flipping back to "Token expired" for five minutes.
+_last_refresh_outcome: dict[str, dict] = {}
 
 
 def _extract_token(creds_json: str) -> str | None:
@@ -117,13 +120,15 @@ def fetch_usage_for_account(email: str, config_path=DEFAULT_CONFIG_PATH) -> dict
         now = time.time()
         last_attempt = _last_refresh_attempt.get(email)
         if last_attempt is not None and now - last_attempt < 300:
-            return usage
+            return _last_refresh_outcome.get(email, usage)
         _last_refresh_attempt[email] = now
 
         try:
             refreshed = core.refresh_claude_credentials(backup)
         except core.ClaudeCredentialsExpiredError:
-            return {"error": {"code": "login_required"}}
+            _last_refresh_outcome[email] = {"error": {"code": "login_required"}}
+            return _last_refresh_outcome[email]
+        _last_refresh_outcome.pop(email, None)
         if refreshed is None:
             return None
 

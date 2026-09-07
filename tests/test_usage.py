@@ -507,3 +507,18 @@ def test_saved_refresh_never_invents_missing_account_attribute(saved_refresh, mo
         s.fetch()
     assert _refresh_actions(s) == ["GET", "POST"]
     assert s.store[s.service] == s.old
+
+
+class TestThrottledPollRepeatsRejection:
+    def test_login_required_sticks_while_throttled(self, monkeypatch, saved_refresh):
+        """After a rejected refresh, a poll within 5 minutes must not flip back to 'Token expired'."""
+        import claude_switcher.usage as u
+        import claude_switcher.core as core
+        fx = saved_refresh
+        def rejected(blob): raise core.ClaudeCredentialsExpiredError("dead")
+        monkeypatch.setattr(core, "refresh_claude_credentials", rejected)
+        first = u.fetch_usage_for_account(fx.email)
+        second = u.fetch_usage_for_account(fx.email)
+        assert first == {"error": {"code": "login_required"}}
+        assert second == {"error": {"code": "login_required"}}
+        assert u.claude_usage_state(second).display == "Login required"
