@@ -214,3 +214,25 @@ class TestModelScopedWeeklyLimit:
         assert "Fable" not in claude_usage_state(u).display  # bad percent skipped, no crash
         u = self._usage(); u["limits"][2]["scope"] = None
         assert "Fable" not in claude_usage_state(u).display  # no model name -> skipped
+
+
+class TestClaudeActiveRowIdentityDrift:
+    def _setup(self, monkeypatch, live_email, active_email):
+        import claude_switcher.usage as u
+        import claude_switcher.core as core
+        import claude_switcher.config as config
+        from types import SimpleNamespace
+        monkeypatch.setattr(core, "_read_oauth_account", lambda: {"emailAddress": live_email})
+        monkeypatch.setattr(config, "get_active_account", lambda *a, **k: SimpleNamespace(email=active_email))
+        monkeypatch.setattr(u, "fetch_usage", lambda service: {"service": service})
+        calls = []
+        monkeypatch.setattr(u, "fetch_usage_for_account", lambda e: calls.append(e) or {"saved": e})
+        return u, calls
+
+    def test_drift_uses_active_accounts_saved_session(self, monkeypatch):
+        u, calls = self._setup(monkeypatch, "other@t", "active@t")
+        assert u.fetch_active_usage() == {"saved": "active@t"} and calls == ["active@t"]
+
+    def test_no_drift_uses_live_slot(self, monkeypatch):
+        u, calls = self._setup(monkeypatch, "active@t", "active@t")
+        assert u.fetch_active_usage() == {"service": "Claude Code-credentials"} and calls == []

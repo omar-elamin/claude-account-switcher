@@ -1,6 +1,7 @@
 """Fetch Claude API usage stats via the OAuth usage endpoint."""
 
 import json
+import logging
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -8,6 +9,8 @@ from datetime import datetime, timezone
 from claude_switcher import keychain
 from claude_switcher.common import _format_countdown
 from claude_switcher.usage_state import UsageState, UsageWindow
+
+logger = logging.getLogger(__name__)
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
 
@@ -59,8 +62,25 @@ def fetch_usage_for_account(email: str) -> dict | None:
     return fetch_usage(f"claude-switcher:{email}")
 
 
-def fetch_active_usage() -> dict | None:
-    """Fetch usage for the currently active Claude Code session."""
+def fetch_active_usage(config_path=None) -> dict | None:
+    """Fetch usage for the currently active Claude Code session.
+
+    If ~/.claude.json says the live session belongs to a different account
+    than the one config marks active (a sign-in done outside the app), use the
+    active account's own saved session instead of attributing the live token's
+    usage to it.
+    """
+    from claude_switcher import core
+    from claude_switcher.config import DEFAULT_CONFIG_PATH, get_active_account
+
+    active = get_active_account(config_path or DEFAULT_CONFIG_PATH, provider="claude")
+    live_email = (core._read_oauth_account() or {}).get("emailAddress")
+    if active and live_email and active.email != live_email:
+        logger.warning(
+            "Claude live session is %s but config marks %s active; using the saved session",
+            live_email, active.email,
+        )
+        return fetch_usage_for_account(active.email)
     return fetch_usage(keychain.CLAUDE_SERVICE)
 
 
