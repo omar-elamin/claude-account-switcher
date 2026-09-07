@@ -340,7 +340,12 @@ def codex_usage_state(usage: dict | None) -> UsageState:
         reset = _format_reset_delta(window["reset_at"]) if "reset_at" in window else None
         reset_suffix = f" ({reset})" if reset else ""
         parts.append(f"{label} {percent:.0f}%{reset_suffix}")
-        windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
+        try:
+            resets_at = float(window.get("reset_at"))
+        except (TypeError, ValueError):
+            resets_at = None
+        windows.append(UsageWindow(label=label, percent=percent, resets_in=reset,
+                                   resets_at=resets_at))
 
     if not parts:
         return UsageState(available=False, display="Usage unavailable")

@@ -41,7 +41,7 @@ From top to bottom:
 
 - A header per provider: `── Claude Code ──` and `── Codex CLI ──`.
 - Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted.
-- `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled".
+- `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled". `Use expiring quota first` controls whether the app switches before the active account runs out.
 - `Auto-reset` submenu with one item, `Codex CLI`, with a checkmark when enabled. Clicking it toggles the setting, and a notification says "Enabled" or "Disabled".
 - `✚ Add Claude account...` and `✚ Add Codex account...`
 - `↻ Refresh usage`
@@ -105,9 +105,9 @@ codex login status
 
 ### Auto-switch
 
-Auto-switch is off by default and is set per provider. When it is on for a provider and the active account's own window reaches 100% (Claude: the 5-hour or 7-day window; Codex: its rate-limit windows), the app switches to another saved account of the same provider that still has room. It prefers accounts whose usage is known over accounts whose usage is unknown. It never crosses providers. There is a 60-second cooldown between auto-switch attempts per provider, including attempts that find no target.
+Auto-switch is off by default and is set per provider. When it is on for a provider, the app evaluates on every usage refresh which usable account should be active: the one whose target window resets soonest (Codex: the weekly window; Claude: the Fable window, or the 7-day window if the account has no Fable limit), and among ties the one with the most left. Budget left in a window is lost when it resets, so using the soonest-expiring quota first wastes the least. An account counts as usable when it has valid credentials, known usage, and no window at 100%.
 
-The threshold is `auto_switch_threshold` in the config file (default 100).
+With 'Use expiring quota first' on (the default), the app switches to that account even while the active one still has room. With it off, the app switches only when the active account reaches 100%, and then to that account. Either way it never crosses providers, keeps a 60-second gap between attempts per provider, and does not switch away from an account you chose by hand until that account runs out. If no account with known usage has room, it falls back to a saved account whose usage is unknown.
 
 ### Rate-limit resets
 
@@ -215,7 +215,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 405 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 454 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 

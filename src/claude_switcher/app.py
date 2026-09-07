@@ -11,6 +11,7 @@ from claude_switcher import codex_core, core, keychain
 from claude_switcher.auto_switch import (
     account_key,
     choose_auto_switch_target,
+    choose_fefo_target,
     should_auto_switch,
     choose_auto_reset_target,
     should_auto_reset,
@@ -34,6 +35,7 @@ from claude_switcher.config import (
     get_active_account,
     load_settings,
     set_auto_switch_enabled,
+    set_proactive_switch_enabled,
     set_auto_reset_enabled,
     DEFAULT_CONFIG_PATH,
 )
@@ -155,6 +157,7 @@ class ClaudeSwitcherApp(rumps.App):
         self._usage_state_cache: dict[tuple[str, str], UsageState] = {}
         self._usage_items: dict[tuple[str, str], rumps.MenuItem] = {}
         self._last_auto_switch_attempt: dict[str, float] = {}
+        self._manual_pin: dict[str, str] = {}
         self._last_reset_eligible: frozenset[str] = frozenset()
         self._last_auto_reset_attempt: dict[str, float] = {}
         self._last_auto_reset_by_account: dict[str, float] = {}
@@ -301,6 +304,10 @@ class ClaudeSwitcherApp(rumps.App):
             item._provider = provider
             item.state = 1 if settings.auto_switch.get(provider, False) else 0
             auto_menu.add(item)
+        auto_menu.add(rumps.separator)
+        item = rumps.MenuItem("Use expiring quota first", callback=self._on_toggle_proactive_switch)
+        item.state = 1 if settings.proactive_switch else 0
+        auto_menu.add(item)
         self.menu.add(auto_menu)
 
     def _has_credentials(self, account) -> bool:
@@ -402,6 +409,7 @@ class ClaudeSwitcherApp(rumps.App):
             )
             return
 
+        self._manual_pin[provider] = email
         self._switch_in_progress.add(provider)
 
         def _switch():
@@ -492,6 +500,17 @@ class ClaudeSwitcherApp(rumps.App):
             title="Claude Switcher",
             subtitle=f"Auto-switch {PROVIDER_LABELS[provider]}",
             message="Enabled" if enabled else "Disabled",
+        )
+
+    def _on_toggle_proactive_switch(self, sender):
+        enabled = not load_settings(self.config_path).proactive_switch
+        set_proactive_switch_enabled(enabled, self.config_path)
+        sender.state = 1 if enabled else 0
+        rumps.notification(
+            title="Claude Switcher",
+            subtitle=f"Proactive switching {'enabled' if enabled else 'disabled'}",
+            message=("Switch to the account whose quota expires soonest, before the active one runs out."
+                     if enabled else "Only switch when the active account runs out."),
         )
 
     def _fetch_all_usage(self):
@@ -651,17 +670,27 @@ class ClaudeSwitcherApp(rumps.App):
 
     def _attempt_auto_switch(self, provider: str) -> dict | None:
         settings = load_settings(self.config_path)
+        if not settings.auto_switch.get(provider, False):
+            return None
         active = get_active_account(self.config_path, provider=provider)
         if not active:
             return None
 
         active_state = self._usage_state_cache.get(account_key(active))
-        if not active_state or not should_auto_switch(
-            active_state,
-            settings.auto_switch.get(provider, False),
-            settings.auto_switch_threshold,
-        ):
+        if not active_state or not active_state.available:
             return None
+
+        accounts = load_accounts(self.config_path)
+        best = choose_fefo_target(
+            provider, accounts, self._usage_state_cache, self._has_credentials,
+            settings.auto_switch_threshold,
+        )
+        exhausted = should_auto_switch(active_state, True, settings.auto_switch_threshold)
+        if not exhausted:
+            if not settings.proactive_switch or best is None or best.email == active.email:
+                return None
+            if self._manual_pin.get(provider) == active.email:
+                return None
 
         now = time.time()
         last_attempt = self._last_auto_switch_attempt.get(provider, 0)
@@ -669,15 +698,16 @@ class ClaudeSwitcherApp(rumps.App):
             return None
         self._last_auto_switch_attempt[provider] = now
 
-        accounts = load_accounts(self.config_path)
-        target = choose_auto_switch_target(
-            provider=provider,
-            accounts=accounts,
-            active_email=active.email,
-            usage_by_account=self._usage_state_cache,
-            has_credentials=self._has_credentials,
-            threshold=settings.auto_switch_threshold,
-        )
+        target = best
+        if exhausted and (target is None or target.email == active.email):
+            target = choose_auto_switch_target(
+                provider=provider,
+                accounts=accounts,
+                active_email=active.email,
+                usage_by_account=self._usage_state_cache,
+                has_credentials=self._has_credentials,
+                threshold=settings.auto_switch_threshold,
+            )
         if not target:
             return {"status": "no_target", "provider": provider, "email": active.email}
 
@@ -691,7 +721,8 @@ class ClaudeSwitcherApp(rumps.App):
                 "message": str(exc),
             }
 
-        return {"status": "switched", "provider": provider, "email": target.email}
+        return {"status": "switched", "reason": "exhausted" if exhausted else "proactive",
+                "provider": provider, "email": target.email}
 
     def _notify_auto_switch_result(self, result: dict):
         provider = result["provider"]
@@ -699,8 +730,10 @@ class ClaudeSwitcherApp(rumps.App):
         if result["status"] == "switched":
             rumps.notification(
                 title="Claude Switcher",
-                subtitle=f"Auto-switched {label}",
-                message=result["email"],
+                subtitle=(f"Auto-switched {label} early" if result.get("reason") == "proactive"
+                          else f"Auto-switched {label}"),
+                message=(f"{result['email']}: its quota expires sooner"
+                         if result.get("reason") == "proactive" else result["email"]),
             )
         elif result["status"] == "no_target":
             rumps.notification(

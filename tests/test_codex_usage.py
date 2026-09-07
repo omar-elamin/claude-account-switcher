@@ -744,3 +744,17 @@ class TestActiveRowIdentityDrift:
         cu, calls = self._setup(monkeypatch, live_email="hotmail@t", active_email="hotmail@t")
         assert cu.fetch_active_codex_usage() == {"email": "hotmail@t", "live": True}
         assert calls == []
+
+
+@pytest.mark.parametrize("reset_fields, expected", [
+    ({"reset_at": 1773921600.5}, 1773921600.5),
+    ({"reset_at": "1773921600.5"}, 1773921600.5),
+    ({}, None), ({"reset_at": None}, None), ({"reset_at": "invalid"}, None),
+])
+def test_every_codex_window_has_reset_timestamp(reset_fields, expected):
+    state = codex_usage_state({"rate_limit": {
+        "primary_window": {"used_percent": 10, **reset_fields},
+        "secondary_window": {"used_percent": 20, **reset_fields},
+    }})
+    assert len(state.windows) == 2
+    assert [w.resets_at for w in state.windows] == [expected] * 2
