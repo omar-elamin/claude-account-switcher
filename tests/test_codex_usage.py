@@ -718,3 +718,29 @@ class TestConsumeResetPrecheckMessages:
         cu, posts = self._run({"rate_limit_reset_credits": {"available_count": 3, "applicable_available_count": 0}}, monkeypatch)
         assert cu.consume_reset_credit("x@test.com") == "no_credit"
         assert posts == []
+
+
+class TestActiveRowIdentityDrift:
+    """The active row must show the active account's usage, not whoever holds the live slot."""
+
+    def _setup(self, monkeypatch, live_email, active_email):
+        import claude_switcher.codex_usage as cu
+        from types import SimpleNamespace
+        monkeypatch.setattr(cu.codex_core, "_read_codex_credentials_for_import_raw", lambda: '{"tokens": {"access_token": "t"}}')
+        monkeypatch.setattr(cu, "normalize_codex_credentials_blob", lambda b: b)
+        monkeypatch.setattr(cu.codex_core, "_codex_email_from_credentials", lambda c=None: live_email)
+        monkeypatch.setattr(cu, "get_active_account", lambda *a, **k: SimpleNamespace(email=active_email))
+        monkeypatch.setattr(cu, "_fetch_codex_usage_once", lambda c: {"email": live_email, "live": True})
+        calls = []
+        monkeypatch.setattr(cu, "fetch_codex_usage_for_account", lambda e, *a, **k: calls.append(e) or {"email": e, "saved": True})
+        return cu, calls
+
+    def test_drift_uses_active_accounts_saved_session(self, monkeypatch):
+        cu, calls = self._setup(monkeypatch, live_email="gmail@t", active_email="hotmail@t")
+        assert cu.fetch_active_codex_usage() == {"email": "hotmail@t", "saved": True}
+        assert calls == ["hotmail@t"]
+
+    def test_no_drift_uses_live_session(self, monkeypatch):
+        cu, calls = self._setup(monkeypatch, live_email="hotmail@t", active_email="hotmail@t")
+        assert cu.fetch_active_codex_usage() == {"email": "hotmail@t", "live": True}
+        assert calls == []

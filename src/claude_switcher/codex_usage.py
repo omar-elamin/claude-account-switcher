@@ -149,6 +149,17 @@ def fetch_active_codex_usage(config_path=DEFAULT_CONFIG_PATH) -> dict | None:
         return None
     creds = normalize_codex_credentials_blob(raw_creds) or raw_creds
     email = codex_core._codex_email_from_credentials(creds)
+    active = get_active_account(config_path, provider="codex")
+    if active and email and active.email != email:
+        # The live session belongs to a different account than the one config
+        # marks active (a sign-in done outside the app). Showing the live
+        # token's numbers under the active row would attribute one account's
+        # usage to another, so use the active account's own saved session.
+        logger.warning(
+            "Codex live session is %s but config marks %s active; using the saved session",
+            email, active.email,
+        )
+        return fetch_codex_usage_for_account(active.email, config_path)
     usage = _fetch_codex_usage_once(creds)
     if usage is not None:
         return usage
