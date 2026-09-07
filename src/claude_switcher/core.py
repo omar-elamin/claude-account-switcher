@@ -32,6 +32,10 @@ _add_in_progress = False
 logger = logging.getLogger(__name__)
 CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# The token endpoint rate-limits the generic "claude-code/2.1.11" agent (429 on
+# every request, verified live) and Cloudflare blocks requests with no agent.
+# It accepts the agent Claude Code itself sends.
+CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.263 (external, cli)"
 
 
 class ClaudeCredentialsExpiredError(RuntimeError):
@@ -61,7 +65,7 @@ def refresh_claude_credentials(creds_json: str) -> str | None:
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "claude-code/2.1.11",
+            "User-Agent": CLAUDE_CLI_USER_AGENT,
         },
     )
     try:

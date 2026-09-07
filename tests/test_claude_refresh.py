@@ -50,7 +50,7 @@ def test_refresh_wire_contract_and_preserved_blob(monkeypatch, caplog, optional_
         }
         assert dict(req.header_items()) == {
             "Content-type": "application/json", "Accept": "application/json",
-            "User-agent": "claude-code/2.1.11",
+            "User-agent": "claude-cli/2.1.263 (external, cli)",
         }
         assert timeout == 10
         return response(payload)
