@@ -40,7 +40,7 @@ The app is not notarized, so macOS may block it on first launch. Open **System S
 From top to bottom:
 
 - A header per provider: `── Claude Code ──` and `── Codex CLI ──`.
-- Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted. (The Claude row says `Usage indisponible`, a French leftover.)
+- Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted.
 - `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled".
 - `Auto-reset` submenu with one item, `Codex CLI`, with a checkmark when enabled. Clicking it toggles the setting, and a notification says "Enabled" or "Disabled".
 - `✚ Add Claude account...` and `✚ Add Codex account...`
@@ -54,10 +54,10 @@ From top to bottom:
 A Claude row looks like this:
 
 ```text
-5h 40% (2h 1m) | 7j 20% (1d 5h) | Fable 32% (1d 5h)
+5h 40% (2h 1m) | 7d 20% (1d 5h) | Fable 32% (1d 5h)
 ```
 
-The first segment is the 5-hour window. The second is the 7-day window, labelled `7j`. After that comes one segment for each model-scoped weekly limit the API reports, labelled with the model's own name (today: `Fable`). The value in parentheses is the time until that window resets. Model-scoped windows are informational only and never trigger auto-switch.
+The first segment is the 5-hour window. The second is the 7-day window. After that comes one segment for each model-scoped weekly limit the API reports, labelled with the model's own name (today: `Fable`). The value in parentheses is the time until that window resets. Model-scoped windows are informational only and never trigger auto-switch.
 
 A Codex row looks like this:
 
@@ -67,7 +67,7 @@ A Codex row looks like this:
 
 There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window. When an account holds banked resets, the row ends with `· N resets` (`· 1 reset` for one). See [Rate-limit resets](#rate-limit-resets).
 
-Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. If the CLI's live session belongs to a different account than the one marked active (for example after a sign-in done outside the app), the active row shows that account's own saved-session usage rather than the live token's, and the log notes the drift. Click the account to re-sync the live session. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
+Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Claude access tokens last about 8 hours and only Claude Code refreshes the live one, so an inactive Claude account's row reads `Token expired (switch to refresh)` once its saved token has expired; switching to that account refreshes it. A `Login required` row means the saved session was revoked and needs a new sign-in. If the CLI's live session belongs to a different account than the one marked active (for example after a sign-in done outside the app), the active row shows that account's own saved-session usage rather than the live token's, and the log notes the drift. Click the account to re-sync the live session. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
 
 Usage refreshes at launch, every 5 minutes, after adding or switching an account, and when you click `↻ Refresh usage`. If any row is unavailable, the app retries quickly up to 3 times, 6 seconds apart.
 

@@ -1,6 +1,7 @@
 """Fetch Claude API usage stats via the OAuth usage endpoint."""
 
 import json
+import time
 import logging
 import urllib.request
 import urllib.error
@@ -53,8 +54,29 @@ def fetch_usage(service: str) -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            # Claude access tokens last about 8 hours and only Claude Code
+            # refreshes the live one. A saved backup therefore goes stale a few
+            # hours after switching away; its refresh token is still valid, so
+            # switching to the account recovers it. Tell the user that instead
+            # of a bare "unavailable"; a 401 on an unexpired token means the
+            # session was revoked and needs a fresh sign-in.
+            code = "token_expired" if _token_expired(creds) else "login_required"
+            return {"error": {"code": code}}
+        return None
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
         return None
+
+
+def _token_expired(creds_json: str) -> bool:
+    """True when the blob's claudeAiOauth.expiresAt (ms epoch) is in the past."""
+    try:
+        expires_at = json.loads(creds_json)["claudeAiOauth"]["expiresAt"]
+        expires_s = expires_at / 1000 if expires_at > 1e11 else expires_at
+        return expires_s < time.time()
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 
 def fetch_usage_for_account(email: str) -> dict | None:
@@ -101,14 +123,20 @@ def _format_reset_delta(resets_at: str) -> str:
 def claude_usage_state(usage: dict | None) -> UsageState:
     """Convert Claude usage data into a normalized usage state."""
     if not usage:
-        return UsageState(available=False, display="Usage indisponible")
+        return UsageState(available=False, display="Usage unavailable")
+    error = usage.get("error") if isinstance(usage, dict) else None
+    if isinstance(error, dict):
+        if error.get("code") == "token_expired":
+            return UsageState(available=False, display="Token expired (switch to refresh)")
+        if error.get("code") == "login_required":
+            return UsageState(available=False, display="Login required")
 
     parts = []
     windows = []
     five_h = usage.get("five_hour", {})
     seven_d = usage.get("seven_day", {})
 
-    for label, window in (("5h", five_h), ("7j", seven_d)):
+    for label, window in (("5h", five_h), ("7d", seven_d)):
         if not isinstance(window, dict) or "utilization" not in window:
             continue
         try:
@@ -144,7 +172,7 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         windows.append(UsageWindow(label=model, percent=percent, resets_in=reset, scoped=True))
 
     if not parts:
-        return UsageState(available=False, display="Usage indisponible")
+        return UsageState(available=False, display="Usage unavailable")
 
     return UsageState(available=True, display=" | ".join(parts), windows=tuple(windows))
 
