@@ -7,13 +7,15 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
-from claude_switcher import keychain
+from claude_switcher import core, keychain
 from claude_switcher.common import _format_countdown
+from claude_switcher.config import DEFAULT_CONFIG_PATH, load_accounts
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 logger = logging.getLogger(__name__)
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
+_last_refresh_attempt: dict[str, float] = {}
 
 
 def _extract_token(creds_json: str) -> str | None:
@@ -37,7 +39,11 @@ def fetch_usage(service: str) -> dict | None:
     creds = keychain.read_credentials(service)
     if not creds:
         return None
+    return _fetch_usage_once(creds)
 
+
+def _fetch_usage_once(creds: str) -> dict | None:
+    """Fetch with exactly this blob so refresh can compare the original bytes."""
     token = _extract_token(creds)
     if not token:
         return None
@@ -57,11 +63,8 @@ def fetch_usage(service: str) -> dict | None:
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             # Claude access tokens last about 8 hours and only Claude Code
-            # refreshes the live one. A saved backup therefore goes stale a few
-            # hours after switching away; its refresh token is still valid, so
-            # switching to the account recovers it. Tell the user that instead
-            # of a bare "unavailable"; a 401 on an unexpired token means the
-            # session was revoked and needs a fresh sign-in.
+            # refreshes the live one. Saved accounts can attempt refresh when
+            # expired; an unexpired 401 means a new sign-in is required.
             code = "token_expired" if _token_expired(creds) else "login_required"
             return {"error": {"code": code}}
         return None
@@ -79,9 +82,63 @@ def _token_expired(creds_json: str) -> bool:
         return False
 
 
-def fetch_usage_for_account(email: str) -> dict | None:
-    """Fetch usage for a saved account by email."""
-    return fetch_usage(f"claude-switcher:{email}")
+def fetch_usage_for_account(email: str, config_path=DEFAULT_CONFIG_PATH) -> dict | None:
+    """Fetch saved usage, safely refreshing expired credentials before reuse."""
+    service = f"claude-switcher:{email}"
+    backup = keychain.read_credentials(service)
+    if not backup:
+        return None
+    usage = _fetch_usage_once(backup)
+    if usage != {"error": {"code": "token_expired"}}:
+        return usage
+
+    with core._CLAUDE_LOCK:
+        if core._add_in_progress:
+            return usage
+        if keychain.read_credentials(service) != backup:
+            return usage
+
+        live = keychain.read_credentials(keychain.CLAUDE_SERVICE)
+        if live:
+            try:
+                live_tokens = json.loads(live).get("claudeAiOauth", {})
+                saved_tokens = json.loads(backup)["claudeAiOauth"]
+                shared = any(
+                    saved_tokens.get(field) and saved_tokens[field] == live_tokens.get(field)
+                    for field in ("refreshToken", "accessToken")
+                )
+            except (ValueError, TypeError, KeyError, AttributeError):
+                # An unreadable live blob cannot establish that rotation is safe.
+                return usage
+            if shared:
+                logger.info("Claude refresh skipped: shared with live session")
+                return usage
+
+        now = time.time()
+        last_attempt = _last_refresh_attempt.get(email)
+        if last_attempt is not None and now - last_attempt < 300:
+            return usage
+        _last_refresh_attempt[email] = now
+
+        try:
+            refreshed = core.refresh_claude_credentials(backup)
+        except core.ClaudeCredentialsExpiredError:
+            return {"error": {"code": "login_required"}}
+        if refreshed is None:
+            return None
+
+        account_attr = keychain.read_account_attribute(service)
+        if account_attr is None:
+            account_attr = next(
+                (a.keychain_account for a in load_accounts(config_path)
+                 if a.provider == "claude" and a.email == email),
+                None,
+            )
+        if account_attr is None:
+            raise RuntimeError("Saved Claude Keychain account attribute is unavailable.")
+        keychain.write_credentials(service, account_attr, refreshed)
+
+    return _fetch_usage_once(refreshed)
 
 
 def fetch_active_usage(config_path=None) -> dict | None:
@@ -102,7 +159,7 @@ def fetch_active_usage(config_path=None) -> dict | None:
             "Claude live session is %s but config marks %s active; using the saved session",
             live_email, active.email,
         )
-        return fetch_usage_for_account(active.email)
+        return fetch_usage_for_account(active.email, config_path or DEFAULT_CONFIG_PATH)
     return fetch_usage(keychain.CLAUDE_SERVICE)
 
 
