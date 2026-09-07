@@ -146,6 +146,9 @@ def _settings_from_dict(data: dict | None) -> AppSettings:
     proactive_switch = data.get("proactive_switch", defaults.proactive_switch)
     if not isinstance(proactive_switch, (bool, int, float, str)):
         proactive_switch = defaults.proactive_switch
+    if isinstance(proactive_switch, str):
+        # A hand-edited config may hold "false"/"0"; bool("false") is True.
+        proactive_switch = proactive_switch.strip().lower() not in ("false", "0", "no", "off", "")
 
     return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold,
                        auto_reset=auto_reset, proactive_switch=bool(proactive_switch))

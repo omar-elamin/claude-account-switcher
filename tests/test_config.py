@@ -387,3 +387,12 @@ def test_proactive_switch_false_and_setter_roundtrip(tmp_path):
         set_proactive_switch_enabled(enabled, path)
         assert load_settings(path).proactive_switch is enabled
         assert json.loads(path.read_text())["settings"]["proactive_switch"] is enabled
+
+
+def test_proactive_switch_string_false_in_hand_edited_config_reads_false(tmp_path):
+    from claude_switcher.config import _settings_from_dict
+    assert _settings_from_dict({"proactive_switch": "false"}).proactive_switch is False
+    assert _settings_from_dict({"proactive_switch": "0"}).proactive_switch is False
+    assert _settings_from_dict({"proactive_switch": "true"}).proactive_switch is True
+    assert _settings_from_dict({"proactive_switch": False}).proactive_switch is False
+    assert _settings_from_dict({}).proactive_switch is True
