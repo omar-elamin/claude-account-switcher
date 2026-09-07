@@ -69,13 +69,13 @@ class TestFormatUsage:
         }
         result = format_usage(usage)
         assert "5h 43% (2h 0m)" in result
-        assert "7j 18% (5d 14h)" in result
+        assert "7d 18% (5d 14h)" in result
 
     def test_returns_unavailable_for_none(self):
-        assert format_usage(None) == "Usage indisponible"
+        assert format_usage(None) == "Usage unavailable"
 
     def test_returns_unavailable_for_empty(self):
-        assert format_usage({}) == "Usage indisponible"
+        assert format_usage({}) == "Usage unavailable"
 
     def test_usage_state_marks_exhausted_at_100(self):
         usage = {
@@ -193,7 +193,7 @@ class TestModelScopedWeeklyLimit:
         assert "Fable 32%" in st.display
         assert st.display.startswith("5h 40%")          # account-wide windows come first
         labels = [w.label for w in st.windows]
-        assert labels == ["5h", "7j", "Fable"]
+        assert labels == ["5h", "7d", "Fable"]
 
     def test_scoped_window_does_not_trigger_exhaustion(self):
         # Fable at 100% but the account's own windows have room: not exhausted.
@@ -236,3 +236,29 @@ class TestClaudeActiveRowIdentityDrift:
     def test_no_drift_uses_live_slot(self, monkeypatch):
         u, calls = self._setup(monkeypatch, "active@t", "active@t")
         assert u.fetch_active_usage() == {"service": "Claude Code-credentials"} and calls == []
+
+
+class TestExpiredSavedToken:
+    """A 401 on a saved Claude token is reported as expired or revoked, not 'unavailable'."""
+
+    def _fetch(self, monkeypatch, expires_delta_s, http_code=401):
+        import io, json, time, urllib.error
+        import claude_switcher.usage as u
+        blob = json.dumps({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r", "expiresAt": int((time.time() + expires_delta_s) * 1000)}})
+        monkeypatch.setattr(u.keychain, "read_credentials", lambda s: blob)
+        def boom(req, timeout=5): raise urllib.error.HTTPError(req.full_url, http_code, "x", {}, io.BytesIO(b""))
+        monkeypatch.setattr(u.urllib.request, "urlopen", boom)
+        return u, u.fetch_usage("claude-switcher:a@t")
+
+    def test_expired_token_401_reads_token_expired(self, monkeypatch):
+        u, data = self._fetch(monkeypatch, -3600)
+        assert u.claude_usage_state(data).display == "Token expired (switch to refresh)"
+        assert u.claude_usage_state(data).available is False
+
+    def test_unexpired_token_401_reads_login_required(self, monkeypatch):
+        u, data = self._fetch(monkeypatch, +3600)
+        assert u.claude_usage_state(data).display == "Login required"
+
+    def test_other_http_error_is_plain_unavailable(self, monkeypatch):
+        u, data = self._fetch(monkeypatch, -3600, http_code=500)
+        assert data is None and u.claude_usage_state(data).display == "Usage unavailable"
