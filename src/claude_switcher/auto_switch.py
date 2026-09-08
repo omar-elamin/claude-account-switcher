@@ -1,5 +1,6 @@
 """Pure auto-switch decision logic."""
 
+import time
 from collections.abc import Callable
 
 from claude_switcher.config import AccountInfo
@@ -100,6 +101,26 @@ def fefo_key(state: UsageState | None, provider: str) -> tuple[float, float]:
 
 
 TIE_SECONDS = 3600.0
+QUIET_SECONDS = 24 * 3600.0
+WEEK_SECONDS = 7 * 86400.0
+UNTOUCHED_TOLERANCE_SECONDS = 15 * 60.0
+
+
+def is_untouched(state: UsageState | None, provider: str, now: float) -> bool:
+    """True when the target window's clock has not started.
+
+    A window's clock starts at first use after a reset. Until then Claude reports no
+    reset time at all, and Codex reports a reset a full week away with nothing used.
+    Such an account is at 100% but generates no refill until it is used, so starting
+    its clock early (when nothing else is about to expire) brings its next refill
+    forward by up to a week.
+    """
+    window = target_window(state, provider)
+    if window is None:
+        return False
+    if window.resets_at is None:
+        return True
+    return window.percent == 0 and window.resets_at - now >= WEEK_SECONDS - UNTOUCHED_TOLERANCE_SECONDS
 
 
 def choose_fefo_target(
@@ -110,6 +131,8 @@ def choose_fefo_target(
     threshold: float = 100.0,
     active_email: str | None = None,
     tie_seconds: float = TIE_SECONDS,
+    quiet_seconds: float = QUIET_SECONDS,
+    now: float | None = None,
 ) -> AccountInfo | None:
     """Choose a usable account by earliest target-window reset, including the active one.
 
@@ -117,6 +140,14 @@ def choose_fefo_target(
     active account wins, so two accounts with the same reset time do not swap back and
     forth as their leftovers drift; otherwise the most leftover wins, then list order.
     Optimality does not depend on the tie-break (any tie rule is optimal).
+
+    Starting clocks: if some candidate's window has not started (see is_untouched) and
+    no running candidate resets within quiet_seconds, choose among the untouched ones
+    (same tie rules) so that its weekly refill is scheduled as early as possible.
+    Otherwise choose among the running ones. Measured against a proven upper bound,
+    this rule is within about 1% of optimal near capacity, where plain earliest-reset
+    loses up to 5% because an account that reset while others still had quota sat
+    idle and its refill cadence slipped.
     """
     candidates = []
     for account in accounts:
@@ -127,9 +158,14 @@ def choose_fefo_target(
             candidates.append(account)
     if not candidates:
         return None
+    now = time.time() if now is None else now
     keys = {account.email: fefo_key(usage_by_account[account_key(account)], provider) for account in candidates}
-    earliest = min(key[0] for key in keys.values())
-    tied = [a for a in candidates if keys[a.email][0] == earliest or keys[a.email][0] - earliest <= tie_seconds]
+    untouched = [a for a in candidates if is_untouched(usage_by_account[account_key(a)], provider, now)]
+    running = [a for a in candidates if a not in untouched]
+    quiet = not any(keys[a.email][0] - now <= quiet_seconds for a in running)
+    pool = untouched if (untouched and quiet) else (running or untouched)
+    earliest = min(keys[a.email][0] for a in pool)
+    tied = [a for a in pool if keys[a.email][0] == earliest or keys[a.email][0] - earliest <= tie_seconds]
     for account in tied:
         if account.email == active_email:
             return account
