@@ -5,9 +5,9 @@ import time
 from pathlib import Path
 
 import rumps
-from Foundation import NSOperationQueue
+from Foundation import NSBundle, NSOperationQueue
 
-from claude_switcher import codex_core, core, keychain
+from claude_switcher import codex_core, core, keychain, login_item
 from claude_switcher.auto_switch import (
     account_key,
     choose_auto_switch_target,
@@ -267,6 +267,9 @@ class ClaudeSwitcherApp(rumps.App):
         self._add_reset_menu(accounts)
 
         self.menu.add(rumps.separator)
+        item = rumps.MenuItem("Start at login", callback=self._on_toggle_start_at_login)
+        item.state = int(login_item.is_enabled())
+        self.menu.add(item)
         self.menu.add(rumps.MenuItem("\u23FB  Quit", callback=rumps.quit_application))
 
     def _add_provider_section(self, provider: str, accounts):
@@ -490,6 +493,32 @@ class ClaudeSwitcherApp(rumps.App):
 
         threading.Thread(target=_add, daemon=True).start()
 
+    def _on_toggle_start_at_login(self, sender):
+        bundle_path = NSBundle.mainBundle().bundlePath()
+        if not bundle_path.endswith(".app"):
+            rumps.notification(
+                title="Claude Switcher",
+                subtitle="Start at login needs the built app",
+                message="Run the app from /Applications (build with ./build_local.sh --install).",
+            )
+            return
+        try:
+            enabled = not login_item.is_enabled()
+            if enabled:
+                login_item.enable(Path(bundle_path))
+            else:
+                login_item.disable()
+            sender.state = int(enabled)
+            rumps.notification(
+                title="Claude Switcher",
+                subtitle="Start at login enabled" if enabled else "Start at login disabled",
+                message=bundle_path if enabled else "Claude Switcher will not open at login.",
+            )
+        except RuntimeError as exc:
+            rumps.notification(
+                title="Claude Switcher", subtitle="Start at login failed", message=str(exc),
+            )
+
     def _on_toggle_auto_switch(self, sender):
         provider = sender._provider
         settings = load_settings(self.config_path)
@@ -683,7 +712,7 @@ class ClaudeSwitcherApp(rumps.App):
         accounts = load_accounts(self.config_path)
         best = choose_fefo_target(
             provider, accounts, self._usage_state_cache, self._has_credentials,
-            settings.auto_switch_threshold,
+            settings.auto_switch_threshold, active_email=active.email,
         )
         exhausted = should_auto_switch(active_state, True, settings.auto_switch_threshold)
         if not exhausted:

@@ -129,6 +129,9 @@ def test_target_window_uses_provider_target():
     assert target_window(UsageState(True, "", (five,)), "claude") is None
 
 
+H = 3600  # reset gaps in hours: gaps under an hour count as a tie
+
+
 def _weekly(percent, reset):
     return UsageState(True, "", (UsageWindow("7d", percent, resets_at=reset),))
 
@@ -137,10 +140,10 @@ def test_fefo_earliest_reset_then_most_left_then_list_order():
     from claude_switcher.auto_switch import choose_fefo_target, fefo_key
     accounts = [_account(name) for name in ("late", "early", "more-left", "tie", "unknown-reset")]
     states = dict(zip(map(account_key, accounts), [
-        _weekly(0, 200), _weekly(70, 100), _weekly(20, 100),
-        _weekly(20, 100), _weekly(0, None),
+        _weekly(0, 200 * H), _weekly(70, 100 * H), _weekly(20, 100 * H),
+        _weekly(20, 100 * H), _weekly(0, None),
     ]))
-    assert fefo_key(states[account_key(accounts[2])], "claude") == (100, -80)
+    assert fefo_key(states[account_key(accounts[2])], "claude") == (100 * H, -80)
     assert fefo_key(states[account_key(accounts[4])], "claude") == (float("inf"), -100)
     assert choose_fefo_target("claude", accounts, states, lambda a: True) == accounts[2]
     assert choose_fefo_target("claude", accounts[:2], states, lambda a: True) == accounts[1]
@@ -163,3 +166,35 @@ def test_fefo_filters_unusable_accounts_and_includes_active():
     assert choose_fefo_target("claude", accounts, states, credentials, threshold=95) == active
     assert choose_fefo_target("claude", accounts[:-1], states, credentials, threshold=95) is None
     assert choose_fefo_target("claude", [], {}, credentials) is None
+
+
+from claude_switcher.auto_switch import choose_fefo_target  # noqa: E402  (tie-break tests)
+
+
+def _state(percent, resets_at, label="7d"):
+    return UsageState(True, "", (UsageWindow(label, percent, resets_at=resets_at),))
+
+
+def test_fefo_tie_within_an_hour_keeps_the_active_account():
+    a, b = _account("a@test.com", "codex", True), _account("b@test.com", "codex")
+    usage = {account_key(a): _state(60, 1000.0), account_key(b): _state(20, 1000.0 + 1800)}
+    chosen = choose_fefo_target("codex", [a, b], usage, lambda _: True, active_email="a@test.com")
+    assert chosen == a  # b has more leftover but resets within the tie window: no flip
+
+
+def test_fefo_tie_beyond_an_hour_is_not_a_tie():
+    a, b = _account("a@test.com", "codex", True), _account("b@test.com", "codex")
+    usage = {account_key(a): _state(60, 1000.0 + 7200), account_key(b): _state(20, 1000.0)}
+    assert choose_fefo_target("codex", [a, b], usage, lambda _: True, active_email="a@test.com") == b
+
+
+def test_fefo_tie_without_active_prefers_most_leftover_then_order():
+    a, b, c = (_account(e, "codex") for e in ("a@test.com", "b@test.com", "c@test.com"))
+    usage = {account_key(a): _state(60, 1000.0), account_key(b): _state(20, 1000.0), account_key(c): _state(20, 1000.0)}
+    assert choose_fefo_target("codex", [a, b, c], usage, lambda _: True, active_email="zzz@test.com") == b
+
+
+def test_fefo_two_untouched_accounts_tie_and_keep_active():
+    a, b = _account("a@test.com", "claude", True), _account("b@test.com", "claude")
+    usage = {account_key(a): _state(5, None, "Fable"), account_key(b): _state(0, None, "Fable")}
+    assert choose_fefo_target("claude", [a, b], usage, lambda _: True, active_email="a@test.com") == a

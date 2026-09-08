@@ -76,3 +76,7 @@ PYV
 codesign --force --deep -s - "$APP"       # re-sign ad-hoc after vendoring
 
 echo "Built: $APP"
+
+if [ "${1:-}" = "--install" ]; then
+    rm -rf "/Applications/Claude Switcher.app" && cp -R "$APP" /Applications/ && echo "Installed: /Applications/Claude Switcher.app"
+fi

@@ -31,6 +31,8 @@ cd claude-account-switcher
 
 Drag `dist/Claude Switcher.app` to `/Applications` and launch it. It appears as a menu bar icon.
 
+Or run `./build_local.sh --install` to build and copy the app to `/Applications`.
+
 The app is not notarized, so macOS may block it on first launch. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
 ## Usage
@@ -47,6 +49,7 @@ From top to bottom:
 - `↻ Refresh usage`
 - `− Remove account` submenu. It lists every saved account as `[Claude] email` or `[Codex] email`, including the active one. Choosing the active account shows an alert instead of removing it: "You cannot remove the active Claude Code account. Switch first." (or "… active Codex CLI account …").
 - `↺ Reset Codex usage` submenu. It lists the Codex accounts that can apply a reset right now, as `email (N available)`. If none can, it shows one disabled item: `No reset applicable now`.
+- `Start at login` registers a per-user launch agent that opens the app when you log in; the app needs to run from its installed location.
 - `⏻ Quit`
 
 ### Usage display
@@ -200,6 +203,8 @@ cd claude-account-switcher
 
 `build_local.sh` creates a `.venv`, installs the package in editable mode, runs py2app, then copies the `@rpath` dylibs that py2app skips (libffi, libssl, libcrypto and their dependencies) into the bundle and re-signs it ad hoc. Without that step the app either fails to launch (libffi) or cannot make HTTPS calls and shows "Usage unavailable". `build_app.sh` runs the same py2app step on its own. `build_local.sh` does not call it; it repeats that step and adds the editable install and the dylib copying around it.
 
+Run `./build_local.sh --install` to also copy the built app to `/Applications`.
+
 To run from source instead of building the app:
 
 ```bash
@@ -215,7 +220,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 454 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 476 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
