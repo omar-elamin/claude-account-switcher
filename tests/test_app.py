@@ -3,6 +3,7 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,7 @@ fake_rumps.quit_application = MagicMock()
 
 fake_foundation = types.ModuleType("Foundation")
 fake_foundation.NSOperationQueue = MagicMock()
+fake_foundation.NSBundle = MagicMock()
 
 @pytest.fixture
 def app_module():
@@ -869,3 +871,77 @@ def test_auto_switch_notification_reason(app_module, tmp_path, reason):
         title="Claude Switcher",
         subtitle="Auto-switched Claude Code early" if reason == "proactive" else "Auto-switched Claude Code",
         message="target: its quota expires sooner" if reason == "proactive" else "target")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_start_at_login_menu_position_and_checkmark(app_module, tmp_path, enabled):
+    app = _reset_app(app_module, tmp_path)
+    with patch.object(app_module.rumps, "MenuItem", ResetMenuItem), \
+         patch.object(app_module.login_item, "is_enabled", return_value=enabled):
+        app_module.ClaudeSwitcherApp._rebuild_menu(app)
+    items = [call.args[0] for call in app.menu.add.call_args_list]
+    assert items[-3] is app_module.rumps.separator
+    assert items[-2].title == "Start at login"
+    assert items[-2].state == int(enabled)
+    assert items[-2].callback == app._on_toggle_start_at_login
+    assert items[-1].title == "⏻  Quit"
+
+
+def test_start_at_login_from_source_notifies_without_toggling(app_module, tmp_path):
+    app = _app_shell(app_module, tmp_path)
+    sender = SimpleNamespace(state=0)
+    fake_rumps.notification.reset_mock()
+    with patch.object(app_module, "NSBundle") as bundle, \
+         patch.object(app_module, "login_item") as login_item:
+        bundle.mainBundle.return_value.bundlePath.return_value = "/usr/local/bin/python3"
+        app._on_toggle_start_at_login(sender)
+    assert login_item.mock_calls == []
+    assert sender.state == 0
+    fake_rumps.notification.assert_called_once_with(
+        title="Claude Switcher",
+        subtitle="Start at login needs the built app",
+        message="Run the app from /Applications (build with ./build_local.sh --install).",
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_start_at_login_toggle_from_bundle(app_module, tmp_path, enabled):
+    app = _app_shell(app_module, tmp_path)
+    sender = SimpleNamespace(state=int(enabled))
+    path = "/Applications/Claude Switcher.app"
+    fake_rumps.notification.reset_mock()
+    with patch.object(app_module, "NSBundle") as bundle, \
+         patch.object(app_module, "login_item") as login_item:
+        bundle.mainBundle.return_value.bundlePath.return_value = path
+        login_item.is_enabled.return_value = enabled
+        app._on_toggle_start_at_login(sender)
+    if enabled:
+        login_item.disable.assert_called_once_with()
+        login_item.enable.assert_not_called()
+    else:
+        login_item.enable.assert_called_once_with(Path(path))
+        login_item.disable.assert_not_called()
+    assert sender.state == int(not enabled)
+    fake_rumps.notification.assert_called_once_with(
+        title="Claude Switcher",
+        subtitle="Start at login disabled" if enabled else "Start at login enabled",
+        message="Claude Switcher will not open at login." if enabled else path,
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_start_at_login_failure_notifies(app_module, tmp_path, enabled):
+    app = _app_shell(app_module, tmp_path)
+    sender = SimpleNamespace(state=int(enabled))
+    fake_rumps.notification.reset_mock()
+    with patch.object(app_module, "NSBundle") as bundle, \
+         patch.object(app_module, "login_item") as login_item:
+        bundle.mainBundle.return_value.bundlePath.return_value = "/Applications/Claude Switcher.app"
+        login_item.is_enabled.return_value = enabled
+        login_item.enable.side_effect = RuntimeError("Permission denied")
+        login_item.disable.side_effect = RuntimeError("Permission denied")
+        app._on_toggle_start_at_login(sender)
+    assert sender.state == int(enabled)
+    fake_rumps.notification.assert_called_once_with(
+        title="Claude Switcher", subtitle="Start at login failed", message="Permission denied",
+    )
