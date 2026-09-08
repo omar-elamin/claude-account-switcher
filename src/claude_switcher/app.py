@@ -712,7 +712,7 @@ class ClaudeSwitcherApp(rumps.App):
         accounts = load_accounts(self.config_path)
         best = choose_fefo_target(
             provider, accounts, self._usage_state_cache, self._has_credentials,
-            settings.auto_switch_threshold,
+            settings.auto_switch_threshold, active_email=active.email,
         )
         exhausted = should_auto_switch(active_state, True, settings.auto_switch_threshold)
         if not exhausted:

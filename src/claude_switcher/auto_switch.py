@@ -99,14 +99,25 @@ def fefo_key(state: UsageState | None, provider: str) -> tuple[float, float]:
             -(100 - target.percent))
 
 
+TIE_SECONDS = 3600.0
+
+
 def choose_fefo_target(
     provider: str,
     accounts: list[AccountInfo],
     usage_by_account: dict[AccountKey, UsageState],
     has_credentials: Callable[[AccountInfo], bool],
     threshold: float = 100.0,
+    active_email: str | None = None,
+    tie_seconds: float = TIE_SECONDS,
 ) -> AccountInfo | None:
-    """Choose a usable account by reset time, including active; ties keep list order."""
+    """Choose a usable account by earliest target-window reset, including the active one.
+
+    Resets within tie_seconds of the earliest count as a tie. Among tied accounts the
+    active account wins, so two accounts with the same reset time do not swap back and
+    forth as their leftovers drift; otherwise the most leftover wins, then list order.
+    Optimality does not depend on the tie-break (any tie rule is optimal).
+    """
     candidates = []
     for account in accounts:
         if account.provider != provider or not has_credentials(account):
@@ -114,6 +125,12 @@ def choose_fefo_target(
         state = usage_by_account.get(account_key(account))
         if state is not None and state.available and not state.is_exhausted(threshold):
             candidates.append(account)
-    return min(candidates,
-               key=lambda account: fefo_key(usage_by_account[account_key(account)], provider),
-               default=None)
+    if not candidates:
+        return None
+    keys = {account.email: fefo_key(usage_by_account[account_key(account)], provider) for account in candidates}
+    earliest = min(key[0] for key in keys.values())
+    tied = [a for a in candidates if keys[a.email][0] == earliest or keys[a.email][0] - earliest <= tie_seconds]
+    for account in tied:
+        if account.email == active_email:
+            return account
+    return min(tied, key=lambda account: keys[account.email][1])

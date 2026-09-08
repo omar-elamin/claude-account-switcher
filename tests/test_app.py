@@ -761,7 +761,7 @@ def fefo_app(app_module, tmp_path, request, monkeypatch):
     set_auto_switch_enabled(provider, True, app.config_path)
     app._usage_state_cache = {
         (provider, a.email): UsageState(True, "", (UsageWindow("7d", 20, resets_at=reset),))
-        for a, reset in zip(accounts, (300, 200, 100))
+        for a, reset in zip(accounts, (300 * 3600, 200 * 3600, 100 * 3600))
     }
     app._has_credentials = lambda a: True
     switch = MagicMock()
@@ -787,7 +787,7 @@ def test_proactive_switch_guards(fefo_app, guard):
     elif guard == "pin":
         app._manual_pin[provider] = "active"
     elif guard == "active-best":
-        app._usage_state_cache[(provider, "active")] = UsageState(True, "", (UsageWindow("7d", 20, resets_at=50),))
+        app._usage_state_cache[(provider, "active")] = UsageState(True, "", (UsageWindow("7d", 20, resets_at=50 * 3600),))
     elif guard == "cooldown":
         app._last_auto_switch_attempt[provider] = 950
     elif guard == "disabled":
@@ -809,7 +809,7 @@ def test_exhausted_switch_uses_best_or_unknown_fallback(fefo_app, fallback):
     app, provider, switch = fefo_app
     set_proactive_switch_enabled(False, app.config_path)
     app._manual_pin[provider] = "active"
-    full = UsageState(True, "", (UsageWindow("7d", 100, resets_at=50),))
+    full = UsageState(True, "", (UsageWindow("7d", 100, resets_at=50 * 3600),))
     app._usage_state_cache[(provider, "active")] = full
     if fallback:
         app._usage_state_cache = {key: full for key in app._usage_state_cache}
