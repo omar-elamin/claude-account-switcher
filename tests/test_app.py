@@ -925,7 +925,7 @@ def test_start_at_login_toggle_from_bundle(app_module, tmp_path, enabled):
     fake_rumps.notification.assert_called_once_with(
         title="Claude Switcher",
         subtitle="Start at login disabled" if enabled else "Start at login enabled",
-        message="Claude Switcher will not open at login." if enabled else path,
+        message="Claude Switcher will not open at your next login." if enabled else f"Claude Switcher will open at your next login. ({path})",
     )
 
 

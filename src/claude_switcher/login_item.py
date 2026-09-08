@@ -1,10 +1,14 @@
-"""Manage the per-user launchd agent for starting at login."""
+"""Start at login via a per-user launch agent file.
 
-import os
+Enabling writes ~/Library/LaunchAgents/<LABEL>.plist; disabling removes it. macOS loads
+LaunchAgents at login, so both take effect at the next login. Nothing here calls
+launchctl on purpose: bootstrapping the agent while the app is running starts a second
+copy of the app (RunAtLoad), and booting it out would quit the app when it was started by
+launchd. Enabled state is simply whether the file exists.
+"""
+
 import plistlib
-import subprocess
 from pathlib import Path
-
 
 LABEL = "com.emilejouannet.claude-switcher"
 
@@ -17,35 +21,33 @@ def is_enabled(home: Path = Path.home()) -> bool:
     return plist_path(home).exists()
 
 
-def enable(bundle_path: Path, home: Path = Path.home(), run=subprocess.run) -> None:
-    path = plist_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as file:
-        plistlib.dump({
-            "Label": LABEL,
-            "ProgramArguments": [str(bundle_path / "Contents" / "MacOS" / "Claude Switcher")],
-            "RunAtLoad": True,
-            "KeepAlive": False,
-            "ProcessType": "Interactive",
-        }, file)
+def plist_contents(bundle_path: Path) -> dict:
+    return {
+        "Label": LABEL,
+        "ProgramArguments": [str(Path(bundle_path) / "Contents" / "MacOS" / "Claude Switcher")],
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "ProcessType": "Interactive",
+    }
 
-    domain = f"gui/{os.getuid()}"
+
+def enable(bundle_path: Path, home: Path = Path.home()) -> None:
+    """Write the launch agent for the given bundle. Takes effect at the next login."""
+    path = plist_path(home)
     try:
-        result = run(["launchctl", "bootstrap", domain, str(path)], capture_output=True, text=True)
-        if result.returncode and (result.returncode == 5 or "already" in (result.stderr or "").lower()):
-            result = run(["launchctl", "enable", f"{domain}/{LABEL}"], capture_output=True, text=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as file:
+            plistlib.dump(plist_contents(bundle_path), file)
     except OSError as exc:
-        raise RuntimeError(f"Could not enable start at login: {exc}") from exc
-    if result.returncode:
-        raise RuntimeError(f"Could not enable start at login: {(result.stderr or '').strip() or 'launchctl failed.'}")
+        raise RuntimeError(f"Could not write the launch agent: {exc}") from exc
 
 
-def disable(home: Path = Path.home(), run=subprocess.run) -> None:
+def disable(home: Path = Path.home()) -> None:
+    """Remove the launch agent. Takes effect at the next login; the running app is untouched."""
     path = plist_path(home)
-    if not path.exists():
-        return
     try:
-        run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True, text=True)
-    except OSError:
-        pass
-    path.unlink(missing_ok=True)
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(f"Could not remove the launch agent: {exc}") from exc

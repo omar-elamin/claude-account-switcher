@@ -512,7 +512,7 @@ class ClaudeSwitcherApp(rumps.App):
             rumps.notification(
                 title="Claude Switcher",
                 subtitle="Start at login enabled" if enabled else "Start at login disabled",
-                message=bundle_path if enabled else "Claude Switcher will not open at login.",
+                message=f"Claude Switcher will open at your next login. ({bundle_path})" if enabled else "Claude Switcher will not open at your next login.",
             )
         except RuntimeError as exc:
             rumps.notification(

@@ -49,7 +49,7 @@ From top to bottom:
 - `↻ Refresh usage`
 - `− Remove account` submenu. It lists every saved account as `[Claude] email` or `[Codex] email`, including the active one. Choosing the active account shows an alert instead of removing it: "You cannot remove the active Claude Code account. Switch first." (or "… active Codex CLI account …").
 - `↺ Reset Codex usage` submenu. It lists the Codex accounts that can apply a reset right now, as `email (N available)`. If none can, it shows one disabled item: `No reset applicable now`.
-- `Start at login` registers a per-user launch agent that opens the app when you log in; the agent points at wherever the app bundle is, so run it from /Applications (`./build_local.sh --install`) to keep that path stable.
+- `Start at login` writes a per-user launch agent that opens the app when you log in (takes effect at your next login; turning it off removes the agent); the agent points at wherever the app bundle is, so run it from /Applications (`./build_local.sh --install`) to keep that path stable.
 - `⏻ Quit`
 
 ### Usage display
@@ -220,7 +220,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 476 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 471 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
