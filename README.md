@@ -110,7 +110,7 @@ codex login status
 
 Auto-switch is off by default and is set per provider. When it is on for a provider, the app evaluates on every usage refresh which usable account should be active: the one whose target window resets soonest (Codex: the weekly window; Claude: the Fable window, or the 7-day window if the account has no Fable limit), and among ties the one with the most left. Budget left in a window is lost when it resets, so using the soonest-expiring quota first wastes the least. An account counts as usable when it has valid credentials, known usage, and no window at 100%.
 
-With 'Use expiring quota first' on (the default), the app switches to that account even while the active one still has room. With it off, the app switches only when the active account reaches 100%, and then to that account. Either way it never crosses providers, keeps a 60-second gap between attempts per provider, and does not switch away from an account you chose by hand until that account runs out. If no account with known usage has room, it falls back to a saved account whose usage is unknown.
+With 'Use expiring quota first' on (the default), the app switches to that account even while the active one still has room. A weekly window's clock only starts when the account is first used, so an account that has not been used since its reset is full but earns no refill; when no usable account's window expires within the next day, the app switches to such an account to start its clock, then goes back to using the soonest-expiring quota. With it off, the app switches only when the active account reaches 100%, and then to that account. Either way it never crosses providers, keeps a 60-second gap between attempts per provider, and does not switch away from an account you chose by hand until that account runs out. If no account with known usage has room, it falls back to a saved account whose usage is unknown.
 
 ### Rate-limit resets
 
@@ -220,7 +220,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 471 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 480 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 

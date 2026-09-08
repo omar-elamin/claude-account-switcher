@@ -196,5 +196,84 @@ def test_fefo_tie_without_active_prefers_most_leftover_then_order():
 
 def test_fefo_two_untouched_accounts_tie_and_keep_active():
     a, b = _account("a@test.com", "claude", True), _account("b@test.com", "claude")
-    usage = {account_key(a): _state(5, None, "Fable"), account_key(b): _state(0, None, "Fable")}
+    usage = {account_key(a): _state(0, None, "Fable"), account_key(b): _state(0, None, "Fable")}  # both genuinely unused
     assert choose_fefo_target("claude", [a, b], usage, lambda _: True, active_email="a@test.com") == a
+
+
+NOW = 1_000_000.0
+DAY = 86400.0
+
+
+def _acc(email, provider="claude", active=False):
+    return _account(email, provider, active)
+
+
+def _st(percent, resets_at, label="Fable"):
+    return UsageState(True, "", (UsageWindow(label, percent, resets_at=resets_at),))
+
+
+def test_is_untouched_claude_and_codex():
+    from claude_switcher.auto_switch import is_untouched
+    assert is_untouched(_st(0, None), "claude", NOW) is True                         # Claude: no reset yet
+    assert is_untouched(_st(12, None), "claude", NOW) is False                       # used: clock running, whatever the field says
+    assert is_untouched(_st(40, NOW + 3 * DAY), "claude", NOW) is False
+    assert is_untouched(_st(0, NOW + 7 * DAY, "7d"), "codex", NOW) is True            # Codex: full week away, nothing used
+    assert is_untouched(_st(0, NOW + 7 * DAY - 600, "7d"), "codex", NOW) is True      # within tolerance
+    assert is_untouched(_st(5, NOW + 7 * DAY, "7d"), "codex", NOW) is False           # used: clock running
+    assert is_untouched(_st(0, NOW + 6 * DAY, "7d"), "codex", NOW) is False
+    assert is_untouched(None, "claude", NOW) is False
+
+
+def test_quiet_period_starts_an_untouched_clock():
+    running = _acc("running@test.com", active=True); fresh = _acc("fresh@test.com")
+    usage = {account_key(running): _st(40, NOW + 3 * DAY), account_key(fresh): _st(0, None)}
+    chosen = choose_fefo_target("claude", [running, fresh], usage, lambda _: True, active_email="running@test.com", now=NOW)
+    assert chosen == fresh
+
+
+def test_expiring_soon_beats_starting_a_clock():
+    running = _acc("running@test.com", active=True); fresh = _acc("fresh@test.com")
+    usage = {account_key(running): _st(40, NOW + 6 * 3600), account_key(fresh): _st(0, None)}
+    chosen = choose_fefo_target("claude", [running, fresh], usage, lambda _: True, active_email="running@test.com", now=NOW)
+    assert chosen == running
+
+
+def test_codex_floating_reset_counts_as_untouched_only_when_unused():
+    running = _acc("running@test.com", "codex", active=True); a = _acc("a@test.com", "codex"); b = _acc("b@test.com", "codex")
+    usage = {account_key(running): _st(30, NOW + 2 * DAY, "7d"), account_key(a): _st(0, NOW + 7 * DAY, "7d"),
+             account_key(b): _st(5, NOW + 7 * DAY - 100, "7d")}
+    chosen = choose_fefo_target("codex", [running, a, b], usage, lambda _: True, active_email="running@test.com", now=NOW)
+    assert chosen == a
+
+
+def test_all_untouched_active_wins_tie():
+    a = _acc("a@test.com", active=True); b = _acc("b@test.com")
+    usage = {account_key(a): _st(0, None), account_key(b): _st(0, None)}
+    assert choose_fefo_target("claude", [a, b], usage, lambda _: True, active_email="a@test.com", now=NOW) == a
+
+
+def test_no_untouched_falls_back_to_earliest_reset():
+    a = _acc("a@test.com", active=True); b = _acc("b@test.com")
+    usage = {account_key(a): _st(40, NOW + 3 * DAY), account_key(b): _st(20, NOW + 2 * DAY)}
+    assert choose_fefo_target("claude", [a, b], usage, lambda _: True, active_email="a@test.com", now=NOW) == b
+
+
+def test_quiet_window_can_be_disabled():
+    running = _acc("running@test.com", active=True); fresh = _acc("fresh@test.com")
+    usage = {account_key(running): _st(40, NOW + 3 * DAY), account_key(fresh): _st(0, None)}
+    chosen = choose_fefo_target("claude", [running, fresh], usage, lambda _: True, active_email="running@test.com", now=NOW, quiet_seconds=10 * DAY)
+    assert chosen == running   # a 10-day quiet requirement is never met here
+
+
+def test_quiet_boundary_is_exclusive_at_exactly_24h():
+    running = _acc("running@test.com", active=True); fresh = _acc("fresh@test.com")
+    usage = {account_key(running): _st(40, NOW + 24 * 3600), account_key(fresh): _st(0, None)}
+    assert choose_fefo_target("claude", [running, fresh], usage, lambda _: True, active_email="running@test.com", now=NOW) == running
+    usage[account_key(running)] = _st(40, NOW + 24 * 3600 + 1)
+    assert choose_fefo_target("claude", [running, fresh], usage, lambda _: True, active_email="running@test.com", now=NOW) == fresh
+
+
+def test_untouched_tolerance_boundary_is_inclusive():
+    from claude_switcher.auto_switch import is_untouched
+    assert is_untouched(_st(0, NOW + 7 * DAY - 15 * 60, "7d"), "codex", NOW) is True
+    assert is_untouched(_st(0, NOW + 7 * DAY - 15 * 60 - 1, "7d"), "codex", NOW) is False
