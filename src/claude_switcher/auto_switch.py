@@ -109,18 +109,18 @@ UNTOUCHED_TOLERANCE_SECONDS = 15 * 60.0
 def is_untouched(state: UsageState | None, provider: str, now: float) -> bool:
     """True when the target window's clock has not started.
 
-    A window's clock starts at first use after a reset. Until then Claude reports no
-    reset time at all, and Codex reports a reset a full week away with nothing used.
+    A window's clock starts at first use after a reset. Until then nothing is used and
+    Claude reports no reset time at all, while Codex reports a reset a full week away.
     Such an account is at 100% but generates no refill until it is used, so starting
     its clock early (when nothing else is about to expire) brings its next refill
     forward by up to a week.
     """
     window = target_window(state, provider)
-    if window is None:
-        return False
+    if window is None or window.percent != 0:
+        return False          # anything used means the clock is running, whatever the reset field says
     if window.resets_at is None:
         return True
-    return window.percent == 0 and window.resets_at - now >= WEEK_SECONDS - UNTOUCHED_TOLERANCE_SECONDS
+    return window.resets_at - now >= WEEK_SECONDS - UNTOUCHED_TOLERANCE_SECONDS
 
 
 def choose_fefo_target(
@@ -163,7 +163,7 @@ def choose_fefo_target(
     untouched = [a for a in candidates if is_untouched(usage_by_account[account_key(a)], provider, now)]
     running = [a for a in candidates if a not in untouched]
     quiet = not any(keys[a.email][0] - now <= quiet_seconds for a in running)
-    pool = untouched if (untouched and quiet) else (running or untouched)
+    pool = untouched if (untouched and quiet) else running   # running is non-empty here: no running means quiet
     earliest = min(keys[a.email][0] for a in pool)
     tied = [a for a in pool if keys[a.email][0] == earliest or keys[a.email][0] - earliest <= tie_seconds]
     for account in tied:
