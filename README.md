@@ -49,7 +49,7 @@ From top to bottom:
 - `↻ Refresh usage`
 - `− Remove account` submenu. It lists every saved account as `[Claude] email` or `[Codex] email`, including the active one. Choosing the active account shows an alert instead of removing it: "You cannot remove the active Claude Code account. Switch first." (or "… active Codex CLI account …").
 - `↺ Reset Codex usage` submenu. It lists the Codex accounts that can apply a reset right now, as `email (N available)`. If none can, it shows one disabled item: `No reset applicable now`.
-- `Start at login` registers a per-user launch agent that opens the app when you log in; the app needs to run from its installed location.
+- `Start at login` registers a per-user launch agent that opens the app when you log in; the agent points at wherever the app bundle is, so run it from /Applications (`./build_local.sh --install`) to keep that path stable.
 - `⏻ Quit`
 
 ### Usage display
