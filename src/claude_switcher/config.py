@@ -32,6 +32,8 @@ class AppSettings:
     auto_switch_threshold: float = 100.0
     auto_reset: dict[str, bool] = field(default_factory=lambda: {"codex": False})
     proactive_switch: bool = True
+    codex_gateway: bool = False
+    codex_gateway_port: int = 8790
 
 
 def _default_settings_dict() -> dict:
@@ -150,8 +152,22 @@ def _settings_from_dict(data: dict | None) -> AppSettings:
         # A hand-edited config may hold "false"/"0"; bool("false") is True.
         proactive_switch = proactive_switch.strip().lower() not in ("false", "0", "no", "off", "")
 
+    gateway = data.get("codex_gateway", defaults.codex_gateway)
+    if not isinstance(gateway, (bool, int, float, str)):
+        gateway = defaults.codex_gateway
+    if isinstance(gateway, str):
+        gateway = gateway.strip().lower() not in ("false", "0", "no", "off", "")
+    try:
+        raw_port = data.get("codex_gateway_port", defaults.codex_gateway_port)
+        port = int(raw_port)
+        if isinstance(raw_port, bool) or not 1 <= port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        port = defaults.codex_gateway_port
+
     return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold,
-                       auto_reset=auto_reset, proactive_switch=bool(proactive_switch))
+                       auto_reset=auto_reset, proactive_switch=bool(proactive_switch),
+                       codex_gateway=bool(gateway), codex_gateway_port=port)
 
 
 def load_accounts(path: Path = DEFAULT_CONFIG_PATH) -> list[AccountInfo]:
@@ -279,4 +295,12 @@ def set_proactive_switch_enabled(
     with _LOCK:
         settings = load_settings(path)
         settings.proactive_switch = bool(enabled)
+        save_settings(settings, path)
+
+
+def set_codex_gateway_enabled(enabled: bool, path: Path = DEFAULT_CONFIG_PATH) -> None:
+    """Enable or disable the local Codex gateway without changing accounts."""
+    with _LOCK:
+        settings = load_settings(path)
+        settings.codex_gateway = bool(enabled)
         save_settings(settings, path)

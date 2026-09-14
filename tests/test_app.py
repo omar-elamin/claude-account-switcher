@@ -945,3 +945,209 @@ def test_start_at_login_failure_notifies(app_module, tmp_path, enabled):
     fake_rumps.notification.assert_called_once_with(
         title="Claude Switcher", subtitle="Start at login failed", message="Permission denied",
     )
+
+
+@pytest.fixture
+def gateway_app(app_module, tmp_path, monkeypatch):
+    import threading
+    from claude_switcher.config import AccountInfo, save_accounts, set_auto_switch_enabled
+    from claude_switcher.usage_state import UsageState, UsageWindow
+    app = _app_shell(app_module, tmp_path)
+    app._gateway = None
+    app._gateway_lock = threading.Lock()
+    app._last_gateway_switch = None
+    app._last_auto_switch_attempt = {}
+    accounts = [AccountInfo(email, 'plus', '', email == 'active@test.com', email, provider='codex')
+                for email in ['active@test.com', 'later@test.com', 'earliest@test.com']]
+    save_accounts(accounts, app.config_path)
+    set_auto_switch_enabled('codex', True, app.config_path)
+    app._usage_state_cache = {
+        ('codex', account.email): UsageState(True, '20%', (UsageWindow('7d', 20, resets_at=reset),))
+        for account, reset in zip(accounts, [300000, 200000, 100000])
+    }
+    app._has_credentials = MagicMock(return_value=True)
+    switch = MagicMock()
+    monkeypatch.setitem(app_module.PROVIDERS['codex'], 'switch', switch)
+    monkeypatch.setattr(app_module, '_on_main_thread', lambda fn: fn())
+    fake_rumps.notification.reset_mock()
+    return app, switch
+
+
+def test_gateway_toggle_on(gateway_app, app_module):
+    from claude_switcher.config import load_settings
+    app, _ = gateway_app
+    with patch.object(app_module, 'Gateway') as factory, patch.object(app_module, 'enable_config') as write:
+        app._on_toggle_codex_gateway(SimpleNamespace(state=0))
+        factory.assert_called_once_with('127.0.0.1', 8790, app._gateway_token_provider, app._gateway_on_usage_limit)
+        factory.return_value.start.assert_called_once()
+        write.assert_called_once_with(8790)
+        assert app._gateway is factory.return_value
+    assert load_settings(app.config_path).codex_gateway
+    assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Codex gateway on'
+
+
+def test_gateway_toggle_port_busy(gateway_app, app_module):
+    from claude_switcher.config import load_settings
+    app, _ = gateway_app
+    with patch.object(app_module, 'Gateway') as factory, patch.object(app_module, 'enable_config') as write:
+        factory.return_value.start.side_effect = OSError('Address already in use')
+        app._on_toggle_codex_gateway(SimpleNamespace(state=0))
+        write.assert_not_called()
+    assert not load_settings(app.config_path).codex_gateway
+    assert app._gateway is None
+    assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Codex gateway could not start'
+    assert 'Address already in use' in fake_rumps.notification.call_args.kwargs['message']
+
+
+def test_gateway_toggle_config_failure_cleans_up(gateway_app, app_module):
+    from claude_switcher.config import load_settings
+    app, _ = gateway_app
+    with patch.object(app_module, 'Gateway') as factory, patch.object(app_module, 'enable_config', side_effect=RuntimeError('invalid TOML')):
+        app._on_toggle_codex_gateway(SimpleNamespace(state=0))
+        factory.return_value.stop.assert_called_once()
+    assert not load_settings(app.config_path).codex_gateway
+    assert app._gateway is None
+
+
+def test_gateway_toggle_off(gateway_app, app_module):
+    from claude_switcher.config import load_settings, set_codex_gateway_enabled
+    app, _ = gateway_app
+    set_codex_gateway_enabled(True, app.config_path)
+    server = app._gateway = MagicMock()
+    with patch.object(app_module, 'disable_config') as write:
+        app._on_toggle_codex_gateway(SimpleNamespace(state=1))
+        write.assert_called_once_with()
+        server.stop.assert_called_once()
+    assert app._gateway is None
+    assert not load_settings(app.config_path).codex_gateway
+    assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Codex gateway off'
+
+
+def test_gateway_limit_auto_switch_off(gateway_app):
+    from claude_switcher.config import set_auto_switch_enabled
+    app, switch = gateway_app
+    set_auto_switch_enabled('codex', False, app.config_path)
+    assert app._gateway_on_usage_limit('active@test.com') is False
+    switch.assert_not_called()
+
+
+def test_gateway_limit_earliest_reset(gateway_app):
+    app, switch = gateway_app
+    assert app._gateway_on_usage_limit('active@test.com') is True
+    switch.assert_called_once_with('earliest@test.com', app.config_path)
+    assert app._usage_state_cache[('codex', 'active@test.com')].is_exhausted()
+    assert app._last_auto_switch_attempt['codex'] > 0
+    assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Auto-switched Codex CLI mid-session'
+    assert fake_rumps.notification.call_args.kwargs['message'] == 'earliest@test.com: the previous account hit its limit'
+    app._rebuild_menu.assert_called_once()
+    app._fetch_all_usage.assert_called_once()
+
+
+def test_gateway_limit_unknown_fallback(gateway_app):
+    app, switch = gateway_app
+    app._usage_state_cache = {}
+    assert app._gateway_on_usage_limit('active@test.com') is True
+    switch.assert_called_once_with('later@test.com', app.config_path)
+
+
+def test_gateway_limit_no_target(gateway_app):
+    app, switch = gateway_app
+    app._has_credentials.return_value = False
+    assert app._gateway_on_usage_limit('active@test.com') is False
+    switch.assert_not_called()
+    assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Codex CLI limit reached'
+    assert fake_rumps.notification.call_args.kwargs['message'] == 'No available account to switch to.'
+
+
+def test_gateway_limit_loop_guard(gateway_app):
+    import time
+    app, switch = gateway_app
+    app._last_gateway_switch = time.time() - 10
+    assert app._gateway_on_usage_limit('active@test.com') is False
+    switch.assert_not_called()
+
+
+def test_gateway_limit_switch_error(gateway_app):
+    app, switch = gateway_app
+    switch.side_effect = RuntimeError('switch failed')
+    assert app._gateway_on_usage_limit('active@test.com') is False
+    assert fake_rumps.notification.call_args.kwargs['message'] == 'switch failed'
+    assert app._last_gateway_switch is None
+
+
+def test_gateway_limit_stale_account_does_not_switch(gateway_app):
+    app, switch = gateway_app
+    assert app._gateway_on_usage_limit('old@test.com') is False
+    switch.assert_not_called()
+    assert not app._usage_state_cache[('codex', 'active@test.com')].is_exhausted()
+
+
+def test_gateway_overlapping_limits_switch_only_once(gateway_app):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    app, switch = gateway_app
+    barrier = threading.Barrier(2)
+
+    def limited():
+        barrier.wait(timeout=3)
+        return app._gateway_on_usage_limit('active@test.com')
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: limited(), range(2)))
+    assert sorted(results) == [False, True]
+    switch.assert_called_once()
+
+
+def _gateway_credentials(expiry, token_id='old'):
+    import base64
+    import json
+    payload = base64.urlsafe_b64encode(json.dumps({'exp': expiry, 'jti': token_id}).encode()).decode().rstrip('=')
+    return json.dumps({'email': 'active@test.com', 'tokens': {'access_token': f'e30.{payload}.sig', 'refresh_token': token_id}})
+
+
+def test_gateway_token_provider_reads_live_token(gateway_app, app_module):
+    import json
+    import time
+    app, _ = gateway_app
+    live = _gateway_credentials(time.time() + 3600)
+    with patch.object(app_module.codex_core, 'read_codex_credentials', return_value=live), patch.object(app_module.codex_core, 'refresh_codex_credentials') as refresh:
+        assert app._gateway_token_provider() == ('active@test.com', json.loads(live)['tokens']['access_token'])
+        refresh.assert_not_called()
+
+
+def test_gateway_token_refresh_updates_live_and_backup_once(gateway_app, app_module, tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import json
+    import threading
+    import time
+    app, _ = gateway_app
+    path = tmp_path / 'auth.json'
+    old = _gateway_credentials(time.time() + 30)
+    fresh = _gateway_credentials(time.time() + 3600, 'fresh')
+    path.write_text(old)
+    monkeypatch.setattr(app_module.codex_core, 'CODEX_AUTH_FILE', path)
+    monkeypatch.setattr(app_module.codex_core, 'read_codex_credentials', path.read_text)
+    barrier = threading.Barrier(2)
+
+    def read_token():
+        barrier.wait(timeout=3)
+        return app._gateway_token_provider()
+
+    with patch.object(app_module.codex_core, 'refresh_codex_credentials', return_value=fresh) as refresh, patch.object(app_module.keychain, 'write_credentials') as backup:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(read_token) for _ in range(2)]
+            results = [future.result(timeout=3) for future in futures]
+        refresh.assert_called_once_with(old)
+        backup.assert_called_once_with('codex-switcher:active@test.com', 'active@test.com', fresh)
+    assert path.read_text() == fresh
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert results == [('active@test.com', json.loads(fresh)['tokens']['access_token'])] * 2
+
+
+def test_gateway_never_refreshes_inactive_token(gateway_app, app_module):
+    import time
+    app, _ = gateway_app
+    live = _gateway_credentials(time.time()).replace('active@test.com', 'inactive@test.com')
+    with patch.object(app_module.codex_core, 'read_codex_credentials', return_value=live), patch.object(app_module.codex_core, 'refresh_codex_credentials') as refresh:
+        assert app._gateway_token_provider() is None
+        refresh.assert_not_called()

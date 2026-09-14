@@ -43,7 +43,7 @@ From top to bottom:
 
 - A header per provider: `── Claude Code ──` and `── Codex CLI ──`.
 - Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted.
-- `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled". `Use expiring quota first` controls whether the app switches before the active account runs out.
+- `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled". `Use expiring quota first` controls whether the app switches before the active account runs out. Below it, `Codex gateway (switch running sessions)` turns the local gateway on or off, with a checkmark when enabled.
 - `Auto-reset` submenu with one item, `Codex CLI`, with a checkmark when enabled. Clicking it toggles the setting, and a notification says "Enabled" or "Disabled".
 - `✚ Add Claude account...` and `✚ Add Codex account...`
 - `↻ Refresh usage`
@@ -111,6 +111,24 @@ codex login status
 Auto-switch is off by default and is set per provider. When it is on for a provider, the app evaluates on every usage refresh which usable account should be active: the one whose target window resets soonest (Codex: the weekly window; Claude: the Fable window, or the 7-day window if the account has no Fable limit), and among ties the one with the most left. Budget left in a window is lost when it resets, so using the soonest-expiring quota first wastes the least. An account counts as usable when it has valid credentials, known usage, and no window at 100%.
 
 With 'Use expiring quota first' on (the default), the app switches to that account even while the active one still has room. A weekly window's clock only starts when the account is first used, so an account that has not been used since its reset is full but earns no refill; when no usable account's window expires within the next day, the app switches to such an account to start its clock, then goes back to using the soonest-expiring quota. With it off, the app switches only when the active account reaches 100%, and then to that account. Either way it never crosses providers, keeps a 60-second gap between attempts per provider, and does not switch away from an account you chose by hand until that account runs out. If no account with known usage has room, it falls back to a saved account whose usage is unknown.
+
+### Codex gateway
+
+Turn on `Auto-switch → Codex gateway (switch running sessions)` to let running Codex sessions follow account switches. Codex normally keeps its token in memory, so replacing `~/.codex/auth.json` does not change the account a running session uses when it hits a usage limit. The gateway sends each authenticated request with the active account's token.
+
+The gateway listens only on `127.0.0.1`, on port `8790` by default. It writes this block at the top of `~/.codex/config.toml` to send Codex traffic through it:
+
+```toml
+# managed by Claude Switcher: Codex gateway
+openai_base_url = "http://127.0.0.1:8790/backend-api/codex"
+chatgpt_base_url = "http://127.0.0.1:8790/backend-api/"
+```
+
+The app keeps a one-time backup at `~/.codex/config.toml.claude-switcher.bak`. Turning the gateway off removes the managed block. Restart open Codex CLI and desktop sessions once whenever you turn the gateway on or off so they read the new settings. Keep Claude Switcher running while the gateway is on.
+
+With Codex auto-switch enabled, a usage-limit response makes the gateway switch to an available account and retry the same request once, so the thread can continue on the new account. Other rate-limit responses pass through unchanged. If no account is available, the gateway returns the original usage-limit response.
+
+The gateway supports HTTP/1.1 only. It refuses WebSocket upgrades so Codex uses its streaming HTTP fallback. The local port has no authentication: any local process can use it with the active account's credentials. This requires the same trust in local processes as the auth file.
 
 ### Rate-limit resets
 
@@ -220,7 +238,7 @@ Run the tests:
 pytest tests/ -q
 ```
 
-There are 480 tests. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
+There are 546 tests. Gateway transport tests use a fake upstream on loopback and skip where local socket binding is blocked. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
 
 The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
 
