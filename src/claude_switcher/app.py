@@ -603,13 +603,27 @@ class ClaudeSwitcherApp(rumps.App):
         with codex_core._CODEX_LOCK:
             if codex_core._add_in_progress:
                 return None
-            creds = codex_core.read_codex_credentials()
-            if not creds:
-                return None
-            email = codex_core._codex_email_from_credentials(creds)
             active = get_active_account(self.config_path, provider="codex")
-            if not active or not email or active.email != email:
+            if not active:
                 return None
+            creds = codex_core.read_codex_credentials()
+            email = codex_core._codex_email_from_credentials(creds) if creds else None
+            store_in_auth_file = bool(creds) and email == active.email
+            if not store_in_auth_file:
+                # The live file drifted: a running session refreshed another account's token
+                # into auth.json (or the file is missing). Serve the account the switcher marks
+                # active from its Keychain backup, and adopt the drifted session into ITS
+                # account's backup so a stale backup heals instead of reading "Login required".
+                if creds and email and email != active.email and any(
+                    a.provider == "codex" and a.email == email for a in load_accounts(self.config_path)
+                ):
+                    codex_core._validate_email(email)
+                    if keychain.read_credentials(f"codex-switcher:{email}") != creds:
+                        keychain.write_credentials(f"codex-switcher:{email}", email, creds)
+                creds = keychain.read_credentials(f"codex-switcher:{active.email}")
+                if not creds or codex_core._codex_email_from_credentials(creds) != active.email:
+                    return None
+                email = active.email
             data = json.loads(creds)
             tokens = data.get("tokens", {})
             token = tokens.get("access_token") if isinstance(tokens, dict) else None
@@ -624,11 +638,13 @@ class ClaudeSwitcherApp(rumps.App):
                 fresh_token = json.loads(refreshed).get("tokens", {}).get("access_token")
                 if not isinstance(fresh_token, str) or not fresh_token:
                     return None
-                # An external Codex login does not take our process lock.
-                if codex_core.read_codex_credentials() != creds:
-                    return None
                 codex_core._validate_email(email)
-                _atomic_write(codex_core.CODEX_AUTH_FILE, refreshed, mode=0o600)
+                if store_in_auth_file:
+                    # An external Codex login does not take our process lock.
+                    if codex_core.read_codex_credentials() != creds:
+                        return None
+                    _atomic_write(codex_core.CODEX_AUTH_FILE, refreshed, mode=0o600)
+                # The backup is the source of truth for this account either way.
                 keychain.write_credentials(f"codex-switcher:{email}", email, refreshed)
                 token = fresh_token
             return email, token

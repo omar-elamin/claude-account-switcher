@@ -1151,3 +1151,79 @@ def test_gateway_never_refreshes_inactive_token(gateway_app, app_module):
     with patch.object(app_module.codex_core, 'read_codex_credentials', return_value=live), patch.object(app_module.codex_core, 'refresh_codex_credentials') as refresh:
         assert app._gateway_token_provider() is None
         refresh.assert_not_called()
+
+
+def _gateway_credentials_for(email, expiry, token_id='old'):
+    import base64
+    import json
+    payload = base64.urlsafe_b64encode(json.dumps({'exp': expiry, 'jti': token_id}).encode()).decode().rstrip('=')
+    return json.dumps({'email': email, 'tokens': {'access_token': f'e30.{payload}.sig', 'refresh_token': token_id}})
+
+
+def _drift_setup(app_module, live_creds, backups):
+    """Patch the live auth file to `live_creds` and Keychain backups to the given dict."""
+    reads = patch.object(app_module.codex_core, 'read_codex_credentials', return_value=live_creds)
+    kc_read = patch.object(app_module.keychain, 'read_credentials', side_effect=lambda service: backups.get(service))
+    kc_write = patch.object(app_module.keychain, 'write_credentials')
+    atomic = patch.object(app_module, '_atomic_write')
+    refresh = patch.object(app_module.codex_core, 'refresh_codex_credentials')
+    return reads, kc_read, kc_write, atomic, refresh
+
+
+def test_gateway_provider_uses_backup_and_adopts_drifted_session(gateway_app, app_module):
+    import json
+    import time
+    app, _ = gateway_app
+    drifted = _gateway_credentials_for('later@test.com', time.time() + 3600, 'drift')   # a running session wrote another saved account's token
+    active_backup = _gateway_credentials_for('active@test.com', time.time() + 3600, 'act')
+    backups = {'codex-switcher:active@test.com': active_backup, 'codex-switcher:later@test.com': 'stale-blob'}
+    r, kr, kw, at, rf = _drift_setup(app_module, drifted, backups)
+    with r, kr, kw as write, at as atomic, rf as refresh:
+        assert app._gateway_token_provider() == ('active@test.com', json.loads(active_backup)['tokens']['access_token'])
+        write.assert_called_once_with('codex-switcher:later@test.com', 'later@test.com', drifted)   # stale backup healed
+        atomic.assert_not_called()          # the live file belongs to another session: never overwritten
+        refresh.assert_not_called()
+
+
+def test_gateway_provider_drift_to_unknown_account_is_not_adopted(gateway_app, app_module):
+    import time
+    app, _ = gateway_app
+    drifted = _gateway_credentials_for('stranger@test.com', time.time() + 3600)
+    backups = {'codex-switcher:active@test.com': _gateway_credentials_for('active@test.com', time.time() + 3600)}
+    r, kr, kw, at, rf = _drift_setup(app_module, drifted, backups)
+    with r, kr, kw as write, at, rf:
+        assert app._gateway_token_provider()[0] == 'active@test.com'
+        write.assert_not_called()
+
+
+def test_gateway_provider_uses_backup_when_live_file_missing(gateway_app, app_module):
+    import json
+    import time
+    app, _ = gateway_app
+    active_backup = _gateway_credentials_for('active@test.com', time.time() + 3600)
+    r, kr, kw, at, rf = _drift_setup(app_module, None, {'codex-switcher:active@test.com': active_backup})
+    with r, kr, kw, at, rf:
+        assert app._gateway_token_provider() == ('active@test.com', json.loads(active_backup)['tokens']['access_token'])
+
+
+def test_gateway_provider_none_when_backup_missing_on_drift(gateway_app, app_module):
+    import time
+    app, _ = gateway_app
+    r, kr, kw, at, rf = _drift_setup(app_module, _gateway_credentials_for('later@test.com', time.time() + 3600), {})
+    with r, kr, kw, at, rf:
+        assert app._gateway_token_provider() is None
+
+
+def test_gateway_provider_refreshes_drifted_backup_in_keychain_only(gateway_app, app_module):
+    import json
+    import time
+    app, _ = gateway_app
+    expiring = _gateway_credentials_for('active@test.com', time.time() + 30, 'exp')
+    fresh = _gateway_credentials_for('active@test.com', time.time() + 3600, 'fresh')
+    r, kr, kw, at, rf = _drift_setup(app_module, _gateway_credentials_for('later@test.com', time.time() + 3600), {'codex-switcher:active@test.com': expiring})
+    with r, kr, kw as write, at as atomic, rf as refresh:
+        refresh.return_value = fresh
+        assert app._gateway_token_provider() == ('active@test.com', json.loads(fresh)['tokens']['access_token'])
+        refresh.assert_called_once_with(expiring)
+        atomic.assert_not_called()
+        assert ('codex-switcher:active@test.com', 'active@test.com', fresh) in [c.args for c in write.call_args_list]
