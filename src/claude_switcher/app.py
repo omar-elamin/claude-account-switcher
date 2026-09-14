@@ -1,5 +1,6 @@
 """macOS menu bar application using rumps."""
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -8,6 +9,8 @@ import rumps
 from Foundation import NSBundle, NSOperationQueue
 
 from claude_switcher import codex_core, core, keychain, login_item
+from claude_switcher.codex_gateway import Gateway, enable_config, disable_config
+from claude_switcher.common import _decode_jwt_payload
 from claude_switcher.auto_switch import (
     account_key,
     choose_auto_switch_target,
@@ -36,6 +39,8 @@ from claude_switcher.config import (
     load_settings,
     set_auto_switch_enabled,
     set_proactive_switch_enabled,
+    set_codex_gateway_enabled,
+    _atomic_write,
     set_auto_reset_enabled,
     DEFAULT_CONFIG_PATH,
 )
@@ -48,7 +53,7 @@ from claude_switcher.core import (
     remove_saved_account,
 )
 from claude_switcher.usage import fetch_usage_for_account, fetch_active_usage, claude_usage_state
-from claude_switcher.usage_state import UsageState
+from claude_switcher.usage_state import UsageState, UsageWindow
 
 
 PROVIDER_LABELS = {
@@ -153,6 +158,9 @@ class ClaudeSwitcherApp(rumps.App):
         icon_path = Path(__file__).parent / "resources" / "icon.png"
         super().__init__("", icon=str(icon_path), template=True, quit_button=None)
         self.config_path = DEFAULT_CONFIG_PATH
+        self._gateway = None
+        self._gateway_lock = threading.Lock()
+        self._last_gateway_switch = None
         self._usage_cache: dict[tuple[str, str], str] = {}
         self._usage_state_cache: dict[tuple[str, str], UsageState] = {}
         self._usage_items: dict[tuple[str, str], rumps.MenuItem] = {}
@@ -169,6 +177,8 @@ class ClaudeSwitcherApp(rumps.App):
         self._manual_refresh = False      # current refresh is user-initiated -> notify when done
         self._signing_in_since: dict[str, float] = {}  # provider -> time.time() Add was clicked
         self._first_launch()
+        if load_settings(self.config_path).codex_gateway:
+            self._start_codex_gateway()
         self._rebuild_menu()
         self._fetch_all_usage()
         self._auto_switch_timer = rumps.Timer(self._on_periodic_usage_refresh, 300)
@@ -310,6 +320,9 @@ class ClaudeSwitcherApp(rumps.App):
         auto_menu.add(rumps.separator)
         item = rumps.MenuItem("Use expiring quota first", callback=self._on_toggle_proactive_switch)
         item.state = 1 if settings.proactive_switch else 0
+        auto_menu.add(item)
+        item = rumps.MenuItem("Codex gateway (switch running sessions)", callback=self._on_toggle_codex_gateway)
+        item.state = 1 if settings.codex_gateway else 0
         auto_menu.add(item)
         self.menu.add(auto_menu)
 
@@ -541,6 +554,138 @@ class ClaudeSwitcherApp(rumps.App):
             message=("Switch to the account whose quota expires soonest, before the active one runs out."
                      if enabled else "Only switch when the active account runs out."),
         )
+
+    def _start_codex_gateway(self):
+        settings = load_settings(self.config_path)
+        server = Gateway("127.0.0.1", settings.codex_gateway_port,
+                         self._gateway_token_provider, self._gateway_on_usage_limit)
+        try:
+            server.start()
+            enable_config(settings.codex_gateway_port)
+        except (OSError, RuntimeError) as exc:
+            server.stop()
+            set_codex_gateway_enabled(False, self.config_path)
+            rumps.notification(title="Claude Switcher", subtitle="Codex gateway could not start",
+                               message=str(exc))
+            return False
+        self._gateway = server
+        return True
+
+    def _on_toggle_codex_gateway(self, sender):
+        settings = load_settings(self.config_path)
+        enabled = not settings.codex_gateway
+        if enabled:
+            if not self._start_codex_gateway():
+                self._rebuild_menu()
+                return
+        else:
+            try:
+                disable_config()
+            except (OSError, RuntimeError) as exc:
+                rumps.notification(title="Claude Switcher", subtitle="Codex gateway could not stop",
+                                   message=str(exc))
+                return
+            if self._gateway is not None:
+                self._gateway.stop()
+                self._gateway = None
+        set_codex_gateway_enabled(enabled, self.config_path)
+        self._rebuild_menu()
+        rumps.notification(
+            title="Claude Switcher", subtitle=f"Codex gateway {'on' if enabled else 'off'}",
+            message=(f"Codex now goes through 127.0.0.1:{settings.codex_gateway_port}. "
+                     "Restart open Codex sessions once so they use it." if enabled else
+                     "Codex talks to OpenAI directly again. Restart open Codex sessions once."),
+        )
+
+    def _gateway_token_provider(self):
+        # This is also the lock used by switches, usage refreshes and add flows.
+        # Re-read inside it so concurrent gateway requests cannot rotate twice.
+        with codex_core._CODEX_LOCK:
+            if codex_core._add_in_progress:
+                return None
+            creds = codex_core.read_codex_credentials()
+            if not creds:
+                return None
+            email = codex_core._codex_email_from_credentials(creds)
+            active = get_active_account(self.config_path, provider="codex")
+            if not active or not email or active.email != email:
+                return None
+            data = json.loads(creds)
+            tokens = data.get("tokens", {})
+            token = tokens.get("access_token") if isinstance(tokens, dict) else None
+            if not isinstance(token, str) or not token:
+                return None
+            payload = _decode_jwt_payload(token) or {}
+            expires = payload.get("exp")
+            if isinstance(expires, (int, float)) and expires <= time.time() + 60:
+                refreshed = codex_core.refresh_codex_credentials(creds)
+                if not refreshed or codex_core._codex_email_from_credentials(refreshed) != email:
+                    return None
+                fresh_token = json.loads(refreshed).get("tokens", {}).get("access_token")
+                if not isinstance(fresh_token, str) or not fresh_token:
+                    return None
+                # An external Codex login does not take our process lock.
+                if codex_core.read_codex_credentials() != creds:
+                    return None
+                codex_core._validate_email(email)
+                _atomic_write(codex_core.CODEX_AUTH_FILE, refreshed, mode=0o600)
+                keychain.write_credentials(f"codex-switcher:{email}", email, refreshed)
+                token = fresh_token
+            return email, token
+
+    def _gateway_on_usage_limit(self, email):
+        with self._gateway_lock:
+            settings = load_settings(self.config_path)
+            if not settings.auto_switch.get("codex", False):
+                return False
+            now = time.time()
+            if self._last_gateway_switch is not None and now - self._last_gateway_switch < 30:
+                return False
+            active = get_active_account(self.config_path, provider="codex")
+            # A response from an old in-flight request must not exhaust a new account.
+            if active is None or active.email != email:
+                return False
+            self._usage_state_cache[account_key(active)] = UsageState(
+                available=True, display="Usage limit reached", windows=(UsageWindow("7d", 100),),
+            )
+            accounts = load_accounts(self.config_path)
+            target = choose_fefo_target(
+                "codex", accounts, self._usage_state_cache, self._has_credentials,
+                settings.auto_switch_threshold, active_email=active.email,
+            )
+            if target is None or target.email == active.email:
+                target = choose_auto_switch_target(
+                    provider="codex", accounts=accounts, active_email=active.email,
+                    usage_by_account=self._usage_state_cache, has_credentials=self._has_credentials,
+                    threshold=settings.auto_switch_threshold,
+                )
+            if target is None:
+                _on_main_thread(lambda: rumps.notification(
+                    title="Claude Switcher", subtitle="Codex CLI limit reached",
+                    message="No available account to switch to.",
+                ))
+                return False
+            try:
+                PROVIDERS["codex"]["switch"](target.email, self.config_path)
+            except Exception as exc:
+                message = str(exc)
+                _on_main_thread(lambda: rumps.notification(
+                    title="Claude Switcher", subtitle="Codex CLI auto-switch failed", message=message,
+                ))
+                return False
+            self._last_gateway_switch = time.time()
+            self._last_auto_switch_attempt["codex"] = self._last_gateway_switch
+
+            def completed():
+                rumps.notification(
+                    title="Claude Switcher", subtitle="Auto-switched Codex CLI mid-session",
+                    message=f"{target.email}: the previous account hit its limit",
+                )
+                self._rebuild_menu()
+                self._fetch_all_usage()
+
+            _on_main_thread(completed)
+            return True
 
     def _fetch_all_usage(self):
         """Fetch usage for all accounts in a background thread."""

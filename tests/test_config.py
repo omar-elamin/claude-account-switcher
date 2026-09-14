@@ -396,3 +396,31 @@ def test_proactive_switch_string_false_in_hand_edited_config_reads_false(tmp_pat
     assert _settings_from_dict({"proactive_switch": "true"}).proactive_switch is True
     assert _settings_from_dict({"proactive_switch": False}).proactive_switch is False
     assert _settings_from_dict({}).proactive_switch is True
+
+
+def test_codex_gateway_settings_roundtrip(tmp_path):
+    path = tmp_path / 'accounts.json'
+    assert load_settings(path).codex_gateway is False
+    assert load_settings(path).codex_gateway_port == 8790
+    settings = load_settings(path)
+    settings.codex_gateway_port = 9876
+    save_settings(settings, path)
+    for enabled in (True, False):
+        config_mod.set_codex_gateway_enabled(enabled, path)
+        assert load_settings(path).codex_gateway is enabled
+        assert load_settings(path).codex_gateway_port == 9876
+        raw = json.loads(path.read_text())['settings']
+        assert raw['codex_gateway'] is enabled
+        assert raw['codex_gateway_port'] == 9876
+
+
+@pytest.mark.parametrize('raw,expected', [('false', False), ('0', False), ('true', True),
+                                         (None, False), ([], False), (1, True)])
+def test_codex_gateway_lenient_bool(raw, expected):
+    assert config_mod._settings_from_dict({'codex_gateway': raw}).codex_gateway is expected
+
+
+@pytest.mark.parametrize('raw,expected', [('9000', 9000), (9001, 9001), ('bad', 8790),
+    (None, 8790), ([], 8790), (0, 8790), (65536, 8790), (True, 8790), (float('inf'), 8790)])
+def test_codex_gateway_lenient_port(raw, expected):
+    assert config_mod._settings_from_dict({'codex_gateway_port': raw}).codex_gateway_port == expected
