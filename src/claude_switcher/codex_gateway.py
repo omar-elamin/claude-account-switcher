@@ -46,14 +46,16 @@ def _dropped_headers(headers):
 def rewrite_headers(headers: dict, token: str) -> dict:
     dropped = _dropped_headers(headers)
     result = {key: value for key, value in headers.items() if key.lower() not in dropped}
-    if any(key.lower() == 'authorization' for key in headers):
-        account_id = account_id_from_token(token)
-        result = {key: value for key, value in result.items()
-                  if key.lower() != 'authorization'
-                  and not (account_id is not None and key.lower() == 'chatgpt-account-id')}
-        result['Authorization'] = f'Bearer {token}'
-        if account_id is not None:
-            result['chatgpt-account-id'] = account_id
+    # Inject on EVERY request, not only those that already carry Authorization:
+    # with a non-default base URL Codex sends its plugin calls (/backend-api/ps/mcp)
+    # without any credentials, and chatgpt.com answers 451 unless the bearer is present.
+    account_id = account_id_from_token(token)
+    result = {key: value for key, value in result.items()
+              if key.lower() != 'authorization'
+              and not (account_id is not None and key.lower() == 'chatgpt-account-id')}
+    result['Authorization'] = f'Bearer {token}'
+    if account_id is not None:
+        result['chatgpt-account-id'] = account_id
     return result
 
 
@@ -176,7 +178,7 @@ class _Handler(BaseHTTPRequestHandler):
                         if switched:
                             continue
                     response_started = True
-                    self.send_response(response.status)
+                    self.send_response_only(response.status)   # upstream's Date/Server are copied below; no duplicates
                     response_headers = response.getheaders()
                     dropped = _dropped_headers(dict(response_headers))
                     for key, value in response_headers:

@@ -126,7 +126,7 @@ chatgpt_base_url = "http://127.0.0.1:8790/backend-api/"
 
 The app keeps a one-time backup at `~/.codex/config.toml.claude-switcher.bak`. Turning the gateway off removes the managed block. Restart open Codex CLI and desktop sessions once whenever you turn the gateway on or off so they read the new settings. Keep Claude Switcher running while the gateway is on.
 
-With Codex auto-switch enabled, a usage-limit response makes the gateway switch to an available account and retry the same request once, so the thread can continue on the new account. Other rate-limit responses pass through unchanged. If no account is available, the gateway returns the original usage-limit response.
+With Codex auto-switch enabled, a usage-limit response makes the gateway switch to an available account and retry the same request once, so the thread can continue on the new account. Other rate-limit responses pass through unchanged. The gateway adds the active account's credentials to every request, including Codex's plugin calls, which Codex sends without credentials when a custom address is configured. If no account is available, the gateway returns the original usage-limit response.
 
 The gateway supports HTTP/1.1 only. It refuses WebSocket upgrades so Codex uses its streaming HTTP fallback. The local port has no authentication: any local process can use it with the active account's credentials. This requires the same trust in local processes as the auth file.
 

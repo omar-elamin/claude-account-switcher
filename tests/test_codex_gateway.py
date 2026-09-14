@@ -44,9 +44,14 @@ def test_rewrite_headers():
     assert result['chatgpt-account-id'] == 'old-id'
 
 
-def test_headers_without_authorization():
+def test_headers_without_authorization_get_the_bearer_injected():
+    # Codex sends plugin calls (/backend-api/ps/mcp) without credentials when the base URL is
+    # not the default; chatgpt.com answers 451 unless the bearer is present. Inject always.
     headers = {'chatgpt-account-id': 'old-id', 'X-Other': 'same'}
-    assert gateway.rewrite_headers(headers, 'new') == headers
+    out = gateway.rewrite_headers(headers, 'new')
+    assert out['Authorization'] == 'Bearer new'
+    assert out['X-Other'] == 'same'
+    assert out['chatgpt-account-id'] == 'old-id'   # token not decodable -> the incoming id is kept
 
 
 @pytest.mark.parametrize('headers,expected', [({'Upgrade': 'websocket'}, True),
@@ -146,7 +151,7 @@ def test_forward_body_query_and_active_identity(proxy):
     assert response.getheader('Content-Length') is None
 
 
-def test_forward_without_authorization(proxy):
+def test_forward_without_authorization_injects_the_bearer(proxy):
     _, connect, _, hook, records, behavior = proxy
     behavior.return_value = (429, b'usage_limit_reached')
     conn = connect()
@@ -155,10 +160,9 @@ def test_forward_without_authorization(proxy):
     assert response.status == 429
     assert response.read() == b'usage_limit_reached'
     headers = {k.lower(): v for k, v in records[0][2].items()}
-    assert 'authorization' not in headers
-    assert headers['chatgpt-account-id'] == 'keep'
+    assert headers['authorization'].startswith('Bearer ')     # injected even though the client sent none
     assert headers['x-test'] == 'keep'
-    hook.assert_not_called()
+    hook.assert_not_called()   # switching is only for requests that carried credentials themselves (model turns), not plugin calls
 
 
 def test_streaming_arrives_before_upstream_finishes(proxy):
