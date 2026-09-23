@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import socket
+import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +13,7 @@ from unittest.mock import Mock
 import pytest
 
 from claude_switcher import codex_gateway as gateway
+from claude_switcher import codex_tls
 
 try:
     import tomllib
@@ -297,8 +299,8 @@ def test_config_roundtrip_preserves_unmanaged_bytes_and_backup(tmp_path):
     gateway.enable_config(8790, path)
     first = path.read_bytes()
     parsed = tomllib.loads(first.decode())
-    assert parsed['openai_base_url'] == 'http://127.0.0.1:8790/backend-api/codex'
-    assert parsed['chatgpt_base_url'] == 'http://127.0.0.1:8790/backend-api/'
+    assert parsed['openai_base_url'] == 'https://127.0.0.1:8790/backend-api/codex'
+    assert parsed['chatgpt_base_url'] == 'https://127.0.0.1:8790/backend-api/'
     assert first.endswith(unmanaged)
     assert first.index(b'openai_base_url') < first.index(b'[mcp_servers')
     assert path.stat().st_mode & 0o777 == 0o600
@@ -333,6 +335,159 @@ def test_config_multiline_values_are_untouched(tmp_path):
     original = 'description = """\n[mcp_servers.fake]\nopenai_base_url = fake\n"""\narray = [\n[1, 2],\n[3, 4]\n]\nopenai_base_url = "old"\n[mcp_servers.real]\ncommand = "x"\n'
     path.write_text(original)
     gateway.enable_config(8790, path)
-    assert tomllib.loads(path.read_text())['openai_base_url'].startswith('http://127.')
+    assert tomllib.loads(path.read_text())['openai_base_url'].startswith('https://127.')
     gateway.disable_config(path)
     assert path.read_text() == original.replace('openai_base_url = "old"\n', '')
+
+
+def test_config_replaces_old_http_managed_block_once(tmp_path):
+    path = tmp_path / 'config.toml'
+    path.write_text(
+        f'{gateway.MARKER}\n'
+        'openai_base_url = "http://127.0.0.1:8790/backend-api/codex"\n'
+        'chatgpt_base_url = "http://127.0.0.1:8790/backend-api/"\n'
+        'model = "gpt-5"\n'
+    )
+    gateway.enable_config(9443, path)
+    raw = path.read_text()
+    assert raw.count(gateway.MARKER) == 1
+    assert raw.count('openai_base_url') == 1
+    assert raw.count('chatgpt_base_url') == 1
+    assert 'http://127.0.0.1' not in raw
+    assert 'https://127.0.0.1:9443/backend-api/codex' in raw
+    assert 'model = "gpt-5"' in raw
+
+
+@pytest.fixture
+def tls_proxy(tmp_path):
+    servers = []
+    connections = []
+    records = []
+    behavior = Mock(return_value=(200, b'ok'))
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            records.append((self.command, self.path, dict(self.headers), body))
+            result = behavior(self)
+            if result is None:
+                return
+            status, payload = result
+            self.send_response(status)
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+
+        do_GET = do_POST
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        try:
+            upstream = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        except PermissionError as exc:
+            pytest.skip(f'sandbox blocks binding loopback sockets: {exc}')
+        upstream.daemon_threads = True
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        servers.append((upstream, upstream_thread))
+        paths = codex_tls.ensure_certificate(directory=tmp_path / 'tls')
+        server = gateway.Gateway(
+            '127.0.0.1', 0, Mock(return_value=('active@test.com', 'active-token')),
+            Mock(return_value=False), upstream=f'http://127.0.0.1:{upstream.server_port}',
+            ssl_context=codex_tls.ssl_context(paths),
+        )
+        server.start()
+
+        def connect(trusted=True):
+            if trusted:
+                context = ssl.create_default_context(cafile=str(paths.ca))
+            else:
+                context = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(
+                '127.0.0.1', server.port, timeout=3, context=context,
+            )
+            connections.append(conn)
+            return conn
+
+        yield server, connect, paths, records, behavior
+    finally:
+        for connection in connections:
+            connection.close()
+        if 'server' in locals():
+            server.stop()
+        for upstream, thread in servers:
+            upstream.shutdown()
+            upstream.server_close()
+            thread.join(timeout=3)
+
+
+def test_tls_gateway_forwards_request_and_streams_response(tls_proxy):
+    _, connect, _, records, behavior = tls_proxy
+    later_chunks_sent = threading.Event()
+
+    def stream(handler):
+        handler.send_response(200)
+        handler.send_header('Content-Type', 'text/event-stream')
+        handler.send_header('Connection', 'close')
+        handler.end_headers()
+        handler.wfile.write(b'data: first\n\n')
+        handler.wfile.flush()
+        time.sleep(0.2)
+        later_chunks_sent.set()
+        handler.wfile.write(b'data: second\n\n')
+        handler.wfile.flush()
+        handler.close_connection = True
+
+    behavior.side_effect = stream
+    body = b'{"input":"hello"}'
+    conn = connect()
+    conn.request('POST', '/backend-api/codex/responses?q=1', body,
+                 {'Authorization': 'Bearer stale'})
+    response = conn.getresponse()
+    assert response.status == 200
+    first_chunk = response.read1(1024)
+    assert first_chunk == b'data: first\n\n'
+    assert not later_chunks_sent.is_set(), 'TLS gateway buffered the streamed response'
+    assert response.read() == b'data: second\n\n'
+    method, path, headers, received = records[0]
+    assert (method, path, received) == (
+        'POST', '/backend-api/codex/responses?q=1', body,
+    )
+    assert headers['Authorization'] == 'Bearer active-token'
+    assert response.getheader('Transfer-Encoding') == 'chunked'
+
+
+def test_untrusted_tls_client_does_not_stop_server(tls_proxy):
+    _, connect, _, records, _ = tls_proxy
+    bad = connect(trusted=False)
+    with pytest.raises((ssl.SSLError, OSError)):
+        bad.request('GET', '/')
+        bad.getresponse()
+
+    good = connect()
+    good.request('GET', '/after-failed-handshake')
+    response = good.getresponse()
+    assert response.status == 200
+    assert response.read() == b'ok'
+    assert records[-1][1] == '/after-failed-handshake'
+
+
+def test_stalled_tls_handshake_does_not_block_good_client(tls_proxy):
+    server, connect, _, records, _ = tls_proxy
+    stalled = socket.create_connection(('127.0.0.1', server.port), timeout=3)
+    try:
+        good = connect()
+        started = time.monotonic()
+        good.request('GET', '/concurrent')
+        response = good.getresponse()
+        assert response.status == 200
+        assert response.read() == b'ok'
+        assert time.monotonic() - started < 2
+        assert records[-1][1] == '/concurrent'
+    finally:
+        stalled.close()
