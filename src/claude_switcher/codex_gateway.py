@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import os
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,20 +70,46 @@ def is_usage_limit(status, body_bytes) -> bool:
                                 for value in (b'usage_limit_reached', b'usage_not_included'))
 
 
+class _GatewayServer(ThreadingHTTPServer):
+    def __init__(self, server_address, handler, ssl_context=None):
+        self.ssl_context = ssl_context
+        super().__init__(server_address, handler)
+
+    def finish_request(self, request, client_address):
+        if self.ssl_context is None:
+            super().finish_request(request, client_address)
+            return
+        try:
+            request.settimeout(10)
+            tls_request = self.ssl_context.wrap_socket(request, server_side=True)
+            tls_request.settimeout(None)
+        except (ssl.SSLError, OSError):
+            request.close()
+            return
+        try:
+            super().finish_request(tls_request, client_address)
+        finally:
+            tls_request.close()
+
+
 class Gateway:
-    def __init__(self, host, port, token_provider, on_usage_limit, upstream='https://chatgpt.com'):
+    def __init__(self, host, port, token_provider, on_usage_limit,
+                 upstream='https://chatgpt.com', ssl_context=None):
         self.host = host
         self.port = port
         self.token_provider = token_provider
         self.on_usage_limit = on_usage_limit
         self.upstream = upstream
+        self.ssl_context = ssl_context
         self._server = None
         self._thread = None
 
     def start(self):
         if self._server is not None:
             return
-        server = ThreadingHTTPServer((self.host, self.port), _Handler)
+        server = _GatewayServer(
+            (self.host, self.port), _Handler, ssl_context=self.ssl_context,
+        )
         server.daemon_threads = True
         server.gateway = self
         self._server = server
@@ -251,8 +278,8 @@ def _edit_config(path, port=None):
         cleaned = _without_managed_config(original)
         if port is not None:
             block = (f'{MARKER}\n'
-                     f'openai_base_url = "http://127.0.0.1:{port}/backend-api/codex"\n'
-                     f'chatgpt_base_url = "http://127.0.0.1:{port}/backend-api/"\n').encode()
+                     f'openai_base_url = "https://127.0.0.1:{port}/backend-api/codex"\n'
+                     f'chatgpt_base_url = "https://127.0.0.1:{port}/backend-api/"\n').encode()
             cleaned = block + cleaned
         _parse_config(cleaned)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -116,15 +116,24 @@ With 'Use expiring quota first' on (the default), the app switches to that accou
 
 Turn on `Auto-switch → Codex gateway (switch running sessions)` to let running Codex sessions follow account switches. Codex normally keeps its token in memory, so replacing `~/.codex/auth.json` does not change the account a running session uses when it hits a usage limit. The gateway sends each authenticated request with the active account's token.
 
-The gateway listens only on `127.0.0.1`, on port `8790` by default. It writes this block at the top of `~/.codex/config.toml` to send Codex traffic through it:
+The gateway listens only on `127.0.0.1`, on port `8790` by default. Codex requires custom workspace backends to use HTTPS, including backends on loopback. The app writes this block at the top of `~/.codex/config.toml` to send Codex traffic through the gateway:
 
 ```toml
 # managed by Claude Switcher: Codex gateway
-openai_base_url = "http://127.0.0.1:8790/backend-api/codex"
-chatgpt_base_url = "http://127.0.0.1:8790/backend-api/"
+openai_base_url = "https://127.0.0.1:8790/backend-api/codex"
+chatgpt_base_url = "https://127.0.0.1:8790/backend-api/"
 ```
 
 The app keeps a one-time backup at `~/.codex/config.toml.claude-switcher.bak`. Turning the gateway off removes the managed block. Restart open Codex CLI and desktop sessions once whenever you turn the gateway on or off so they read the new settings. Keep Claude Switcher running while the gateway is on.
+
+On first use, Claude Switcher creates a local CA and server certificate in `~/Library/Application Support/Claude Switcher/codex-gateway-tls`. macOS asks once for permission to trust the CA in your login keychain. The CA has a name constraint that permits only `127.0.0.1`, and the app deletes the CA private key as soon as it signs the server certificate. This prevents the CA from signing more certificates later.
+
+To remove the trust entry, open Keychain Access, select the login keychain, and delete the certificate whose name starts with `Claude Switcher Local CA`. You can also find its SHA-1 fingerprint and remove it in Terminal:
+
+```sh
+security find-certificate -a -c "Claude Switcher Local CA" -Z ~/Library/Keychains/login.keychain-db
+security delete-certificate -Z SHA1_FINGERPRINT -t ~/Library/Keychains/login.keychain-db
+```
 
 With Codex auto-switch enabled, a usage-limit response makes the gateway switch to an available account and retry the same request once, so the thread can continue on the new account. Other rate-limit responses pass through unchanged. The gateway adds the active account's credentials to every request, including Codex's plugin calls, which Codex sends without credentials when a custom address is configured. If no account is available, the gateway returns the original usage-limit response.
 

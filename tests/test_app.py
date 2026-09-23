@@ -976,23 +976,54 @@ def gateway_app(app_module, tmp_path, monkeypatch):
 def test_gateway_toggle_on(gateway_app, app_module):
     from claude_switcher.config import load_settings
     app, _ = gateway_app
-    with patch.object(app_module, 'Gateway') as factory, patch.object(app_module, 'enable_config') as write:
+    paths = SimpleNamespace(previous_fingerprint='OLD')
+    context = object()
+    server = MagicMock()
+    order = []
+    with patch.object(app_module, 'Gateway') as factory, \
+         patch.object(app_module, 'ensure_certificate', return_value=paths) as certificate, \
+         patch.object(app_module, 'ensure_trusted') as trusted, \
+         patch.object(app_module, 'ssl_context', return_value=context) as make_context, \
+         patch.object(app_module, 'enable_config') as write:
+        certificate.side_effect = lambda: (order.append('certificate'), paths)[1]
+        trusted.side_effect = lambda *args, **kwargs: order.append('trust')
+        make_context.side_effect = lambda *args, **kwargs: (order.append('context'), context)[1]
+        factory.side_effect = lambda *args, **kwargs: (order.append('gateway'), server)[1]
+        server.start.side_effect = lambda: order.append('start')
+        write.side_effect = lambda *args, **kwargs: order.append('config')
         app._on_toggle_codex_gateway(SimpleNamespace(state=0))
-        factory.assert_called_once_with('127.0.0.1', 8790, app._gateway_token_provider, app._gateway_on_usage_limit)
-        factory.return_value.start.assert_called_once()
+        certificate.assert_called_once_with()
+        trusted.assert_called_once_with(paths, previous_fingerprint='OLD')
+        make_context.assert_called_once_with(paths)
+        factory.assert_called_once_with(
+            '127.0.0.1', 8790, app._gateway_token_provider,
+            app._gateway_on_usage_limit, ssl_context=context,
+        )
+        server.start.assert_called_once()
         write.assert_called_once_with(8790)
-        assert app._gateway is factory.return_value
+        assert order == ['certificate', 'trust', 'context', 'gateway', 'start', 'config']
+        assert app._gateway is server
     assert load_settings(app.config_path).codex_gateway
     assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Codex gateway on'
+    assert 'https://127.0.0.1:8790' in fake_rumps.notification.call_args.kwargs['message']
 
 
 def test_gateway_toggle_port_busy(gateway_app, app_module):
     from claude_switcher.config import load_settings
     app, _ = gateway_app
-    with patch.object(app_module, 'Gateway') as factory, patch.object(app_module, 'enable_config') as write:
+    paths = SimpleNamespace(previous_fingerprint=None)
+    with patch.object(app_module, 'Gateway') as factory, \
+         patch.object(app_module, 'ensure_certificate', return_value=paths), \
+         patch.object(app_module, 'ensure_trusted'), \
+         patch.object(app_module, 'ssl_context'), \
+         patch.object(app_module, 'gateway_configured', return_value=False) as configured, \
+         patch.object(app_module, 'disable_config') as disable, \
+         patch.object(app_module, 'enable_config') as write:
         factory.return_value.start.side_effect = OSError('Address already in use')
         app._on_toggle_codex_gateway(SimpleNamespace(state=0))
         write.assert_not_called()
+        configured.assert_called_once_with()
+        disable.assert_not_called()
     assert not load_settings(app.config_path).codex_gateway
     assert app._gateway is None
     assert fake_rumps.notification.call_args.kwargs['subtitle'] == 'Codex gateway could not start'
@@ -1002,11 +1033,36 @@ def test_gateway_toggle_port_busy(gateway_app, app_module):
 def test_gateway_toggle_config_failure_cleans_up(gateway_app, app_module):
     from claude_switcher.config import load_settings
     app, _ = gateway_app
-    with patch.object(app_module, 'Gateway') as factory, patch.object(app_module, 'enable_config', side_effect=RuntimeError('invalid TOML')):
+    paths = SimpleNamespace(previous_fingerprint=None)
+    with patch.object(app_module, 'Gateway') as factory, \
+         patch.object(app_module, 'ensure_certificate', return_value=paths), \
+         patch.object(app_module, 'ensure_trusted'), \
+         patch.object(app_module, 'ssl_context'), \
+         patch.object(app_module, 'gateway_configured', return_value=True), \
+         patch.object(app_module, 'disable_config') as disable, \
+         patch.object(app_module, 'enable_config', side_effect=RuntimeError('invalid TOML')):
         app._on_toggle_codex_gateway(SimpleNamespace(state=0))
         factory.return_value.stop.assert_called_once()
+        disable.assert_called_once_with()
     assert not load_settings(app.config_path).codex_gateway
     assert app._gateway is None
+
+
+def test_gateway_tls_setup_failure_disables_setting(gateway_app, app_module):
+    from claude_switcher.config import load_settings
+    app, _ = gateway_app
+    with patch.object(app_module, 'Gateway') as factory, \
+         patch.object(app_module, 'ensure_certificate', side_effect=RuntimeError('Trust cancelled')), \
+         patch.object(app_module, 'gateway_configured', return_value=True), \
+         patch.object(app_module, 'disable_config') as disable, \
+         patch.object(app_module, 'enable_config') as write:
+        app._on_toggle_codex_gateway(SimpleNamespace(state=0))
+    factory.assert_not_called()
+    write.assert_not_called()
+    disable.assert_called_once_with()
+    assert not load_settings(app.config_path).codex_gateway
+    assert app._gateway is None
+    assert fake_rumps.notification.call_args.kwargs['message'] == 'Trust cancelled'
 
 
 def test_gateway_toggle_off(gateway_app, app_module):

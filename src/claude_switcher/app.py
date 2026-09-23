@@ -1,6 +1,7 @@
 """macOS menu bar application using rumps."""
 
 import json
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -9,7 +10,10 @@ import rumps
 from Foundation import NSBundle, NSOperationQueue
 
 from claude_switcher import codex_core, core, keychain, login_item
-from claude_switcher.codex_gateway import Gateway, enable_config, disable_config
+from claude_switcher.codex_gateway import (
+    Gateway, disable_config, enable_config, gateway_configured,
+)
+from claude_switcher.codex_tls import ensure_certificate, ensure_trusted, ssl_context
 from claude_switcher.common import _decode_jwt_payload
 from claude_switcher.auto_switch import (
     account_key,
@@ -557,13 +561,24 @@ class ClaudeSwitcherApp(rumps.App):
 
     def _start_codex_gateway(self):
         settings = load_settings(self.config_path)
-        server = Gateway("127.0.0.1", settings.codex_gateway_port,
-                         self._gateway_token_provider, self._gateway_on_usage_limit)
+        server = None
         try:
+            paths = ensure_certificate()
+            ensure_trusted(paths, previous_fingerprint=paths.previous_fingerprint)
+            context = ssl_context(paths)
+            server = Gateway("127.0.0.1", settings.codex_gateway_port,
+                             self._gateway_token_provider, self._gateway_on_usage_limit,
+                             ssl_context=context)
             server.start()
             enable_config(settings.codex_gateway_port)
-        except (OSError, RuntimeError) as exc:
-            server.stop()
+        except (OSError, RuntimeError, ssl.SSLError) as exc:
+            if server is not None:
+                server.stop()
+            try:
+                if gateway_configured():
+                    disable_config()
+            except (OSError, RuntimeError):
+                pass
             set_codex_gateway_enabled(False, self.config_path)
             rumps.notification(title="Claude Switcher", subtitle="Codex gateway could not start",
                                message=str(exc))
@@ -592,7 +607,7 @@ class ClaudeSwitcherApp(rumps.App):
         self._rebuild_menu()
         rumps.notification(
             title="Claude Switcher", subtitle=f"Codex gateway {'on' if enabled else 'off'}",
-            message=(f"Codex now goes through 127.0.0.1:{settings.codex_gateway_port}. "
+            message=(f"Codex now goes through https://127.0.0.1:{settings.codex_gateway_port}. "
                      "Restart open Codex sessions once so they use it." if enabled else
                      "Codex talks to OpenAI directly again. Restart open Codex sessions once."),
         )
