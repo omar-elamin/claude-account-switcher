@@ -49,7 +49,11 @@ for provider, label in [('claude', 'Claude'), ('codex', 'Codex')]:
     app._update_reset_labels()
     assert item.callback is None
     assert item._menuitem.title() == 'native@example.test (0 resets left)'
-assert 'Claude Code' not in app.menu['Auto-reset']
+assert list(app.menu['Auto-reset']) == ['Claude Code', 'Codex CLI']
+for provider, label in [('claude', 'Claude Code'), ('codex', 'Codex CLI')]:
+    option = app.menu['Auto-reset'][label]
+    assert option._provider == provider and option.state == 0
+    assert option.callback == app._on_toggle_auto_reset
 print('Native NSMenu and callback PASS; no credentials or HTTP accessed')
 '''
     env = os.environ.copy()

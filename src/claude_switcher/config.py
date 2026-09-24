@@ -30,7 +30,7 @@ class AppSettings:
         default_factory=lambda: {provider: False for provider in DEFAULT_PROVIDERS}
     )
     auto_switch_threshold: float = 100.0
-    auto_reset: dict[str, bool] = field(default_factory=lambda: {"codex": False})
+    auto_reset: dict[str, bool] = field(default_factory=lambda: {provider: False for provider in DEFAULT_PROVIDERS})
     proactive_switch: bool = True
     codex_gateway: bool = False
     codex_gateway_port: int = 8790

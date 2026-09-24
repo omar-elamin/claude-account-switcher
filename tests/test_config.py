@@ -329,7 +329,7 @@ class TestSettings:
 
 def test_auto_reset_default_and_roundtrip(tmp_path):
     path = tmp_path / "accounts.json"
-    assert load_settings(path).auto_reset == {"codex": False}
+    assert load_settings(path).auto_reset == {"claude": False, "codex": False}
     assert config_mod.is_auto_reset_enabled("codex", path) is False
     set_auto_switch_enabled("claude", True, path)
     config_mod.set_auto_reset_enabled("codex", True, path)
@@ -347,7 +347,7 @@ def test_auto_reset_tolerant_settings(tmp_path, raw):
     path = tmp_path / "accounts.json"
     path.write_text(json.dumps({"accounts": [], "settings": {"auto_reset": raw, "auto_switch": {"codex": True}}}))
     settings = load_settings(path)
-    assert settings.auto_reset == {"codex": bool(raw.get("codex", False)) if isinstance(raw, dict) else False}
+    assert settings.auto_reset == {"claude": False, "codex": bool(raw.get("codex", False)) if isinstance(raw, dict) else False}
     assert settings.auto_switch["codex"] is True
 
 
@@ -356,7 +356,7 @@ def test_old_config_load_does_not_change_file(tmp_path):
     original = '{"accounts": [], "settings": {"auto_switch": {"codex": true}, "auto_switch_threshold": 95}}'
     path.write_text(original)
     settings = load_settings(path)
-    assert settings.auto_reset == {"codex": False}
+    assert settings.auto_reset == {"claude": False, "codex": False}
     assert settings.auto_switch["codex"] is True
     assert settings.auto_switch_threshold == 95
     assert path.read_text() == original

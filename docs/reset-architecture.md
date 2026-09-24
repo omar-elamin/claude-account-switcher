@@ -21,15 +21,25 @@ providers. A provider's opaque ticket stays inside its adapter.
 | Consent binding | Account, organization, credential fingerprint, grant details and balance | Account ID and balance; token refresh may retain the same account ID |
 | Redemption | Grant ID and request UUID | Redeem request UUID |
 | Network retry | No automatic POST retry | Existing single retry with the same request UUID |
-| Automatic redemption | Unsupported | Existing opt-in setting and cooldowns |
+| Automatic redemption | Shared opt-in policy, off by default | Shared opt-in policy, off by default |
 
-Background polling cannot call either adapter's manual redemption method. Selecting
-a usable row performs a fresh check before showing confirmation. Cancelling sends
-no reset request. The backend checks consent again before POST. Both providers
-report an uncertain response as uncertain. The app suppresses duplicate clicks by
-provider and email, and Codex auto-reset skips an account with a pending manual
-confirmation. Claude auto-reset remains unavailable even if a configuration file
-contains an enabled flag.
+With auto-reset off, polling only reads usage and eligibility. Selecting a usable
+row performs a fresh check before showing confirmation. Cancelling sends no reset
+request. The backend checks consent again before POST. Both providers report an
+uncertain response as uncertain.
+
+Each provider has an independent Auto-reset option, off by default. When enabled,
+the shared policy requires an exhausted active account and no known account to
+switch to. It prefers a usable reset on the active account, then an exhausted
+backup account of the same provider. The app rereads target usage and eligibility
+before redemption. It rechecks the triggering active account, setting, and known
+alternatives immediately before POST, including after the backend's final read.
+
+Manual and automatic requests share an atomic guard keyed by provider and email.
+Automatic attempts have a one-minute provider cooldown and a one-hour account
+cooldown, including uncertain outcomes. Enabling or disabling one provider does
+not change the other provider. Each automatic result gets its own notification,
+and completed attempts refresh usage and reset availability.
 
 This uses Adapter for the two API contracts and the existing registry to select
 behavior. It avoids an inheritance-based Template Method because authentication,

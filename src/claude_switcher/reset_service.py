@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+from collections.abc import Callable
 
 from claude_switcher import claude_reset, codex_usage
 from claude_switcher.config import get_active_account
@@ -31,11 +32,11 @@ class ResetAdapter(Protocol):
 
     def poll(self, email: str, path: Path, usage: UsageState) -> ResetStatus: ...
     def prepare(self, email: str, path: Path) -> ResetStatus: ...
-    def redeem(self, offer: ResetOffer, path: Path) -> str: ...
+    def redeem(self, offer: ResetOffer, path: Path, *, authorize: Callable[[], bool] | None = None) -> str: ...
 
 
 class ClaudeResetAdapter:
-    supports_automatic = False
+    supports_automatic = True
 
     def poll(self, email, path, usage):
         # Claude's ordinary usage response does not contain grant eligibility.
@@ -49,10 +50,10 @@ class ClaudeResetAdapter:
             native.clears, native.ends_at, native)
         return ResetStatus(status.remaining, offer)
 
-    def redeem(self, offer, path):
+    def redeem(self, offer, path, *, authorize=None):
         if offer.provider != 'claude' or not isinstance(offer.ticket, claude_reset.ResetOffer):
             return 'changed'
-        return claude_reset.redeem_reset(offer.ticket, path)
+        return claude_reset.redeem_reset(offer.ticket, path, authorize=authorize)
 
 
 @dataclass(frozen=True)
@@ -94,13 +95,13 @@ class CodexResetAdapter:
             native.provider, native.email, native.total_remaining, native.label,
             native.clears, ticket=_CodexTicket(identity)))
 
-    def redeem(self, offer, path):
+    def redeem(self, offer, path, *, authorize=None):
         if offer.provider != 'codex' or not isinstance(offer.ticket, _CodexTicket):
             return 'changed'
         try:
             code = codex_usage.consume_reset_credit(offer.email, path,
                 expected_account_id=offer.ticket.account_id,
-                expected_credits=offer.total_remaining)
+                expected_credits=offer.total_remaining, authorize=authorize)
         except Exception:
             # A lost response can follow a successful reset. Do not claim failure
             # or expose raw provider/credential errors through the common UI.
@@ -108,7 +109,3 @@ class CodexResetAdapter:
         return {'reset': 'reset', 'nothing_to_reset': 'not_limited',
                 'no_credit': 'unavailable', 'already_redeemed': 'already_used',
                 'changed': 'changed'}.get(code, 'unknown')
-
-    def redeem_automatically(self, email, path):
-        # Existing opt-in Codex policy calls this; Claude has no such operation.
-        return codex_usage.consume_reset_credit(email, path)

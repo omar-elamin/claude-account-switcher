@@ -188,8 +188,8 @@ def prepare_reset(email, config_path=DEFAULT_CONFIG_PATH):
             return Availability(email)
 
 
-def redeem_reset(offer, config_path=DEFAULT_CONFIG_PATH):
-    """Manual confirmation only; revalidate target and grant before one POST."""
+def redeem_reset(offer, config_path=DEFAULT_CONFIG_PATH, *, authorize=None):
+    """Revalidate target, grant, and optional automatic policy before one POST."""
     with core._CLAUDE_LOCK:
         key = (offer.email, offer.organization, offer.grant_id)
         attempt = _request_ids.get(key)
@@ -217,6 +217,10 @@ def redeem_reset(offer, config_path=DEFAULT_CONFIG_PATH):
         except (OSError, ValueError, TypeError, RuntimeError):
             return 'unavailable'
         try:
+            # Automatic policy is checked inside the provider lock, after the
+            # final network read. Manual callers have already confirmed.
+            if authorize is not None and not authorize():
+                return 'changed'
             response = _request(target[1],
                 f'https://api.anthropic.com/api/organizations/{offer.organization}/reset_rate_limits',
                 {'program': 'cedar_ember', 'grant_id': offer.grant_id, 'request_id': offer.request_id})

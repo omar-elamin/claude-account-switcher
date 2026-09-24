@@ -223,7 +223,7 @@ def reset_account_id(email: str, config_path=DEFAULT_CONFIG_PATH) -> str | None:
 
 def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH, *,
                          expected_account_id: str | None = None,
-                         expected_credits: int | None = None) -> str:
+                         expected_credits: int | None = None, authorize=None) -> str:
     """Recheck usage, then redeem one reset with an idempotent network retry."""
     key = str(uuid4())
     busy_message = "A Codex account add is in progress. Try again in a moment."
@@ -286,6 +286,8 @@ def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH, *,
         req.add_header("Content-Type", "application/json")
 
         for attempt in range(2):
+            if authorize is not None and not authorize():
+                return "changed" if attempt == 0 else "unknown"
             status = None
             try:
                 with urlopen(req, timeout=10) as resp:

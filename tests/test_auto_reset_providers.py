@@ -148,3 +148,79 @@ def test_overlapping_auto_and_manual_reset_share_one_operation_guard(app_module,
         consume_mock.assert_called_once()
         prepare.assert_not_called()
     assert not app._reset_in_progress
+
+
+@pytest.mark.parametrize('provider',['claude','codex'])
+def test_eligibility_removed_during_fresh_usage_blocks_post(automatic,provider):
+    t=automatic
+    save_settings(AppSettings(auto_reset={provider:True}),t.app.config_path)
+    real=t.app._fetch_usage_state
+    count=0
+    def fetch(account,active):
+        nonlocal count
+        state=real(account,active)
+        if account.provider==provider:
+            count+=1
+            if count==2: t.balances['ready@test.com']=0
+        return state
+    t.app._fetch_usage_state=fetch
+    run_refresh(t)
+    assert posts(t)==[]
+
+@pytest.mark.parametrize('provider',['claude','codex'])
+def test_optout_during_prepare_blocks_post(automatic,provider):
+    t=automatic
+    save_settings(AppSettings(auto_reset={provider:True}),t.app.config_path)
+    adapter=t.module.PROVIDERS[provider]['reset']
+    prepare=adapter.prepare
+    def changed(*args):
+        result=prepare(*args)
+        save_settings(AppSettings(auto_reset={provider:False}),t.app.config_path)
+        return result
+    with patch.object(adapter,'prepare',side_effect=changed):
+        run_refresh(t)
+    assert posts(t)==[]
+
+@pytest.mark.parametrize('provider',['claude','codex'])
+def test_switch_to_healthy_account_during_fresh_usage_blocks_post(automatic,provider):
+    t=automatic
+    save_settings(AppSettings(auto_reset={provider:True}),t.app.config_path)
+    real=t.app._fetch_usage_state
+    count=0
+    def fetch(account,active):
+        nonlocal count
+        state=real(account,active)
+        if account.provider==provider:
+            count+=1
+            if count==2:
+                accounts=[replace(a,active=False) if a.provider==provider else a for a in t.accounts]
+                accounts.append(AccountInfo('other@test.com','pro','',True,'other',provider=provider))
+                save_accounts(accounts,t.app.config_path)
+                t.app._usage_state_cache[provider,'other@test.com']=UsageState(True,'10%',(UsageWindow('5h',10),))
+        return state
+    t.app._fetch_usage_state=fetch
+    run_refresh(t)
+    assert posts(t)==[]
+
+
+@pytest.mark.parametrize('provider',['claude','codex'])
+def test_disable_during_final_backend_recheck_cancels_post(automatic,provider):
+    from claude_switcher import claude_reset
+    t=automatic
+    save_settings(AppSettings(auto_reset={provider:True}),t.app.config_path)
+    module=claude_reset if provider=='claude' else codex_usage
+    name='_open' if provider=='claude' else 'urlopen'
+    send=getattr(module,name)
+    reads=0
+    def intercept(request,timeout):
+        nonlocal reads
+        response=send(request,timeout)
+        if request.get_method()=='GET':
+            reads+=1
+            if reads==(3 if provider=='claude' else 4):
+                save_settings(AppSettings(auto_reset={provider:False}),t.app.config_path)
+        return response
+    with patch.object(module,name,side_effect=intercept):
+        run_refresh(t)
+    assert reads==(3 if provider=='claude' else 4)
+    assert posts(t)==[]
