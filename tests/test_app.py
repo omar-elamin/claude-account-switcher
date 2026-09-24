@@ -1283,3 +1283,53 @@ def test_gateway_provider_refreshes_drifted_backup_in_keychain_only(gateway_app,
         refresh.assert_called_once_with(expiring)
         atomic.assert_not_called()
         assert ('codex-switcher:active@test.com', 'active@test.com', fresh) in [c.args for c in write.call_args_list]
+
+
+@pytest.mark.parametrize('confirmed', [0, 1])
+def test_claude_reset_user_journey_real_backend(app_module, tmp_path, monkeypatch, confirmed):
+    """Menu click -> GET -> account confirmation -> GET/POST, entirely synthetic."""
+    import io
+    import json
+    from claude_switcher import claude_reset
+    from claude_switcher.config import AccountInfo, save_accounts
+    from test_claude_reset import eligible, EMAIL, ORG
+    app = _reset_app(app_module, tmp_path)
+    accounts = [AccountInfo(EMAIL, 'max', '', False, EMAIL,
+                {'emailAddress': EMAIL, 'organizationUuid': ORG}),
+                AccountInfo(EMAIL, 'pro', '', True, EMAIL, provider='codex')]
+    save_accounts(accounts, app.config_path)
+    calls = []
+    def send(req, timeout):
+        calls.append(req.get_method())
+        body = eligible() if req.get_method() == 'GET' else {'result': 'reset'}
+        return io.BytesIO(json.dumps(body).encode())
+    monkeypatch.setattr(claude_reset, '_open', send)
+    monkeypatch.setattr(claude_reset.keychain, 'read_credentials', lambda service:
+        json.dumps({'claudeAiOauth': {'accessToken': 'test'}}) if service == 'claude-switcher:' + EMAIL else None)
+    claude_reset._request_ids.clear()
+    with patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
+         patch.object(app_module.threading, 'Thread', ImmediateThread), \
+         patch.object(app_module, '_on_main_thread', side_effect=lambda fn: fn()), \
+         patch.object(app_module.rumps, 'alert', return_value=confirmed) as alert:
+        app._add_claude_reset_menu(accounts)
+        assert calls == []
+        menu = app.menu.add.call_args.args[0]
+        assert menu.title == '↺ Reset Claude usage'
+        assert len(menu.children) == 1
+        menu.children[0].callback(menu.children[0])
+        assert EMAIL in alert.call_args.kwargs['message']
+        assert '1' in alert.call_args.kwargs['message']
+        assert alert.call_args.kwargs['cancel'] == 'Cancel'
+        assert calls == (['GET', 'GET', 'POST'] if confirmed else ['GET'])
+        if confirmed:
+            app._fetch_all_usage.assert_called_once()
+        assert not app._claude_reset_in_progress
+
+
+def test_claude_reset_duplicate_click_is_ignored(app_module, tmp_path):
+    app = _reset_app(app_module, tmp_path)
+    sender = SimpleNamespace(_email='test@example.test')
+    with patch.object(app_module.threading, 'Thread') as thread:
+        app._on_reset_claude_usage(sender)
+        app._on_reset_claude_usage(sender)
+    assert thread.call_count == 1
