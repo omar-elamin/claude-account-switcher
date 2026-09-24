@@ -4,6 +4,7 @@ import urllib.request
 
 import pytest
 
+import claude_switcher.claude_reset as claude_reset
 import claude_switcher.codex_core as codex_core
 import claude_switcher.codex_usage as codex_usage
 
@@ -21,6 +22,7 @@ def block_network_access(monkeypatch):
         NETWORK_ATTEMPTS.append(url)
         raise AssertionError(f"network access attempted: {url}")
 
+    monkeypatch.setattr(claude_reset, "_open", blocked_urlopen)
     monkeypatch.setattr(codex_core, "urlopen", blocked_urlopen)
     monkeypatch.setattr(codex_usage, "urlopen", blocked_urlopen)
     monkeypatch.setattr(urllib.request, "urlopen", blocked_urlopen)

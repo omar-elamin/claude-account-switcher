@@ -149,3 +149,16 @@ def test_failed_eligibility_never_exposes_credentials(setup_reset):
     status = reset.prepare_reset(EMAIL, s.path)
     assert status.offer is None and status.remaining is None
     assert 'synthetic-claude' not in repr(status)
+
+
+def test_confirmation_reports_total_balance_across_multiple_grants(setup_reset):
+    from claude_switcher.claude_reset_ui import confirmation
+    s = setup_reset
+    bonus = copy.deepcopy(s.body['get']['cedar_ember']['grants'][0])
+    bonus['id'] = 'bonus'
+    s.body['get']['cedar_ember']['grants'].append(bonus)
+    status = reset.prepare_reset(EMAIL, s.path)
+    assert status.remaining == 2
+    message = confirmation(status.offer)
+    assert 'Resets left: 2' in message
+    assert 'leaves you with 1 reset.' in message

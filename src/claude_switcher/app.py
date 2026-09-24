@@ -9,6 +9,7 @@ from pathlib import Path
 import rumps
 from Foundation import NSBundle, NSOperationQueue
 
+from claude_switcher import claude_reset, claude_reset_ui
 from claude_switcher import codex_core, core, keychain, login_item
 from claude_switcher.codex_gateway import (
     Gateway, disable_config, enable_config, gateway_configured,
@@ -279,6 +280,7 @@ class ClaudeSwitcherApp(rumps.App):
             self.menu.add(remove_menu)
 
         self._add_reset_menu(accounts)
+        self._add_claude_reset_menu(accounts)
 
         self.menu.add(rumps.separator)
         item = rumps.MenuItem("Start at login", callback=self._on_toggle_start_at_login)
@@ -361,6 +363,66 @@ class ClaudeSwitcherApp(rumps.App):
         if not eligible:
             reset_menu.add(rumps.MenuItem("No reset applicable now", callback=None))
         self.menu.add(reset_menu)
+
+    def _add_claude_reset_menu(self, accounts):
+        accounts = [a for a in accounts if a.provider == "claude"]
+        if not accounts:
+            return
+        menu = rumps.MenuItem(claude_reset_ui.MENU_TITLE)
+        for account in accounts:
+            item = rumps.MenuItem(claude_reset_ui.account_title(account.email),
+                                  callback=self._on_reset_claude_usage)
+            item._email = account.email
+            menu.add(item)
+        self.menu.add(menu)
+
+    def _on_reset_claude_usage(self, sender):
+        # Only this explicit menu action can enter the Claude redemption flow.
+        # Keep the account captured across asynchronous checks and confirmation.
+        email = sender._email
+        pending = getattr(self, "_claude_reset_in_progress", None)
+        if pending is None:
+            pending = self._claude_reset_in_progress = set()
+        if email in pending:
+            return
+        pending.add(email)
+
+        def _checked(status):
+            if status.offer is None:
+                pending.discard(email)
+                rumps.alert(title="Claude usage resets",
+                            message=claude_reset_ui.unavailable(email, status.remaining))
+                return
+            if rumps.alert(title=claude_reset_ui.CONFIRM_TITLE,
+                           message=claude_reset_ui.confirmation(status.offer),
+                           ok="Reset", cancel="Cancel") != 1:
+                pending.discard(email)
+                return
+
+            def _redeem():
+                try:
+                    code = claude_reset.redeem_reset(status.offer, self.config_path)
+                except Exception:
+                    code = "unknown"
+
+                def _finish():
+                    pending.discard(email)
+                    rumps.notification(title="Claude Switcher", subtitle="Claude usage reset",
+                        message=email + "\n" + claude_reset_ui.result_message(code))
+                    self._fetch_all_usage()
+
+                _on_main_thread(_finish)
+
+            threading.Thread(target=_redeem, daemon=True).start()
+
+        def _check():
+            try:
+                status = claude_reset.prepare_reset(email, self.config_path)
+            except Exception:
+                status = claude_reset.Availability(email)
+            _on_main_thread(lambda: _checked(status))
+
+        threading.Thread(target=_check, daemon=True).start()
 
     def _on_reset_codex_usage(self, sender):
         email = sender._email

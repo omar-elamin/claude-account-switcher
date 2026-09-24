@@ -566,6 +566,10 @@ def test_reset_menus_and_eligibility(app_module, tmp_path):
         assert auto.title == "Auto-reset"
         assert [(i.title, i.state) for i in auto.children] == [("Codex CLI", 1)]
         reset = items[titles.index("−  Remove account") + 1]
+        claude_menu = next(i for i in items if getattr(i, "title", None) == "↺ Reset Claude usage")
+        assert len(claude_menu.children) == 1
+        assert claude_menu.children[0]._email == "claude"
+        assert claude_menu.children[0].callback == app._on_reset_claude_usage
         assert reset.title == "↺ Reset Codex usage"
         assert [i.title for i in reset.children] == ["eligible (3 available)"]
         app._usage_state_cache = {}
@@ -1292,7 +1296,7 @@ def test_claude_reset_user_journey_real_backend(app_module, tmp_path, monkeypatc
     import json
     from claude_switcher import claude_reset
     from claude_switcher.config import AccountInfo, save_accounts
-    from test_claude_reset import eligible, EMAIL, ORG
+    from tests.test_claude_reset import eligible, EMAIL, ORG
     app = _reset_app(app_module, tmp_path)
     accounts = [AccountInfo(EMAIL, 'max', '', False, EMAIL,
                 {'emailAddress': EMAIL, 'organizationUuid': ORG}),
