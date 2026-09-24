@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 import rumps
 from claude_switcher.app import ClaudeSwitcherApp
-from claude_switcher import claude_reset, keychain, login_item
+from claude_switcher import claude_reset, reset_service, keychain, login_item
 from claude_switcher.config import AccountInfo, save_accounts
 
 def forbidden(*args, **kwargs):
@@ -28,24 +28,27 @@ app.config_path = Path(sys.argv[1])
 app._usage_state_cache = {}
 app._usage_cache = {}
 app._has_credentials = lambda account: False
-save_accounts([AccountInfo('native@example.test', 'max', '', False, 'test')], app.config_path)
+accounts = [AccountInfo('native@example.test', 'max', '', False, 'test', provider=p)
+            for p in ('claude', 'codex')]
+save_accounts(accounts, app.config_path)
 app._rebuild_menu()
-menu = app.menu['↺ Reset Claude usage']
-assert menu._menu.numberOfItems() == 1
-item = next(iter(menu.values()))
-assert item._email == 'native@example.test'
-assert item.callback is None
-assert item._menuitem.title() == 'native@example.test (checking resets…)'
-app._claude_reset_cache = {'native@example.test': claude_reset.Availability('native@example.test', 2, object())}
-app._update_claude_reset_labels()
-assert item.callback == app._on_reset_claude_usage
-assert item._menuitem.action() is not None
-assert item._menuitem.title() == 'native@example.test (2 resets left, available)'
-assert item._menuitem.isEnabled()
-app._claude_reset_cache = {'native@example.test': claude_reset.Availability('native@example.test', 0)}
-app._update_claude_reset_labels()
-assert item.callback is None
-assert item._menuitem.title() == 'native@example.test (0 resets left)'
+for provider, label in [('claude', 'Claude'), ('codex', 'Codex')]:
+    menu = app.menu[f'↺ Reset {label} usage']
+    assert menu._menu.numberOfItems() == 1
+    item = next(iter(menu.values()))
+    assert item._email == 'native@example.test' and item._provider == provider
+    assert item.callback is None
+    assert item._menuitem.title() == 'native@example.test (checking resets…)'
+    app._reset_cache = {(provider, item._email): reset_service.ResetStatus(2, object())}
+    app._update_reset_labels()
+    assert item.callback == app._on_reset_usage
+    assert item._menuitem.action() is not None
+    assert item._menuitem.title() == 'native@example.test (2 resets left, available)'
+    assert item._menuitem.isEnabled()
+    app._reset_cache = {(provider, item._email): reset_service.ResetStatus(0)}
+    app._update_reset_labels()
+    assert item.callback is None
+    assert item._menuitem.title() == 'native@example.test (0 resets left)'
 assert 'Claude Code' not in app.menu['Auto-reset']
 print('Native NSMenu and callback PASS; no credentials or HTTP accessed')
 '''

@@ -1,10 +1,14 @@
-"""Text and menu labels for manual Claude Code usage resets.
+"""Text and menu labels for manual Claude Code and Codex CLI usage resets.
 
 Presentation only. No logic, network calls, or imports.
 """
 
-MENU_TITLE = '↺ Reset Claude usage'
-CONFIRM_TITLE = 'Reset Claude usage?'
+CONFIRM_TITLE = 'Reset usage?'
+
+_PROVIDERS = {
+    'claude': ('Claude', 'Claude Code'),
+    'codex': ('Codex', 'Codex CLI'),
+}
 
 _LIMIT_LABELS = {
     'five_hour': '5-hour limit',
@@ -23,7 +27,7 @@ _MONTHS = (
 )
 
 _RESULTS = {
-    'reset': 'Your Claude usage was reset. One reset was used.',
+    'reset': 'Your usage was reset. One reset was used.',
     'already_used': 'This reset was already used.',
     'not_limited': 'You have not hit a usage limit, so there is nothing to reset.',
     'cooldown': 'A reset was used recently. Try again later.',
@@ -32,9 +36,9 @@ _RESULTS = {
     'changed': 'The reset details changed. Open the menu to check again.',
     'unknown': (
         'We could not confirm what happened. '
-        'Check your Claude usage before you try again.'
+        'Check your usage before you try again.'
     ),
-    'login_required': 'Sign in to Claude again, then try the reset.',
+    'login_required': 'Sign in again, then try the reset.',
     'busy': 'A reset is already in progress. Wait for it to finish.',
 }
 
@@ -76,6 +80,13 @@ def _format_date(iso):
     return date
 
 
+def menu_title(provider):
+    names = _PROVIDERS.get(provider)
+    if names is None:
+        return '↺ Reset usage'
+    return '↺ Reset %s usage' % names[0]
+
+
 def account_title(email, status=None):
     if status is None:
         return f"{email} (checking resets…)"
@@ -89,7 +100,11 @@ def account_title(email, status=None):
     return f"{email} ({remaining} {noun} left, {availability})"
 
 def confirmation(offer):
-    lines = ['Account: %s' % offer.email]
+    lines = []
+    names = _PROVIDERS.get(offer.provider)
+    if names is not None:
+        lines.append('Provider: %s' % names[1])
+    lines.append('Account: %s' % offer.email)
     if offer.label:
         lines.append('Reset: %s' % offer.label)
     clears = [_limit_label(limit_id) for limit_id in (offer.clears or ())]

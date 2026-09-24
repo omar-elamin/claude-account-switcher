@@ -20,6 +20,8 @@ class UsageState:
     windows: tuple[UsageWindow, ...] = ()
     reset_credits: int = 0
     reset_applicable: int = 0
+    # Distinguish an absent/malformed provider balance from a confirmed zero.
+    reset_counts_known: bool = False
 
     @property
     def max_percent(self) -> float | None:

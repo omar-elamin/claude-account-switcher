@@ -147,3 +147,25 @@ def test_same_account_pending_guard_is_shared_and_provider_scoped(app_module,tmp
         app._on_reset_usage(row)
         app._on_reset_usage(other)
     assert thread.call_count==2
+
+
+def test_unknown_codex_reset_metadata_is_not_displayed_as_zero():
+    from claude_switcher.reset_service import CodexResetAdapter
+    payload={'rate_limit':{'primary_window':{'used_percent':20}}}
+    state=codex_usage.codex_usage_state(payload)
+    status=CodexResetAdapter().poll('user@test.com',None,state)
+    assert status.remaining is None and status.offer is None
+
+
+def test_pending_manual_codex_confirmation_prevents_automatic_consumption(app_module,tmp_path):
+    from claude_switcher.config import AppSettings, save_settings
+    from claude_switcher.usage_state import UsageState,UsageWindow
+    app=_reset_app(app_module,tmp_path)
+    account=AccountInfo('user@test.com','pro','',True,'user@test.com',provider='codex')
+    save_accounts([account],app.config_path)
+    save_settings(AppSettings(auto_reset={'codex':True}),app.config_path)
+    app._usage_state_cache={('codex',account.email):UsageState(True,'100%',(UsageWindow('5h',100),),1,1)}
+    app._reset_in_progress={('codex',account.email)}
+    with patch.object(codex_usage,'consume_reset_credit') as consume:
+        assert app._attempt_auto_reset('codex') is None
+    consume.assert_not_called()
