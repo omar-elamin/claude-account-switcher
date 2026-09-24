@@ -168,6 +168,8 @@ class ClaudeSwitcherApp(rumps.App):
         self._last_gateway_switch = None
         self._usage_cache: dict[tuple[str, str], str] = {}
         self._usage_state_cache: dict[tuple[str, str], UsageState] = {}
+        self._claude_reset_cache: dict[str, claude_reset.Availability] = {}
+        self._claude_reset_items: dict[str, rumps.MenuItem] = {}
         self._usage_items: dict[tuple[str, str], rumps.MenuItem] = {}
         self._last_auto_switch_attempt: dict[str, float] = {}
         self._manual_pin: dict[str, str] = {}
@@ -368,13 +370,25 @@ class ClaudeSwitcherApp(rumps.App):
         accounts = [a for a in accounts if a.provider == "claude"]
         if not accounts:
             return
+        self._claude_reset_items = {}
         menu = rumps.MenuItem(claude_reset_ui.MENU_TITLE)
         for account in accounts:
-            item = rumps.MenuItem(claude_reset_ui.account_title(account.email),
-                                  callback=self._on_reset_claude_usage)
+            status = getattr(self, "_claude_reset_cache", {}).get(account.email)
+            callback = self._on_reset_claude_usage if status and status.offer else None
+            item = rumps.MenuItem(claude_reset_ui.account_title(account.email, status),
+                                  callback=callback)
             item._email = account.email
+            self._claude_reset_items[account.email] = item
             menu.add(item)
         self.menu.add(menu)
+
+    def _update_claude_reset_labels(self):
+        # Change titles and callbacks in place, without rebuilding an open menu.
+        cache = getattr(self, "_claude_reset_cache", {})
+        for email, item in getattr(self, "_claude_reset_items", {}).items():
+            status = cache.get(email)
+            item.title = claude_reset_ui.account_title(email, status)
+            item.set_callback(self._on_reset_claude_usage if status and status.offer else None)
 
     def _on_reset_claude_usage(self, sender):
         # Only this explicit menu action can enter the Claude redemption flow.
@@ -388,6 +402,10 @@ class ClaudeSwitcherApp(rumps.App):
         pending.add(email)
 
         def _checked(status):
+            if not hasattr(self, "_claude_reset_cache"):
+                self._claude_reset_cache = {}
+            self._claude_reset_cache[email] = status
+            self._update_claude_reset_labels()
             if status.offer is None:
                 pending.discard(email)
                 rumps.alert(title="Claude usage resets",
@@ -407,6 +425,10 @@ class ClaudeSwitcherApp(rumps.App):
 
                 def _finish():
                     pending.discard(email)
+                    # The old balance is no longer reliable, including after an
+                    # ambiguous response. The next GET supplies the new label.
+                    self._claude_reset_cache.pop(email, None)
+                    self._update_claude_reset_labels()
                     rumps.notification(title="Claude Switcher", subtitle="Claude usage reset",
                         message=email + "\n" + claude_reset_ui.result_message(code))
                     self._fetch_all_usage()
@@ -796,6 +818,8 @@ class ClaudeSwitcherApp(rumps.App):
         def _fetch():
             auto_switch_results = []
             auto_reset_result = None
+            reset_statuses = {a.email: claude_reset.Availability(a.email)
+                              for a in accounts if a.provider == "claude"}
             try:
                 for account in accounts:
                     key = account_key(account)
@@ -807,6 +831,13 @@ class ClaudeSwitcherApp(rumps.App):
                     state = self._fetch_usage_state(account, active_by_provider.get(account.provider))
                     self._usage_state_cache[key] = state
                     self._usage_cache[key] = state.display
+                    if account.provider == "claude":
+                        try:
+                            reset_statuses[account.email] = claude_reset.prepare_reset(
+                                account.email, self.config_path)
+                        except Exception:
+                            # A failed read must replace a stale positive balance.
+                            reset_statuses[account.email] = claude_reset.Availability(account.email)
 
                 for provider in ("claude", "codex"):
                     result = self._attempt_auto_switch(provider)
@@ -817,6 +848,7 @@ class ClaudeSwitcherApp(rumps.App):
             finally:
                 def _finish():
                     self._refresh_in_progress = False
+                    self._claude_reset_cache = reset_statuses
                     switched = any(r["status"] == "switched" for r in auto_switch_results)
 
                     states = [self._usage_state_cache.get(account_key(a)) for a in accounts]
@@ -842,6 +874,7 @@ class ClaudeSwitcherApp(rumps.App):
                     if switched or self._reset_eligible_emails() != last_eligible:
                         self._rebuild_menu()
                     self._update_usage_labels()
+                    self._update_claude_reset_labels()
                     for result in auto_switch_results:
                         self._notify_auto_switch_result(result)
                     if auto_reset_result:

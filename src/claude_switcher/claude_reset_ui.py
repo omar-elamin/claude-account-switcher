@@ -76,9 +76,17 @@ def _format_date(iso):
     return date
 
 
-def account_title(email):
-    return '%s…' % email
-
+def account_title(email, status=None):
+    if status is None:
+        return f"{email} (checking resets…)"
+    remaining = status.remaining
+    if remaining is None:
+        return f"{email} (could not check)"
+    if remaining == 0:
+        return f"{email} (0 resets left)"
+    noun = "reset" if remaining == 1 else "resets"
+    availability = "unavailable now" if status.offer is None else "available"
+    return f"{email} ({remaining} {noun} left, {availability})"
 
 def confirmation(offer):
     lines = ['Account: %s' % offer.email]

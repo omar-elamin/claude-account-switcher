@@ -1319,8 +1319,8 @@ def test_claude_reset_user_journey_real_backend(app_module, tmp_path, monkeypatc
         json.dumps({'claudeAiOauth': {'accessToken': 'test'}}) if service == 'claude-switcher:' + EMAIL else None)
     claude_reset._request_ids.clear()
     app._claude_reset_cache = {EMAIL: claude_reset.Availability(EMAIL, 1, object())}
-    monkeypatch.setattr(claude_reset, 'prepare_reset', _REAL_PREPARE_RESET)
-    with patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
+    with patch.object(claude_reset, 'prepare_reset', _REAL_PREPARE_RESET), \
+         patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
          patch.object(app_module.threading, 'Thread', ImmediateThread), \
          patch.object(app_module, '_on_main_thread', side_effect=lambda fn: fn()), \
          patch.object(app_module.rumps, 'alert', return_value=confirmed) as alert:
