@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from claude_switcher import claude_reset as _reset_backend, codex_usage as _codex_backend
+_REAL_PREPARE_RESET = _reset_backend.prepare_reset
 
 
 fake_rumps = types.ModuleType("rumps")
@@ -28,7 +30,11 @@ def app_module():
     sys.modules.pop("claude_switcher.app", None)
     with patch.dict(sys.modules, {"rumps": fake_rumps, "Foundation": fake_foundation}):
         module = importlib.import_module("claude_switcher.app")
-        yield module
+        # Existing app tests isolate provider I/O. The reset journey tests below
+        # explicitly restore the real client and supply synthetic HTTP/Keychain.
+        with patch.object(_reset_backend, "prepare_reset",
+                          side_effect=lambda email, path: _reset_backend.Availability(email)):
+            yield module
     sys.modules.pop("claude_switcher.app", None)
 
 
@@ -271,7 +277,7 @@ class TestAddRestartsInProgressSignIn:
         app.menu = MagicMock()
         app._add_auto_switch_menu = MagicMock()
         app._add_auto_reset_menu = MagicMock()
-        app._add_reset_menu = MagicMock()
+        app._add_reset_menus = MagicMock()
         # Exercise the real menu builder: both rows must carry their provider
         # and invoke the unified handler with the existing labels and order.
         with patch.object(app_module, "load_accounts", return_value=[]), \
@@ -551,6 +557,7 @@ def test_reset_menus_and_eligibility(app_module, tmp_path):
     accounts = [AccountInfo(email, "pro", "", False, email, provider=p) for p, email in
                 [("codex", "eligible"), ("codex", "ineligible"), ("codex", "unknown"), ("claude", "claude")]]
     save_accounts(accounts, app.config_path)
+    app._reset_cache = {("claude", "claude"): app_module.reset_service.ResetStatus(1, object())}
     set_auto_reset_enabled("codex", True, app.config_path)
     app._usage_state_cache = {
         ("codex", "eligible"): UsageState(True, "100%", reset_credits=3, reset_applicable=2),
@@ -564,17 +571,22 @@ def test_reset_menus_and_eligibility(app_module, tmp_path):
         titles = [getattr(i, "title", None) for i in items]
         auto = items[titles.index("Auto-switch") + 1]
         assert auto.title == "Auto-reset"
-        assert [(i.title, i.state) for i in auto.children] == [("Codex CLI", 1)]
+        assert [(i.title, i.state) for i in auto.children] == [("Claude Code", 0), ("Codex CLI", 1)]
         reset = items[titles.index("−  Remove account") + 1]
-        assert reset.title == "↺ Reset Codex usage"
-        assert [i.title for i in reset.children] == ["eligible (3 available)"]
+        claude_menu = next(i for i in items if getattr(i, "title", None) == "↺ Reset Claude usage")
+        assert len(claude_menu.children) == 1
+        assert claude_menu.children[0]._email == "claude"
+        assert claude_menu.children[0].callback == app._on_reset_usage
+        reset = next(i for i in items if getattr(i, "title", None) == "↺ Reset Codex usage")
+        assert [i._email for i in reset.children] == ["eligible", "ineligible", "unknown"]
+        assert all("checking resets" in i.title for i in reset.children)
         app._usage_state_cache = {}
         app.menu.reset_mock()
         app_module.ClaudeSwitcherApp._rebuild_menu(app)
         reset = next(c.args[0] for c in app.menu.add.call_args_list if getattr(c.args[0], "title", None) == "↺ Reset Codex usage")
-        assert len(reset.children) == 1
-        assert reset.children[0].title == "No reset applicable now"
-        assert reset.children[0].callback is None
+        assert len(reset.children) == 3
+        assert all("checking resets" in i.title for i in reset.children)
+        assert all(i.callback is None for i in reset.children)
 
 
 @pytest.mark.parametrize("initial", [False, True])
@@ -589,44 +601,58 @@ def test_toggle_auto_reset(app_module, tmp_path, initial):
                                                         message="Disabled" if initial else "Enabled")
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex"])
 @pytest.mark.parametrize("confirmed", [0, 1])
-@pytest.mark.parametrize("outcome,subtitle", [("reset", "Reset applied"), ("nothing_to_reset", "Nothing to reset"),
-    ("no_credit", "No reset credit available"), ("already_redeemed", "Already redeemed"), (RuntimeError("failed"), "Error")])
-def test_manual_reset_confirmation_and_main_thread_completion(app_module, tmp_path, confirmed, outcome, subtitle):
+@pytest.mark.parametrize("outcome", ["reset", "not_limited", "unavailable", "already_used", RuntimeError("secret")])
+def test_manual_reset_confirmation_and_main_thread_completion(app_module, tmp_path, provider, confirmed, outcome):
     app = _reset_app(app_module, tmp_path)
-    app._usage_state_cache[("codex", "user@test.com")] = app_module.UsageState(True, "100%", reset_credits=3, reset_applicable=2)
-    sender = SimpleNamespace(_email="user@test.com")
+    adapter = app_module.PROVIDERS[provider]["reset"]
+    offer = app_module.reset_service.ResetOffer(provider, "user@test.com", 3, "Reset",
+                                               ("five_hour", "seven_day"))
+    status = app_module.reset_service.ResetStatus(3, offer)
+    sender = SimpleNamespace(_provider=provider, _email=offer.email)
     with patch.object(app_module.rumps, "alert", return_value=confirmed) as alert, \
-         patch.object(app_module, "consume_reset_credit", side_effect=outcome if isinstance(outcome, Exception) else None,
+         patch.object(adapter, "prepare", return_value=status), \
+         patch.object(adapter, "redeem", side_effect=outcome if isinstance(outcome, Exception) else None,
                       return_value=outcome) as consume, \
          patch.object(app_module.threading, "Thread") as thread, \
          patch.object(app_module, "_on_main_thread") as main:
-        app._on_reset_codex_usage(sender)
-        alert.assert_called_once_with(title="Use a rate limit reset?", message="Use 1 of 3 banked resets for user@test.com? This resets that account's Codex 5-hour and weekly windows and cannot be undone.", ok="Reset", cancel="Cancel")
+        app._on_reset_usage(sender)
+        alert.assert_not_called()
+        thread.call_args.kwargs["target"]()  # GET preparation worker
+        alert.assert_not_called()
+        main.call_args.args[0]()  # Confirmation belongs on Cocoa main thread
+        assert offer.email in alert.call_args.kwargs["message"]
+        assert "Resets left: 3" in alert.call_args.kwargs["message"]
         consume.assert_not_called()
         if not confirmed:
-            thread.assert_not_called()
-            app._fetch_all_usage.assert_not_called()
+            assert thread.call_count == 1
+            assert not app._reset_in_progress
             return
-        assert thread.call_args.kwargs["daemon"] is True
+        assert thread.call_count == 2
         thread.call_args.kwargs["target"]()
-        consume.assert_called_once_with(sender._email, app.config_path)
+        consume.assert_called_once_with(offer, app.config_path)
         app_module.rumps.notification.assert_not_called()
-        app._fetch_all_usage.assert_not_called()
         main.call_args.args[0]()
-    app_module.rumps.notification.assert_called_once()
-    notification = app_module.rumps.notification.call_args.kwargs
-    assert notification["subtitle"] == subtitle
-    assert notification["title"] == ("Error" if isinstance(outcome, Exception) else "Claude Switcher")
-    assert notification["message"] == ("failed" if isinstance(outcome, Exception) else
-                                       "user@test.com: windows reset" if outcome == "reset" else sender._email)
+    notice = app_module.rumps.notification.call_args.kwargs
+    assert "secret" not in notice["message"]
+    assert offer.email in notice["message"]
+    assert app_module.PROVIDER_LABELS[provider] in notice["subtitle"]
+    if isinstance(outcome, Exception):
+        assert "could not confirm" in notice["message"]
     app._fetch_all_usage.assert_called_once()
+    assert not app._reset_in_progress
 
 
-@pytest.mark.parametrize("enabled,percent,target_state,provider,expected", [
-    (True, 100, None, "codex", True), (False, 100, None, "codex", False),
-    (True, 99, None, "codex", False), (True, 100, 10, "codex", False),
-    (True, 100, "unknown", "codex", False), (True, 100, None, "claude", False),
+def _auto_offer(app_module, provider, email, count=3):
+    offer = app_module.reset_service.ResetOffer(provider, email, count, "Reset", ("five_hour", "seven_day"))
+    return app_module.reset_service.ResetStatus(count, offer)
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("enabled,percent,target_state,expected", [
+    (True, 100, None, True), (False, 100, None, False),
+    (True, 99, None, False), (True, 100, 10, False), (True, 100, "unknown", False),
 ])
 def test_auto_reset_acceptance_conditions(app_module, tmp_path, enabled, percent, target_state, provider, expected):
     from claude_switcher.config import AccountInfo, AppSettings, save_accounts, save_settings
@@ -634,119 +660,97 @@ def test_auto_reset_acceptance_conditions(app_module, tmp_path, enabled, percent
     app = _reset_app(app_module, tmp_path)
     active = AccountInfo("active", "plus", "", True, "active", provider=provider)
     accounts = [active]
-    app._usage_state_cache[(provider, "active")] = UsageState(True, "usage", (UsageWindow("5h", percent),), 3, 2)
+    state = UsageState(True, "usage", (UsageWindow("5h", percent),), 3, 2)
+    app._usage_state_cache[(provider, "active")] = state
+    app._reset_cache = {(provider, "active"): _auto_offer(app_module, provider, "active")}
     if target_state is not None:
         accounts.append(AccountInfo("other", "plus", "", False, "other", provider=provider))
         app._usage_state_cache[(provider, "other")] = UsageState(False, "unknown") if target_state == "unknown" else UsageState(True, "usage", (UsageWindow("5h", target_state),))
     save_accounts(accounts, app.config_path)
     save_settings(AppSettings(auto_reset={provider: enabled}), app.config_path)
+    adapter = app_module.PROVIDERS[provider]["reset"]
     with patch.object(app, "_has_credentials", return_value=True), \
-         patch.object(app_module, "consume_reset_credit", return_value="reset") as consume, \
+         patch.object(app, "_fetch_usage_state", return_value=state), \
+         patch.object(adapter, "prepare", return_value=app._reset_cache[(provider,"active")]), \
+         patch.object(adapter, "redeem", return_value="reset") as consume, \
          patch.dict(app_module.PROVIDERS[provider], {"switch": MagicMock()}) as providers:
-        result = app._attempt_auto_reset(provider)
-        assert bool(result) is expected
-        if expected:
-            consume.assert_called_once_with("active", app.config_path)
-        else:
-            consume.assert_not_called()
+        assert bool(app._attempt_auto_reset(provider)) is expected
+        assert consume.call_count == int(expected)
         providers["switch"].assert_not_called()
 
 
-@pytest.mark.parametrize("outcome", ["reset", "nothing_to_reset", "no_credit", "already_redeemed", RuntimeError("failed")])
-def test_auto_reset_cooldowns_and_other_account(app_module, tmp_path, outcome):
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("outcome", ["reset", "not_limited", "unavailable", "already_used", RuntimeError("secret")])
+def test_auto_reset_cooldowns_and_other_account(app_module, tmp_path, provider, outcome):
     from claude_switcher.config import AccountInfo, AppSettings, save_accounts, save_settings
     from claude_switcher.usage_state import UsageState, UsageWindow
     app = _reset_app(app_module, tmp_path)
-    accounts = [AccountInfo(e, "plus", "", e == "active", e, provider="codex") for e in ("active", "other")]
+    accounts = [AccountInfo(e, "plus", "", e == "active", e, provider=provider) for e in ("active", "other")]
     save_accounts(accounts, app.config_path)
-    save_settings(AppSettings(auto_reset={"codex": True}), app.config_path)
-    app._usage_state_cache = {("codex", "active"): UsageState(True, "100%", (UsageWindow("5h", 100),)),
-                             ("codex", "other"): UsageState(True, "100%", (UsageWindow("5h", 100),), 3, 2)}
+    save_settings(AppSettings(auto_reset={provider: True}), app.config_path)
+    state = UsageState(True, "100%", (UsageWindow("5h", 100),), 3, 2)
+    app._usage_state_cache = {(provider,e): state for e in ("active", "other")}
+    app._reset_cache = {(provider,"other"): _auto_offer(app_module,provider,"other")}
+    adapter = app_module.PROVIDERS[provider]["reset"]
     with patch.object(app, "_has_credentials", return_value=True), \
+         patch.object(app, "_fetch_usage_state", return_value=state), \
+         patch.object(adapter, "prepare", side_effect=lambda email,path: _auto_offer(app_module,provider,email)), \
          patch.object(app_module.time, "time", return_value=10000) as now, \
-         patch.object(app_module, "consume_reset_credit", return_value=outcome,
+         patch.object(adapter, "redeem", return_value=outcome,
                       side_effect=outcome if isinstance(outcome, Exception) else None) as consume:
-        assert app._attempt_auto_reset("codex") is not None
-        consume.assert_called_once_with("other", app.config_path)
+        assert app._attempt_auto_reset(provider) is not None
+        assert consume.call_args.args[0].email == "other"
         now.return_value = 10059
-        assert app._attempt_auto_reset("codex") is None
+        assert app._attempt_auto_reset(provider) is None
         now.return_value = 13599
-        assert app._attempt_auto_reset("codex") is None
+        assert app._attempt_auto_reset(provider) is None
         assert consume.call_count == 1
         now.return_value = 13600
-        assert app._attempt_auto_reset("codex") is not None
+        assert app._attempt_auto_reset(provider) is not None
         assert consume.call_count == 2
-        # Provider cooldown still applies when a different account gains a credit.
-        app._usage_state_cache[("codex", "active")] = app._usage_state_cache[("codex", "other")]
+        app._reset_cache[(provider,"active")] = _auto_offer(app_module,provider,"active")
         now.return_value = 13659
-        assert app._attempt_auto_reset("codex") is None
+        assert app._attempt_auto_reset(provider) is None
         now.return_value = 13660
-        assert app._attempt_auto_reset("codex") is not None
-        assert consume.call_args.args[0] == "active"
+        assert app._attempt_auto_reset(provider) is not None
+        assert consume.call_args.args[0].email == "active"
+        assert not app._reset_in_progress
 
 
-@pytest.mark.parametrize("outcome,subtitle", [("reset", "Auto-reset applied"), ("nothing_to_reset", "Nothing to reset"),
-    ("no_credit", "No reset credit available"), ("already_redeemed", "Already redeemed"), (RuntimeError("failed"), "Error")])
-def test_refresh_runs_auto_reset_after_switch_and_refreshes_on_main(app_module, tmp_path, outcome, subtitle):
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("outcome", ["reset", "not_limited", "unavailable", "already_used", RuntimeError("secret")])
+def test_refresh_runs_auto_reset_after_switch_and_refreshes_on_main(app_module, tmp_path, provider, outcome):
     from claude_switcher.config import AccountInfo, AppSettings, save_accounts, save_settings
     from claude_switcher.usage_state import UsageState, UsageWindow
     app = _reset_app(app_module, tmp_path)
-    account = AccountInfo("active", "plus", "", True, "active", provider="codex")
+    account = AccountInfo("active", "plus", "", True, "active", provider=provider)
     save_accounts([account], app.config_path)
-    save_settings(AppSettings(auto_reset={"codex": True}), app.config_path)
+    save_settings(AppSettings(auto_reset={provider: True}), app.config_path)
     state = UsageState(True, "100%", (UsageWindow("5h", 100),), 3, 2)
     events = []
     app._attempt_auto_switch = MagicMock(side_effect=lambda p: events.append(p))
-
-    def consume(*args):
+    adapter = app_module.PROVIDERS[provider]["reset"]
+    def consume(*args, **kwargs):
         events.append("reset")
-        if isinstance(outcome, Exception):
-            raise outcome
+        if isinstance(outcome, Exception): raise outcome
         return outcome
-
     with patch.object(app, "_fetch_usage_state", return_value=state), \
-         patch.object(app_module, "consume_reset_credit", side_effect=consume), \
+         patch.object(adapter, "poll", return_value=_auto_offer(app_module,provider,"active")), \
+         patch.object(adapter, "prepare", return_value=_auto_offer(app_module,provider,"active")), \
+         patch.object(adapter, "redeem", side_effect=consume), \
          patch.object(app_module.threading, "Thread", ImmediateThread), \
          patch.object(app_module, "_on_main_thread") as main:
         app_module.ClaudeSwitcherApp._fetch_all_usage(app)
-        assert events == ["claude", "codex", "reset"]
+        assert events == (["claude", "reset", "codex"] if provider == "claude" else ["claude", "codex", "reset"])
         app_module.rumps.notification.assert_not_called()
         app._fetch_all_usage.assert_not_called()
         main.call_args.args[0]()
-    app_module.rumps.notification.assert_called_once()
-    assert app_module.rumps.notification.call_args.kwargs["subtitle"] == subtitle
-    if outcome == "reset":
-        assert app_module.rumps.notification.call_args.kwargs["message"] == "active: windows reset (2 left)"
+    notice = app_module.rumps.notification.call_args.kwargs
+    assert notice["subtitle"] == "Auto-reset " + app_module.PROVIDER_LABELS[provider]
+    assert "secret" not in notice["message"]
+    if isinstance(outcome, Exception): assert "could not confirm" in notice["message"]
     app._fetch_all_usage.assert_called_once()
-    app._rebuild_menu.assert_called_once()
-
-
-class TestResetMenuRebuildPolicy:
-    """The menu is rebuilt only when its structure changes, not on every refresh."""
-
-    def _app(self, app_module):
-        app = app_module.ClaudeSwitcherApp.__new__(app_module.ClaudeSwitcherApp)
-        app._usage_state_cache = {}
-        app._last_reset_eligible = frozenset()
-        return app
-
-    def test_eligible_set_reads_only_codex_applicable(self, app_module):
-        from claude_switcher.usage_state import UsageState
-        app = self._app(app_module)
-        app._usage_state_cache = {
-            ("codex", "a@t"): UsageState(True, "x", reset_credits=3, reset_applicable=2),
-            ("codex", "b@t"): UsageState(True, "x", reset_credits=3, reset_applicable=0),
-            ("claude", "c@t"): UsageState(True, "x", reset_credits=9, reset_applicable=9),
-            ("codex", "d@t"): None,
-        }
-        assert app._reset_eligible_emails() == frozenset({"a@t"})
-
-    def test_consume_wrapper_reports_any_exception(self, app_module, monkeypatch):
-        app = self._app(app_module)
-        app.config_path = "unused"
-        monkeypatch.setattr(app_module, "consume_reset_credit", lambda *a, **k: (_ for _ in ()).throw(OSError("keychain down")))
-        result = app._consume_reset("a@t", 2)
-        assert result["code"] == "error" and "keychain down" in result["message"]
+    app._rebuild_menu.assert_not_called()
 
 
 @pytest.fixture(params=["claude", "codex"])
@@ -1283,3 +1287,113 @@ def test_gateway_provider_refreshes_drifted_backup_in_keychain_only(gateway_app,
         refresh.assert_called_once_with(expiring)
         atomic.assert_not_called()
         assert ('codex-switcher:active@test.com', 'active@test.com', fresh) in [c.args for c in write.call_args_list]
+
+
+@pytest.mark.parametrize('confirmed', [0, 1])
+def test_claude_reset_user_journey_real_backend(app_module, tmp_path, monkeypatch, confirmed):
+    """Menu click -> GET -> account confirmation -> GET/POST, entirely synthetic."""
+    import io
+    import json
+    from claude_switcher import claude_reset
+    from claude_switcher.config import AccountInfo, save_accounts
+    from tests.test_claude_reset import eligible, EMAIL, ORG
+    app = _reset_app(app_module, tmp_path)
+    accounts = [AccountInfo(EMAIL, 'max', '', False, EMAIL,
+                {'emailAddress': EMAIL, 'organizationUuid': ORG}),
+                AccountInfo(EMAIL, 'pro', '', True, EMAIL, provider='codex')]
+    save_accounts(accounts, app.config_path)
+    calls = []
+    def send(req, timeout):
+        calls.append(req.get_method())
+        body = eligible() if req.get_method() == 'GET' else {'result': 'reset'}
+        return io.BytesIO(json.dumps(body).encode())
+    monkeypatch.setattr(claude_reset, '_open', send)
+    monkeypatch.setattr(claude_reset.keychain, 'read_credentials', lambda service:
+        json.dumps({'claudeAiOauth': {'accessToken': 'test'}}) if service == 'claude-switcher:' + EMAIL else None)
+    claude_reset._request_ids.clear()
+    app._reset_cache = {("claude", EMAIL): app_module.reset_service.ResetStatus(1, object())}
+    with patch.object(claude_reset, 'prepare_reset', _REAL_PREPARE_RESET), \
+         patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
+         patch.object(app_module.threading, 'Thread', ImmediateThread), \
+         patch.object(app_module, '_on_main_thread', side_effect=lambda fn: fn()), \
+         patch.object(app_module.rumps, 'alert', return_value=confirmed) as alert:
+        app._add_reset_menus([a for a in accounts if a.provider == "claude"])
+        assert calls == []
+        menu = app.menu.add.call_args.args[0]
+        assert menu.title == '↺ Reset Claude usage'
+        assert len(menu.children) == 1
+        menu.children[0].callback(menu.children[0])
+        assert EMAIL in alert.call_args.kwargs['message']
+        assert '1' in alert.call_args.kwargs['message']
+        assert alert.call_args.kwargs['cancel'] == 'Cancel'
+        assert calls == (['GET', 'GET', 'POST'] if confirmed else ['GET'])
+        if confirmed:
+            app._fetch_all_usage.assert_called_once()
+        assert not app._reset_in_progress
+
+
+def test_claude_reset_duplicate_click_is_ignored(app_module, tmp_path):
+    app = _reset_app(app_module, tmp_path)
+    sender = SimpleNamespace(_email='test@example.test', _provider='claude')
+    with patch.object(app_module.threading, 'Thread') as thread:
+        app._on_reset_usage(sender)
+        app._on_reset_usage(sender)
+    assert thread.call_count == 1
+
+
+def test_claude_reset_background_refresh_updates_each_menu_row_without_redemption(app_module, tmp_path):
+    import io
+    import json
+    from claude_switcher import claude_reset
+    from claude_switcher.config import AccountInfo, save_accounts
+    from tests.test_claude_reset import eligible, ORG
+    app = _reset_app(app_module, tmp_path)
+    accounts = [AccountInfo(email, 'max', '', False, email,
+        {'emailAddress': email, 'organizationUuid': ORG}) for email in
+        ('ready@test.com', 'empty@test.com', 'blocked@test.com', 'error@test.com')]
+    accounts.append(AccountInfo('ready@test.com', 'pro', '', False, 'codex', provider='codex'))
+    save_accounts(accounts, app.config_path)
+    calls = []
+    failed = set()
+    def send(request, timeout):
+        assert request.get_method() == 'GET', 'Background refresh must never redeem'
+        email = request.get_header('Authorization').removeprefix('Bearer ')
+        calls.append(email)
+        if email == 'error@test.com' or email in failed:
+            raise TimeoutError('synthetic transport failure')
+        body = eligible()
+        if email == 'empty@test.com':
+            body['cedar_ember']['grants'][0]['resets_left'] = 0
+        if email == 'blocked@test.com':
+            body['cedar_ember']['grants'][0]['usable_now'] = False
+        return io.BytesIO(json.dumps(body).encode())
+    def read(service):
+        assert service.startswith('claude-switcher:')
+        return json.dumps({'claudeAiOauth': {'accessToken': service.split(':',1)[1]}})
+    with patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
+         patch.object(app_module.threading, 'Thread', ImmediateThread), \
+         patch.object(app_module, '_on_main_thread', side_effect=lambda fn: fn()), \
+         patch.object(claude_reset, 'prepare_reset', _REAL_PREPARE_RESET), \
+         patch.object(claude_reset, '_open', side_effect=send), \
+         patch.object(claude_reset.keychain, 'read_credentials', side_effect=read), \
+         patch.object(app, '_fetch_usage_state', return_value=app_module.UsageState(True, '10%')), \
+         patch.object(app, '_attempt_auto_switch', return_value=None), \
+         patch.object(app, '_attempt_auto_reset', return_value=None), \
+         patch.object(claude_reset, 'redeem_reset') as redeem:
+        app._add_reset_menus([a for a in accounts if a.provider == "claude"])
+        rows = app.menu.add.call_args.args[0].children
+        assert all('checking resets' in row.title for row in rows)
+        app_module.ClaudeSwitcherApp._fetch_all_usage(app)
+        assert calls == [a.email for a in accounts if a.provider == 'claude']
+        assert [row.title for row in rows] == [
+            'ready@test.com (1 reset left, available)',
+            'empty@test.com (0 resets left)',
+            'blocked@test.com (1 reset left, unavailable now)',
+            'error@test.com (could not check)']
+        assert [row.callback is not None for row in rows] == [True, False, False, False]
+        # A later failure must replace a previously positive balance.
+        failed.add('ready@test.com')
+        app_module.ClaudeSwitcherApp._fetch_all_usage(app)
+        assert rows[0].title == 'ready@test.com (could not check)'
+        assert rows[0].callback is None
+        redeem.assert_not_called()

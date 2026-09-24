@@ -25,22 +25,27 @@ def should_auto_reset(active_usage: UsageState, enabled: bool, threshold: float)
 
 
 def choose_auto_reset_target(
+    provider: str,
     accounts: list[AccountInfo],
     active_email: str,
     usage_by_account: dict[AccountKey, UsageState],
+    reset_by_account: dict,
+    threshold: float = 100.0,
 ) -> AccountInfo | None:
-    """Prefer the active Codex account, then an exhausted saved account."""
+    """Prefer the active account, then a depleted account with a usable reset."""
     candidates = []
     for account in accounts:
-        if account.provider != "codex":
+        if account.provider != provider:
             continue
-        state = usage_by_account.get(account_key(account))
-        if state is None or state.reset_applicable <= 0:
+        key = account_key(account)
+        state = usage_by_account.get(key)
+        reset = reset_by_account.get(key)
+        if (state is None or not state.available or not state.is_exhausted(threshold)
+                or reset is None or reset.offer is None):
             continue
         if account.email == active_email:
             return account
-        if state.is_exhausted():
-            candidates.append(account)
+        candidates.append(account)
     return candidates[0] if candidates else None
 
 

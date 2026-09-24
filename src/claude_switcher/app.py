@@ -9,6 +9,7 @@ from pathlib import Path
 import rumps
 from Foundation import NSBundle, NSOperationQueue
 
+from claude_switcher import reset_service, reset_ui
 from claude_switcher import codex_core, core, keychain, login_item
 from claude_switcher.codex_gateway import (
     Gateway, disable_config, enable_config, gateway_configured,
@@ -35,7 +36,6 @@ from claude_switcher.codex_usage import (
     fetch_active_codex_usage,
     fetch_codex_usage_for_account,
     codex_usage_state,
-    consume_reset_credit,
 )
 from claude_switcher.config import (
     load_accounts,
@@ -74,6 +74,7 @@ PROVIDERS = {
         ),
         "add_success": "Claude account added",
         "core": core,
+        "reset": reset_service.ClaudeResetAdapter(),
         "credential_prefix": "claude-switcher:",
         "account_click": "_on_claude_account_click",
         "switch": switch_account,
@@ -88,6 +89,7 @@ PROVIDERS = {
         ),
         "add_success": "Signed in to Codex",
         "core": codex_core,
+        "reset": reset_service.CodexResetAdapter(),
         "credential_prefix": "codex-switcher:",
         "account_click": "_on_codex_account_click",
         "switch": switch_codex_account,
@@ -98,12 +100,10 @@ PROVIDERS = {
 }
 AUTO_SWITCH_COOLDOWN_SECONDS = 60
 AUTO_RESET_ACCOUNT_COOLDOWN_SECONDS = 3600
-RESET_MESSAGES = {
-    "reset": "Reset applied",
-    "nothing_to_reset": "Nothing to reset",
-    "no_credit": "No reset credit available",
-    "already_redeemed": "Already redeemed",
-}
+# Manual callbacks run on Cocoa's main thread; automatic resets run on a worker.
+# Claiming a provider/account must be atomic across both entry points.
+_RESET_OPERATION_LOCK = threading.Lock()
+
 
 # When a usage refresh comes back unavailable (e.g. the first fetch races a macOS
 # Keychain-access prompt, which blocks `security` past its timeout), retry a few
@@ -167,12 +167,13 @@ class ClaudeSwitcherApp(rumps.App):
         self._last_gateway_switch = None
         self._usage_cache: dict[tuple[str, str], str] = {}
         self._usage_state_cache: dict[tuple[str, str], UsageState] = {}
+        self._reset_cache: dict[tuple[str, str], reset_service.ResetStatus] = {}
+        self._reset_items: dict[tuple[str, str], rumps.MenuItem] = {}
         self._usage_items: dict[tuple[str, str], rumps.MenuItem] = {}
         self._last_auto_switch_attempt: dict[str, float] = {}
         self._manual_pin: dict[str, str] = {}
-        self._last_reset_eligible: frozenset[str] = frozenset()
         self._last_auto_reset_attempt: dict[str, float] = {}
-        self._last_auto_reset_by_account: dict[str, float] = {}
+        self._last_auto_reset_by_account: dict[tuple[str, str], float] = {}
         self._refresh_in_progress = False
         self._switch_in_progress: set[str] = set()
         self._quick_retries_left = QUICK_RETRY_BUDGET
@@ -233,17 +234,8 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Claude Code or Codex CLI before using Claude Switcher.",
             )
 
-    def _reset_eligible_emails(self) -> frozenset[str]:
-        """Codex accounts that can apply a rate-limit reset now, per cached usage."""
-        cache = getattr(self, "_usage_state_cache", {}) or {}
-        return frozenset(
-            email for (provider, email), state in cache.items()
-            if provider == "codex" and state is not None and state.reset_applicable > 0
-        )
-
     def _rebuild_menu(self):
         """Rebuild the menu from current account state."""
-        self._last_reset_eligible = self._reset_eligible_emails()
         accounts = load_accounts(self.config_path)
         self.menu.clear()
         self._usage_items = {}
@@ -278,7 +270,7 @@ class ClaudeSwitcherApp(rumps.App):
                 remove_menu.add(item)
             self.menu.add(remove_menu)
 
-        self._add_reset_menu(accounts)
+        self._add_reset_menus(accounts)
 
         self.menu.add(rumps.separator)
         item = rumps.MenuItem("Start at login", callback=self._on_toggle_start_at_login)
@@ -338,73 +330,149 @@ class ClaudeSwitcherApp(rumps.App):
     def _add_auto_reset_menu(self):
         settings = load_settings(self.config_path)
         auto_menu = rumps.MenuItem("Auto-reset")
-        item = rumps.MenuItem("Codex CLI", callback=self._on_toggle_auto_reset)
-        item._provider = "codex"
-        item.state = 1 if settings.auto_reset.get("codex", False) else 0
-        auto_menu.add(item)
+        for provider, entry in PROVIDERS.items():
+            if not entry["reset"].supports_automatic:
+                continue
+            item = rumps.MenuItem(PROVIDER_LABELS[provider], callback=self._on_toggle_auto_reset)
+            item._provider = provider
+            item.state = int(settings.auto_reset.get(provider, False))
+            auto_menu.add(item)
         self.menu.add(auto_menu)
 
-    def _add_reset_menu(self, accounts):
-        reset_menu = rumps.MenuItem("↺ Reset Codex usage")
-        eligible = False
-        for account in accounts:
-            if account.provider != "codex":
+    def _add_reset_menus(self, accounts):
+        self._reset_items = {}
+        cache = getattr(self, "_reset_cache", {})
+        for provider in PROVIDERS:
+            rows = [a for a in accounts if a.provider == provider]
+            if not rows:
                 continue
-            state = self._usage_state_cache.get(account_key(account))
-            if state is None or state.reset_applicable <= 0:
-                continue
-            item = rumps.MenuItem(f"{account.email} ({state.reset_credits} available)",
-                                  callback=self._on_reset_codex_usage)
-            item._email = account.email
-            reset_menu.add(item)
-            eligible = True
-        if not eligible:
-            reset_menu.add(rumps.MenuItem("No reset applicable now", callback=None))
-        self.menu.add(reset_menu)
+            menu = rumps.MenuItem(reset_ui.menu_title(provider))
+            menu._provider = provider
+            for account in rows:
+                key = account_key(account)
+                status = cache.get(key)
+                item = rumps.MenuItem(reset_ui.account_title(account.email, status),
+                    callback=self._on_reset_usage if status and status.offer else None)
+                item._email, item._provider = account.email, provider
+                self._reset_items[key] = item
+                menu.add(item)
+            self.menu.add(menu)
 
-    def _on_reset_codex_usage(self, sender):
-        email = sender._email
-        state = self._usage_state_cache.get(("codex", email))
-        if state is None or state.reset_applicable <= 0:
+    def _update_reset_labels(self):
+        cache = getattr(self, "_reset_cache", {})
+        for (provider, email), item in getattr(self, "_reset_items", {}).items():
+            status = cache.get((provider, email))
+            item.title = reset_ui.account_title(email, status)
+            item.set_callback(self._on_reset_usage if status and status.offer else None)
+
+    def _begin_reset(self, key):
+        with _RESET_OPERATION_LOCK:
+            pending = getattr(self, "_reset_in_progress", None)
+            if pending is None:
+                pending = self._reset_in_progress = set()
+            if key in pending:
+                return False
+            pending.add(key)
+            return True
+
+    def _end_reset(self, key):
+        with _RESET_OPERATION_LOCK:
+            self._reset_in_progress.discard(key)
+
+    def _on_reset_usage(self, sender):
+        provider, email = sender._provider, sender._email
+        adapter = PROVIDERS[provider]["reset"]
+        key = (provider, email)
+        if not self._begin_reset(key):
             return
-        if rumps.alert(
-            title="Use a rate limit reset?",
-            message=f"Use 1 of {state.reset_credits} banked resets for {email}? This resets that account's Codex 5-hour and weekly windows and cannot be undone.",
-            ok="Reset", cancel="Cancel",
-        ) != 1:
-            return
 
-        def _reset():
-            result = self._consume_reset(email, state.reset_credits)
+        def _checked(status):
+            if not hasattr(self, "_reset_cache"):
+                self._reset_cache = {}
+            self._reset_cache[key] = status
+            self._update_reset_labels()
+            if status.offer is None:
+                self._end_reset(key)
+                rumps.alert(title="Usage resets",
+                            message=reset_ui.unavailable(email, status.remaining))
+                return
+            if rumps.alert(title=reset_ui.CONFIRM_TITLE,
+                           message=reset_ui.confirmation(status.offer),
+                           ok="Reset", cancel="Cancel") != 1:
+                self._end_reset(key)
+                return
 
-            def _finish():
-                self._notify_reset_result(result)
-                self._fetch_all_usage()
+            def _redeem():
+                try:
+                    code = adapter.redeem(status.offer, self.config_path)
+                except Exception:
+                    code = "unknown"
 
-            _on_main_thread(_finish)
+                def _finish():
+                    self._end_reset(key)
+                    self._reset_cache.pop(key, None)
+                    self._update_reset_labels()
+                    self._notify_reset_result({"provider": provider, "email": email, "code": code})
+                    self._fetch_all_usage()
 
-        threading.Thread(target=_reset, daemon=True).start()
+                _on_main_thread(_finish)
 
-    def _consume_reset(self, email: str, credits: int) -> dict:
+            threading.Thread(target=_redeem, daemon=True).start()
+
+        def _check():
+            try:
+                status = adapter.prepare(email, self.config_path)
+            except Exception:
+                status = reset_service.ResetStatus()
+            _on_main_thread(lambda: _checked(status))
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _auto_reset_authorized(self, provider, trigger_email):
+        settings = load_settings(self.config_path)
+        active = get_active_account(self.config_path, provider=provider)
+        if active is None or active.email != trigger_email:
+            return False
+        state = self._usage_state_cache.get(account_key(active))
+        if state is None or not should_auto_reset(
+                state, settings.auto_reset.get(provider, False), settings.auto_switch_threshold):
+            return False
+        return choose_auto_switch_target(provider, load_accounts(self.config_path), active.email,
+            self._usage_state_cache, self._has_credentials, settings.auto_switch_threshold) is None
+
+    def _consume_reset(self, provider: str, email: str, credits: int, trigger_email: str) -> dict:
+        result = {"provider": provider, "email": email, "credits": credits, "code": "unavailable"}
         try:
-            code = consume_reset_credit(email, self.config_path)
-            return {"code": code, "email": email, "credits": credits}
-        except Exception as exc:  # noqa: BLE001 - a dead thread would hide the failure
-            return {"code": "error", "email": email, "message": str(exc)}
+            settings = load_settings(self.config_path)
+            if not self._auto_reset_authorized(provider, trigger_email):
+                return result
+            account = next((a for a in load_accounts(self.config_path)
+                            if a.provider == provider and a.email == email), None)
+            if account is None:
+                return result
+            state = self._fetch_usage_state(account, get_active_account(self.config_path, provider=provider))
+            if not should_auto_reset(state, True, settings.auto_switch_threshold):
+                return result
+            adapter = PROVIDERS[provider]["reset"]
+            status = adapter.prepare(email, self.config_path)
+            if status.offer is None:
+                return result
+            # Disabling the option during the read cancels the pending redemption.
+            authorize = lambda: self._auto_reset_authorized(provider, trigger_email)
+            if not authorize():
+                return result
+            result["credits"] = status.remaining
+            result["code"] = adapter.redeem(status.offer, self.config_path, authorize=authorize)
+        except Exception:
+            result["code"] = "unknown"
+        return result
 
     def _notify_reset_result(self, result: dict, automatic: bool = False):
-        code, email = result["code"], result["email"]
-        if code == "error":
-            rumps.notification(title="Error", subtitle="Error", message=result["message"])
-            return
-        subtitle = RESET_MESSAGES[code]
-        message = email
-        if code == "reset":
-            message = f"{email}: windows reset"
-            if automatic:
-                subtitle = "Auto-reset applied"
-                message += f" ({result['credits'] - 1} left)"
-        rumps.notification(title="Claude Switcher", subtitle=subtitle, message=message)
+        provider = result["provider"]
+        label = PROVIDER_LABELS[provider]
+        subtitle = f"Auto-reset {label}" if automatic else f"{label} usage reset"
+        rumps.notification(title="Claude Switcher", subtitle=subtitle,
+            message=result["email"] + "\n" + reset_ui.result_message(result["code"]))
 
     def _on_claude_account_click(self, sender):
         self._switch_account("claude", sender._email)
@@ -733,7 +801,8 @@ class ClaudeSwitcherApp(rumps.App):
 
         def _fetch():
             auto_switch_results = []
-            auto_reset_result = None
+            auto_reset_results = []
+            reset_statuses = {account_key(a): reset_service.ResetStatus() for a in accounts}
             try:
                 for account in accounts:
                     key = account_key(account)
@@ -745,16 +814,25 @@ class ClaudeSwitcherApp(rumps.App):
                     state = self._fetch_usage_state(account, active_by_provider.get(account.provider))
                     self._usage_state_cache[key] = state
                     self._usage_cache[key] = state.display
+                    try:
+                        reset_statuses[key] = PROVIDERS[account.provider]["reset"].poll(
+                            account.email, self.config_path, state)
+                    except Exception:
+                        reset_statuses[key] = reset_service.ResetStatus()
 
                 for provider in ("claude", "codex"):
                     result = self._attempt_auto_switch(provider)
                     if result:
                         auto_switch_results.append(result)
-                    if provider == "codex":
-                        auto_reset_result = self._attempt_auto_reset(provider)
+                    if PROVIDERS[provider]["reset"].supports_automatic:
+                        reset_result = self._attempt_auto_reset(provider, reset_statuses)
+                        if reset_result:
+                            auto_reset_results.append(reset_result)
+                            reset_statuses[provider, reset_result["email"]] = reset_service.ResetStatus()
             finally:
                 def _finish():
                     self._refresh_in_progress = False
+                    self._reset_cache = reset_statuses
                     switched = any(r["status"] == "switched" for r in auto_switch_results)
 
                     states = [self._usage_state_cache.get(account_key(a)) for a in accounts]
@@ -772,18 +850,16 @@ class ClaudeSwitcherApp(rumps.App):
                             if state is None or not state.available:
                                 self._usage_cache[account_key(account)] = "Checking…"
 
-                    # Rebuild only when the menu's structure changed: a switch, or
-                    # the set of Codex accounts that can apply a reset. Rebuilding on
-                    # every 5-minute tick would flicker an open menu and re-run the
-                    # per-account keychain reads on the main thread.
-                    last_eligible = getattr(self, "_last_reset_eligible", frozenset())
-                    if switched or self._reset_eligible_emails() != last_eligible:
+                    # Account rows remain present when availability changes.
+                    # Update titles in place; switching still changes the structure.
+                    if switched:
                         self._rebuild_menu()
                     self._update_usage_labels()
+                    self._update_reset_labels()
                     for result in auto_switch_results:
                         self._notify_auto_switch_result(result)
-                    if auto_reset_result:
-                        self._notify_reset_result(auto_reset_result, automatic=True)
+                    for reset_result in auto_reset_results:
+                        self._notify_reset_result(reset_result, automatic=True)
                     if self._manual_refresh:
                         # The menu closed on click, so tell the user it finished
                         # and give them the numbers without reopening.
@@ -793,7 +869,7 @@ class ClaudeSwitcherApp(rumps.App):
                             subtitle="Usage updated",
                             message=self._active_usage_summary(),
                         )
-                    if switched or auto_reset_result:
+                    if switched or auto_reset_results:
                         self._fetch_all_usage()
                     elif should_retry:
                         self._schedule_quick_retry()
@@ -807,15 +883,18 @@ class ClaudeSwitcherApp(rumps.App):
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _on_toggle_auto_reset(self, sender):
+        provider = sender._provider
+        if not PROVIDERS[provider]["reset"].supports_automatic:
+            return
         settings = load_settings(self.config_path)
-        enabled = not settings.auto_reset.get("codex", False)
-        set_auto_reset_enabled("codex", enabled, self.config_path)
+        enabled = not settings.auto_reset.get(provider, False)
+        set_auto_reset_enabled(provider, enabled, self.config_path)
         self._rebuild_menu()
-        rumps.notification(title="Claude Switcher", subtitle="Auto-reset Codex CLI",
+        rumps.notification(title="Claude Switcher", subtitle=f"Auto-reset {PROVIDER_LABELS[provider]}",
                            message="Enabled" if enabled else "Disabled")
 
-    def _attempt_auto_reset(self, provider: str) -> dict | None:
-        if provider != "codex":
+    def _attempt_auto_reset(self, provider: str, reset_statuses=None) -> dict | None:
+        if not PROVIDERS[provider]["reset"].supports_automatic:
             return None
         active = get_active_account(self.config_path, provider=provider)
         if active is None:
@@ -833,20 +912,33 @@ class ClaudeSwitcherApp(rumps.App):
             self._has_credentials, settings.auto_switch_threshold,
         ) is not None:
             return None
-        target = choose_auto_reset_target(accounts, active.email, self._usage_state_cache)
+        statuses = reset_statuses if reset_statuses is not None else getattr(self, "_reset_cache", {})
+        target = choose_auto_reset_target(provider, accounts, active.email,
+            self._usage_state_cache, statuses, settings.auto_switch_threshold)
         if target is None:
             return None
-        now = time.time()
-        last_attempt = self._last_auto_reset_attempt.get(provider)
-        last_account_attempt = self._last_auto_reset_by_account.get(target.email)
-        if (last_attempt is not None and now - last_attempt < AUTO_SWITCH_COOLDOWN_SECONDS) or (
-            last_account_attempt is not None and now - last_account_attempt < AUTO_RESET_ACCOUNT_COOLDOWN_SECONDS
-        ):
-            return None
-        # Guard attempts as well as successes: a delayed reset must not burn another credit.
-        self._last_auto_reset_attempt[provider] = now
-        self._last_auto_reset_by_account[target.email] = now
-        return self._consume_reset(target.email, self._usage_state_cache[account_key(target)].reset_credits)
+        key = account_key(target)
+        with _RESET_OPERATION_LOCK:
+            pending = getattr(self, "_reset_in_progress", None)
+            if pending is None:
+                pending = self._reset_in_progress = set()
+            if key in pending:
+                return None
+            now = time.time()
+            last_attempt = self._last_auto_reset_attempt.get(provider)
+            last_account_attempt = self._last_auto_reset_by_account.get(key)
+            if (last_attempt is not None and now - last_attempt < AUTO_SWITCH_COOLDOWN_SECONDS) or (
+                last_account_attempt is not None and now - last_account_attempt < AUTO_RESET_ACCOUNT_COOLDOWN_SECONDS
+            ):
+                return None
+            # Guard attempts too: unknown responses must not burn another credit.
+            self._last_auto_reset_attempt[provider] = now
+            self._last_auto_reset_by_account[key] = now
+            pending.add(key)
+        try:
+            return self._consume_reset(provider, target.email, statuses[key].remaining, active.email)
+        finally:
+            self._end_reset(key)
 
     def _schedule_quick_retry(self):
         """Refetch usage after a short delay, on the main thread. One pending at a time."""

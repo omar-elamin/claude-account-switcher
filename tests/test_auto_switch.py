@@ -1,3 +1,4 @@
+import pytest
 from claude_switcher.auto_switch import (
     account_key,
     should_auto_switch,
@@ -92,26 +93,30 @@ def test_should_auto_reset_matches_switch_semantics():
                 assert should_auto_reset(state, enabled, threshold) == should_auto_switch(state, enabled, threshold)
 
 
-def test_reset_target_prefers_active_then_first_exhausted_codex():
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_reset_target_prefers_active_then_first_exhausted_same_provider(provider):
     from claude_switcher.auto_switch import choose_auto_reset_target
+    from claude_switcher.reset_service import ResetStatus
     from dataclasses import replace
-    active = _account("active", "codex", True)
-    other = _account("other", "codex")
-    later = _account("later", "codex")
-    claude = _account("active", "claude")
-    healthy = _account("healthy", "codex")
-    accounts = [claude, healthy, other, later, active]
-    credit = replace(_usage(100), reset_credits=3, reset_applicable=2)
-    states = {account_key(a): credit for a in accounts}
-    states[account_key(healthy)] = replace(credit, windows=(UsageWindow("5h", 10),))
-    assert choose_auto_reset_target(accounts, active.email, states) == active
-    states[account_key(active)] = _usage(100)
-    assert choose_auto_reset_target(accounts, active.email, states) == other
+    active = _account("active", provider, True)
+    other = _account("other", provider)
+    later = _account("later", provider)
+    foreign = _account("active", "claude" if provider == "codex" else "codex")
+    healthy = _account("healthy", provider)
+    accounts = [foreign, healthy, other, later, active]
+    states = {account_key(a): _usage(100) for a in accounts}
+    statuses = {account_key(a): ResetStatus(3, object()) for a in accounts}
+    states[account_key(healthy)] = _usage(10)
+    def pick():
+        return choose_auto_reset_target(provider, accounts, active.email, states, statuses)
+    assert pick() == active
+    statuses[account_key(active)] = ResetStatus(0)
+    assert pick() == other
     del states[account_key(other)]
-    assert choose_auto_reset_target(accounts, active.email, states) == later
-    states[account_key(later)] = replace(credit, reset_applicable=0)
-    assert choose_auto_reset_target(accounts, active.email, states) is None
-    assert choose_auto_reset_target(accounts, active.email, {}) is None
+    assert pick() == later
+    statuses[account_key(later)] = ResetStatus(3)
+    assert pick() is None
+    assert choose_auto_reset_target(provider, accounts, active.email, {}, statuses) is None
 
 
 def test_target_window_uses_provider_target():

@@ -201,7 +201,29 @@ def _reset_counts(usage: dict | None) -> tuple[int, int]:
     )
 
 
-def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH) -> str:
+def reset_account_id(email: str, config_path=DEFAULT_CONFIG_PATH) -> str | None:
+    """Bind manual consent to the saved Codex identity, across token refreshes."""
+    with codex_core._CODEX_LOCK:
+        if codex_core._add_in_progress:
+            return None
+        account = next((a for a in load_accounts(config_path)
+                        if a.provider == "codex" and a.email == email), None)
+        if account is None:
+            return None
+        blob = (codex_core._read_codex_credentials_for_import_raw() if account.active
+                else keychain.read_credentials(f"codex-switcher:{email}"))
+        if not blob:
+            return None
+        actual_email = codex_core._codex_email_from_credentials(blob)
+        if actual_email and actual_email != email:
+            return None
+        tokens = _extract_codex_token(blob)
+        return tokens[1] if tokens else None
+
+
+def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH, *,
+                         expected_account_id: str | None = None,
+                         expected_credits: int | None = None, authorize=None) -> str:
     """Recheck usage, then redeem one reset with an idempotent network retry."""
     key = str(uuid4())
     busy_message = "A Codex account add is in progress. Try again in a moment."
@@ -222,6 +244,8 @@ def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH) -> str:
     if isinstance(error, dict) and error.get("code") == "login_required":
         logger.info("Codex reset email=%s key=%s outcome=login_required", email, key)
         raise RuntimeError(f"Login required for {email}. Add the account again first.")
+    if expected_credits is not None and _reset_counts(usage)[0] != expected_credits:
+        return "changed"
     if _reset_counts(usage)[1] <= 0:
         logger.info("Codex reset email=%s key=%s outcome=no_credit", email, key)
         return "no_credit"
@@ -245,6 +269,14 @@ def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH) -> str:
             logger.info("Codex reset email=%s key=%s outcome=credentials_unavailable", email, key)
             raise RuntimeError("Codex credentials unavailable. Sign in again.")
         token, account_id = tokens
+        if expected_account_id is not None:
+            # Manual consent must survive neither account removal nor replacement.
+            account = next((a for a in load_accounts(config_path)
+                            if a.provider == "codex" and a.email == email), None)
+            actual_email = codex_core._codex_email_from_credentials(blob)
+            if (account is None or account_id != expected_account_id
+                    or (actual_email and actual_email != email)):
+                return "changed"
         req = Request(CODEX_RESET_CONSUME_URL, method="POST",
                       data=json.dumps({"redeem_request_id": key}).encode())
         req.add_header("Authorization", f"Bearer {token}")
@@ -254,6 +286,8 @@ def consume_reset_credit(email: str, config_path=DEFAULT_CONFIG_PATH) -> str:
         req.add_header("Content-Type", "application/json")
 
         for attempt in range(2):
+            if authorize is not None and not authorize():
+                return "changed" if attempt == 0 else "unknown"
             status = None
             try:
                 with urlopen(req, timeout=10) as resp:
@@ -350,9 +384,15 @@ def codex_usage_state(usage: dict | None) -> UsageState:
     if not parts:
         return UsageState(available=False, display="Usage unavailable")
     available, applicable = _reset_counts(usage)
+    credits = usage.get("rate_limit_reset_credits")
+    counts_known = (isinstance(credits, dict)
+                    and type(credits.get("available_count")) is int
+                    and type(credits.get("applicable_available_count")) is int
+                    and 0 <= applicable <= available)
     suffix = f" · {available} reset{'s' if available != 1 else ''}" if available > 0 else ""
     return UsageState(available=True, display=" | ".join(parts) + suffix, windows=tuple(windows),
-                      reset_credits=available, reset_applicable=applicable)
+                      reset_credits=available, reset_applicable=applicable,
+                      reset_counts_known=counts_known)
 
 
 def format_codex_usage(usage: dict | None) -> str:
