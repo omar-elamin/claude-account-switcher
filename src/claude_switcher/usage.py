@@ -165,6 +165,7 @@ def fetch_active_usage(config_path=None) -> dict | None:
             live_email, active.email,
         )
         return fetch_usage_for_account(active.email, config_path or DEFAULT_CONFIG_PATH)
+    core.sync_current_account_credentials(config_path or DEFAULT_CONFIG_PATH)
     return fetch_usage(keychain.CLAUDE_SERVICE)
 
 

@@ -48,7 +48,7 @@ class TestImportCurrentAccount:
     @patch("claude_switcher.core.keychain")
     def test_import_success(self, mock_kc, mock_status, mock_oauth, tmp_path):
         mock_status.return_value = {"email": "test@test.com", "subscriptionType": "pro", "orgName": "Org"}
-        mock_kc.read_credentials.return_value = '{"accessToken":"tok"}'
+        mock_kc.read_credentials.return_value = '{"claudeAiOauth":{"accessToken":"tok","refreshToken":"tok-refresh","expiresAt":4102444800000}}'
         mock_kc.read_account_attribute.return_value = "testuser"
         mock_oauth.return_value = {"emailAddress": "test@test.com"}
 
@@ -59,7 +59,7 @@ class TestImportCurrentAccount:
         assert result.email == "test@test.com"
         assert result.oauth_account == {"emailAddress": "test@test.com"}
         mock_kc.write_credentials.assert_called_once_with(
-            "claude-switcher:test@test.com", "testuser", '{"accessToken":"tok"}'
+            "claude-switcher:test@test.com", "testuser", '{"claudeAiOauth":{"accessToken":"tok","refreshToken":"tok-refresh","expiresAt":4102444800000}}'
         )
 
     @patch("claude_switcher.core.get_auth_status")
@@ -82,18 +82,18 @@ class TestSwitchAccount:
                                 oauth_account={"emailAddress": "b@test.com"}), config_path)
 
         mock_kc.read_credentials.side_effect = [
-            '{"accessToken":"refreshed-a"}',
-            '{"accessToken":"tok-b"}',
+            '{"claudeAiOauth":{"accessToken":"refreshed-a","refreshToken":"refreshed-a-refresh","expiresAt":4102444800000}}',
+            '{"claudeAiOauth":{"accessToken":"tok-b","refreshToken":"tok-b-refresh","expiresAt":4102444800000}}',
         ]
         mock_read_oauth.return_value = {"emailAddress": "a@test.com"}
 
         switch_account("b@test.com", config_path)
 
         mock_kc.write_credentials.assert_any_call(
-            "claude-switcher:a@test.com", "usera", '{"accessToken":"refreshed-a"}'
+            "claude-switcher:a@test.com", "usera", '{"claudeAiOauth":{"accessToken":"refreshed-a","refreshToken":"refreshed-a-refresh","expiresAt":4102444800000}}'
         )
         mock_kc.write_credentials.assert_any_call(
-            "Claude Code-credentials", "userb", '{"accessToken":"tok-b"}'
+            "Claude Code-credentials", "userb", '{"claudeAiOauth":{"accessToken":"tok-b","refreshToken":"tok-b-refresh","expiresAt":4102444800000}}'
         )
         mock_write_oauth.assert_called_once_with({"emailAddress": "b@test.com"})
 
@@ -126,9 +126,9 @@ class TestAddNewAccount:
         from claude_switcher.config import add_account, AccountInfo
         add_account(AccountInfo("a@test.com", "pro", "Org A", True, "usera"), config_path)
 
-        mock_kc.snapshot_credentials.return_value = ("usera", '{"accessToken":"tok-a"}')
+        mock_kc.snapshot_credentials.return_value = ("usera", '{"claudeAiOauth":{"accessToken":"tok-a","refreshToken":"tok-a-refresh","expiresAt":4102444800000}}')
         mock_kc._single_line.side_effect = lambda value: value
-        mock_kc.read_credentials.return_value = '{"accessToken":"tok-new"}'
+        mock_kc.read_credentials.return_value = '{"claudeAiOauth":{"accessToken":"tok-new","refreshToken":"tok-new-refresh","expiresAt":4102444800000}}'
         mock_kc.read_account_attribute.side_effect = ["newuser"]
         mock_kc.delete_credentials.return_value = False
         mock_login.return_value = True
@@ -158,7 +158,7 @@ class TestAddNewAccount:
         assert result is None
 
     def test_cancelled_add_without_active_config_restores_live_snapshot(self, tmp_path):
-        snapshot = ("live-account", '{"accessToken":"live"}')
+        snapshot = ("live-account", '{"claudeAiOauth":{"accessToken":"live","refreshToken":"live-refresh","expiresAt":4102444800000}}')
         with patch.object(core_mod, "keychain") as mock_kc, patch.object(
             core_mod, "run_auth_logout"
         ), patch.object(core_mod, "run_auth_login", return_value=False):
@@ -181,7 +181,7 @@ class TestAddNewAccount:
             AccountInfo("old@test.com", "pro", "", True, "config-account"),
             config_path,
         )
-        snapshot = ("live-account", '{"accessToken":"live"}')
+        snapshot = ("live-account", '{"claudeAiOauth":{"accessToken":"live","refreshToken":"live-refresh","expiresAt":4102444800000}}')
 
         with patch.object(core_mod, "keychain") as mock_kc, patch.object(
             core_mod, "run_auth_logout"
@@ -373,7 +373,7 @@ class TestCoreWithMixedProviders:
             AccountInfo("user@test.com", "plus", "", True, "codex-user", provider="codex"),
             config_path,
         )
-        mock_kc.read_credentials.side_effect = ['{"token":"current"}', '{"token":"target"}']
+        mock_kc.read_credentials.side_effect = ['{"claudeAiOauth":{"accessToken":"current"}}', '{"claudeAiOauth":{"accessToken":"target"}}']
         mock_read_oauth.return_value = {"emailAddress": "user@test.com"}
 
         switch_account("other@test.com", config_path)
@@ -426,7 +426,7 @@ class TestClaudeAddIdentityGuard:
         ), patch.object(
             core_mod, "_read_oauth_account", return_value={"emailAddress": "B@test.com"}
         ):
-            mock_kc.snapshot_credentials.return_value = ("uB", '{"accessToken":"B"}')
+            mock_kc.snapshot_credentials.return_value = ("uB", '{"claudeAiOauth":{"accessToken":"B","refreshToken":"B-refresh","expiresAt":4102444800000}}')
             mock_kc._single_line.side_effect = lambda v: v
             mock_kc.delete_credentials.return_value = False
             add_new_account(config_path)

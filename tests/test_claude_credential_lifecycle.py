@@ -5,6 +5,8 @@ credentials are synthetic; these tests never touch a user's login.
 """
 
 import json
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -12,6 +14,10 @@ from types import SimpleNamespace
 import pytest
 
 from claude_switcher import config, core, usage
+
+REAL_KEYCHAIN = {name: getattr(core.keychain, name) for name in (
+    "read_credentials", "write_credentials", "read_account_attribute",
+    "snapshot_credentials", "restore_credentials", "delete_credentials")}
 
 
 def credentials(label, *, expired=False):
@@ -175,3 +181,65 @@ def test_usage_poll_defers_reconciliation_during_account_add(lifecycle, monkeypa
     usage.fetch_active_usage(s.path)
     assert s.store[s.a] == CLEARED
     assert s.writes == []
+
+
+def test_repeated_switch_to_same_account_preserves_new_login(lifecycle):
+    s = lifecycle
+    fresh = s.store[core.CLAUDE_SERVICE]
+    core.switch_account("a@example.test", s.path)
+    assert s.store[core.CLAUDE_SERVICE] == fresh
+    assert core.CLAUDE_SERVICE not in s.writes
+
+
+@pytest.mark.parametrize("change", ["token", "identity"])
+def test_external_login_change_during_poll_is_not_saved_under_stale_identity(lifecycle, monkeypatch, change):
+    s = lifecycle
+    old = s.store[s.a]
+    def read_attribute(service):
+        if change == "token":
+            s.store[core.CLAUDE_SERVICE] = credentials("changed-externally")
+        else:
+            s.state.write_text(json.dumps({"oauthAccount": {"emailAddress": "b@example.test"}}))
+        return "fixture-attribute"
+    monkeypatch.setattr(core.keychain, "read_account_attribute", read_attribute)
+    usage.fetch_active_usage(s.path)
+    assert s.store[s.a] == old
+    assert s.writes == []
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native macOS Keychain integration")
+def test_recovery_roundtrip_through_real_isolated_keychain(lifecycle, monkeypatch, tmp_path):
+    s = lifecycle
+    kc = str(tmp_path / "lifecycle.keychain-db")
+    create = subprocess.run(["/usr/bin/security", "create-keychain", "-p", "fixture", kc],
+                            capture_output=True, text=True)
+    if create.returncode:
+        pytest.skip("sandbox cannot create isolated Keychain")
+    try:
+        subprocess.run(["/usr/bin/security", "unlock-keychain", "-p", "fixture", kc],
+                       capture_output=True, check=True)
+        def isolated_run(args, **kwargs):
+            assert args[0] == "security"
+            assert args[1] in {"find-generic-password", "add-generic-password", "delete-generic-password"}
+            return subprocess.run(["/usr/bin/security", *args[1:], kc], **kwargs)
+        monkeypatch.setattr(core.keychain, "subprocess", SimpleNamespace(
+            run=isolated_run, TimeoutExpired=subprocess.TimeoutExpired))
+        for name, func in REAL_KEYCHAIN.items():
+            monkeypatch.setattr(core.keychain, name, func)
+        for service, blob in s.store.items():
+            core.keychain.write_credentials(service, "fixture-attribute", blob)
+        fresh = credentials("synthetic-" + "x" * 3000)
+        core.keychain.write_credentials(core.CLAUDE_SERVICE, "fixture-attribute", fresh)
+        core.keychain.write_credentials(s.a, "fixture-attribute", CLEARED)
+        usage.fetch_active_usage(s.path)
+        assert core.keychain.read_credentials(s.a) == fresh
+        core.switch_account("b@example.test", s.path)
+        core.switch_account("a@example.test", s.path)
+        assert core.keychain.read_credentials(core.CLAUDE_SERVICE) == fresh
+        core.keychain.write_credentials(s.b, "fixture-attribute", CLEARED)
+        with pytest.raises(core.ClaudeCredentialsExpiredError):
+            core.switch_account("b@example.test", s.path)
+        assert core.keychain.read_credentials(core.CLAUDE_SERVICE) == fresh
+        assert config.get_active_account(s.path).email == "a@example.test"
+    finally:
+        subprocess.run(["/usr/bin/security", "delete-keychain", kc], capture_output=True, check=True)

@@ -42,6 +42,46 @@ class ClaudeCredentialsExpiredError(RuntimeError):
     """Raised when a saved Claude session needs a new sign-in."""
 
 
+def has_claude_credentials(creds_json: str | None) -> bool:
+    """Distinguish a saved session from Claude Code's cleared-login marker.
+
+    This is structural validation, not proof that the server accepts the token.
+    Expired access tokens are retained so Claude Code can refresh them.
+    """
+    try:
+        token = json.loads(creds_json)["claudeAiOauth"]["accessToken"]
+        return isinstance(token, str) and bool(token.strip())
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def sync_current_account_credentials(config_path: Path = DEFAULT_CONFIG_PATH) -> bool:
+    """Save a healthy external sign-in without ever changing the live login."""
+    with _CLAUDE_LOCK:
+        if _add_in_progress:
+            return False
+        active = get_active_account(config_path, provider="claude")
+        if not active:
+            return False
+        oauth = _read_oauth_account()
+        if (oauth or {}).get("emailAddress") != active.email:
+            return False
+        live = keychain.read_credentials(CLAUDE_SERVICE)
+        if not has_claude_credentials(live):
+            return False
+        service = f"claude-switcher:{active.email}"
+        if keychain.read_credentials(service) == live:
+            return False
+        account_attr = keychain.read_account_attribute(CLAUDE_SERVICE)
+        # External Claude processes do not share our lock. If either the login
+        # or its identity changed while reading Keychain, defer to the next poll.
+        if (keychain.read_credentials(CLAUDE_SERVICE) != live
+                or _read_oauth_account() != oauth):
+            return False
+        keychain.write_credentials(service, account_attr or active.keychain_account, live)
+        return True
+
+
 def refresh_claude_credentials(creds_json: str) -> str | None:
     """Refresh a saved Claude OAuth blob, preserving unrelated credential fields."""
     try:
@@ -209,7 +249,7 @@ def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountIn
         if creds:
             break
         time.sleep(1)
-    if not creds:
+    if not has_claude_credentials(creds):
         return None
 
     acct_attr = keychain.read_account_attribute(CLAUDE_SERVICE) or "unknown"
@@ -253,6 +293,8 @@ def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -
             raise RuntimeError("A Claude account add is in progress. Try again in a moment.")
 
         active = get_active_account(config_path)
+        current_creds = None
+        current_oauth = None
 
         if active:
             # Only back up the live credential if it actually belongs to the
@@ -263,16 +305,17 @@ def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -
             live_email = (current_oauth or {}).get("emailAddress")
             if live_email == active.email:
                 current_creds = keychain.read_credentials(CLAUDE_SERVICE)
-                if current_creds:
-                    keychain.write_credentials(
-                        f"claude-switcher:{active.email}", active.keychain_account, current_creds
-                    )
-                if current_oauth:
-                    active.oauth_account = current_oauth
-                    add_account(active, config_path)
 
         _validate_email(target_email)
         target_creds = keychain.read_credentials(f"claude-switcher:{target_email}")
+        # A queued auto/manual switch may already have selected this account.
+        # Preserve a fresh live login rather than restoring its older backup.
+        if active and active.email == target_email and has_claude_credentials(current_creds):
+            if target_creds != current_creds:
+                keychain.write_credentials(
+                    f"claude-switcher:{active.email}", active.keychain_account, current_creds
+                )
+            return
         if not target_creds:
             raise RuntimeError(f"Credentials not found in Keychain for {target_email}")
 
@@ -282,6 +325,18 @@ def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -
         )
         if not target_account:
             raise RuntimeError(f"Account {target_email} not found in config")
+
+        # A nonempty JSON blob can still be Claude Code's cleared-login marker.
+        # Reject it before changing any saved account or the live session.
+        if not has_claude_credentials(target_creds):
+            raise ClaudeCredentialsExpiredError("This saved Claude session needs a new sign-in.")
+
+        if active and has_claude_credentials(current_creds):
+            keychain.write_credentials(
+                f"claude-switcher:{active.email}", active.keychain_account, current_creds
+            )
+            active.oauth_account = current_oauth
+            add_account(active, config_path)
 
         keychain.write_credentials(CLAUDE_SERVICE, target_account.keychain_account, target_creds)
 
@@ -314,7 +369,7 @@ def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | No
         # switch_account: on drift, skip rather than clobber a different backup.
         if active and snapshot is not None:
             live_email = (_read_oauth_account() or {}).get("emailAddress")
-            if live_email == active.email:
+            if live_email == active.email and has_claude_credentials(snapshot[1]):
                 keychain.write_credentials(
                     f"claude-switcher:{active.email}", snapshot[0], snapshot[1]
                 )
