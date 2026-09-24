@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from claude_switcher import claude_reset as _reset_backend
+_REAL_PREPARE_RESET = _reset_backend.prepare_reset
 
 
 fake_rumps = types.ModuleType("rumps")
@@ -28,7 +30,11 @@ def app_module():
     sys.modules.pop("claude_switcher.app", None)
     with patch.dict(sys.modules, {"rumps": fake_rumps, "Foundation": fake_foundation}):
         module = importlib.import_module("claude_switcher.app")
-        yield module
+        # Existing app tests isolate provider I/O. The reset journey tests below
+        # explicitly restore the real client and supply synthetic HTTP/Keychain.
+        with patch.object(module.claude_reset, "prepare_reset",
+                          side_effect=lambda email, path: module.claude_reset.Availability(email)):
+            yield module
     sys.modules.pop("claude_switcher.app", None)
 
 
@@ -551,6 +557,7 @@ def test_reset_menus_and_eligibility(app_module, tmp_path):
     accounts = [AccountInfo(email, "pro", "", False, email, provider=p) for p, email in
                 [("codex", "eligible"), ("codex", "ineligible"), ("codex", "unknown"), ("claude", "claude")]]
     save_accounts(accounts, app.config_path)
+    app._claude_reset_cache = {"claude": app_module.claude_reset.Availability("claude", 1, object())}
     set_auto_reset_enabled("codex", True, app.config_path)
     app._usage_state_cache = {
         ("codex", "eligible"): UsageState(True, "100%", reset_credits=3, reset_applicable=2),
@@ -1311,6 +1318,8 @@ def test_claude_reset_user_journey_real_backend(app_module, tmp_path, monkeypatc
     monkeypatch.setattr(claude_reset.keychain, 'read_credentials', lambda service:
         json.dumps({'claudeAiOauth': {'accessToken': 'test'}}) if service == 'claude-switcher:' + EMAIL else None)
     claude_reset._request_ids.clear()
+    app._claude_reset_cache = {EMAIL: claude_reset.Availability(EMAIL, 1, object())}
+    monkeypatch.setattr(claude_reset, 'prepare_reset', _REAL_PREPARE_RESET)
     with patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
          patch.object(app_module.threading, 'Thread', ImmediateThread), \
          patch.object(app_module, '_on_main_thread', side_effect=lambda fn: fn()), \
@@ -1337,3 +1346,61 @@ def test_claude_reset_duplicate_click_is_ignored(app_module, tmp_path):
         app._on_reset_claude_usage(sender)
         app._on_reset_claude_usage(sender)
     assert thread.call_count == 1
+
+
+def test_claude_reset_background_refresh_updates_each_menu_row_without_redemption(app_module, tmp_path):
+    import io
+    import json
+    from claude_switcher import claude_reset
+    from claude_switcher.config import AccountInfo, save_accounts
+    from tests.test_claude_reset import eligible, ORG
+    app = _reset_app(app_module, tmp_path)
+    accounts = [AccountInfo(email, 'max', '', False, email,
+        {'emailAddress': email, 'organizationUuid': ORG}) for email in
+        ('ready@test.com', 'empty@test.com', 'blocked@test.com', 'error@test.com')]
+    accounts.append(AccountInfo('ready@test.com', 'pro', '', False, 'codex', provider='codex'))
+    save_accounts(accounts, app.config_path)
+    calls = []
+    failed = set()
+    def send(request, timeout):
+        assert request.get_method() == 'GET', 'Background refresh must never redeem'
+        email = request.get_header('Authorization').removeprefix('Bearer ')
+        calls.append(email)
+        if email == 'error@test.com' or email in failed:
+            raise TimeoutError('synthetic transport failure')
+        body = eligible()
+        if email == 'empty@test.com':
+            body['cedar_ember']['grants'][0]['resets_left'] = 0
+        if email == 'blocked@test.com':
+            body['cedar_ember']['grants'][0]['usable_now'] = False
+        return io.BytesIO(json.dumps(body).encode())
+    def read(service):
+        assert service.startswith('claude-switcher:')
+        return json.dumps({'claudeAiOauth': {'accessToken': service.split(':',1)[1]}})
+    with patch.object(app_module.rumps, 'MenuItem', ResetMenuItem), \
+         patch.object(app_module.threading, 'Thread', ImmediateThread), \
+         patch.object(app_module, '_on_main_thread', side_effect=lambda fn: fn()), \
+         patch.object(claude_reset, 'prepare_reset', _REAL_PREPARE_RESET), \
+         patch.object(claude_reset, '_open', side_effect=send), \
+         patch.object(claude_reset.keychain, 'read_credentials', side_effect=read), \
+         patch.object(app, '_fetch_usage_state', return_value=app_module.UsageState(True, '10%')), \
+         patch.object(app, '_attempt_auto_switch', return_value=None), \
+         patch.object(app, '_attempt_auto_reset', return_value=None), \
+         patch.object(claude_reset, 'redeem_reset') as redeem:
+        app._add_claude_reset_menu(accounts)
+        rows = app.menu.add.call_args.args[0].children
+        assert all('checking resets' in row.title for row in rows)
+        app_module.ClaudeSwitcherApp._fetch_all_usage(app)
+        assert calls == [a.email for a in accounts if a.provider == 'claude']
+        assert [row.title for row in rows] == [
+            'ready@test.com (1 reset left, available)',
+            'empty@test.com (0 resets left)',
+            'blocked@test.com (1 reset left, unavailable now)',
+            'error@test.com (could not check)']
+        assert [row.callback is not None for row in rows] == [True, False, False, False]
+        # A later failure must replace a previously positive balance.
+        failed.add('ready@test.com')
+        app_module.ClaudeSwitcherApp._fetch_all_usage(app)
+        assert rows[0].title == 'ready@test.com (could not check)'
+        assert rows[0].callback is None
+        redeem.assert_not_called()

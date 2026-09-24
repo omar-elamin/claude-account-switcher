@@ -34,10 +34,18 @@ menu = app.menu['↺ Reset Claude usage']
 assert menu._menu.numberOfItems() == 1
 item = next(iter(menu.values()))
 assert item._email == 'native@example.test'
+assert item.callback is None
+assert item._menuitem.title() == 'native@example.test (checking resets…)'
+app._claude_reset_cache = {'native@example.test': claude_reset.Availability('native@example.test', 2, object())}
+app._update_claude_reset_labels()
 assert item.callback == app._on_reset_claude_usage
 assert item._menuitem.action() is not None
-assert item._menuitem.title() == 'native@example.test…'
+assert item._menuitem.title() == 'native@example.test (2 resets left, available)'
 assert item._menuitem.isEnabled()
+app._claude_reset_cache = {'native@example.test': claude_reset.Availability('native@example.test', 0)}
+app._update_claude_reset_labels()
+assert item.callback is None
+assert item._menuitem.title() == 'native@example.test (0 resets left)'
 assert 'Claude Code' not in app.menu['Auto-reset']
 print('Native NSMenu and callback PASS; no credentials or HTTP accessed')
 '''
