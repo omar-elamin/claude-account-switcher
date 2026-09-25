@@ -34,6 +34,7 @@ class AppSettings:
     proactive_switch: bool = True
     codex_gateway: bool = False
     codex_gateway_port: int = 8790
+    claude_route_based_on: str = "fable"
 
 
 def _default_settings_dict() -> dict:
@@ -165,7 +166,11 @@ def _settings_from_dict(data: dict | None) -> AppSettings:
     except (TypeError, ValueError, OverflowError):
         port = defaults.codex_gateway_port
 
-    return AppSettings(auto_switch=auto_switch, auto_switch_threshold=threshold,
+    basis = data.get("claude_route_based_on", defaults.claude_route_based_on)
+    if basis not in ("fable", "weekly"):
+        basis = defaults.claude_route_based_on
+
+    return AppSettings(claude_route_based_on=basis, auto_switch=auto_switch, auto_switch_threshold=threshold,
                        auto_reset=auto_reset, proactive_switch=bool(proactive_switch),
                        codex_gateway=bool(gateway), codex_gateway_port=port)
 
@@ -303,4 +308,14 @@ def set_codex_gateway_enabled(enabled: bool, path: Path = DEFAULT_CONFIG_PATH) -
     with _LOCK:
         settings = load_settings(path)
         settings.codex_gateway = bool(enabled)
+        save_settings(settings, path)
+
+
+def set_claude_route_based_on(basis: str, path: Path = DEFAULT_CONFIG_PATH) -> None:
+    """Select Claude's routing window without changing other settings."""
+    if basis not in ("fable", "weekly"):
+        raise ValueError("Claude routing basis must be fable or weekly")
+    with _LOCK:
+        settings = load_settings(path)
+        settings.claude_route_based_on = basis
         save_settings(settings, path)

@@ -1,6 +1,7 @@
 """Pure auto-switch decision logic."""
 
 import time
+from dataclasses import replace
 from collections.abc import Callable
 
 from claude_switcher.config import AccountInfo
@@ -12,6 +13,17 @@ AccountKey = tuple[str, str]
 def account_key(account: AccountInfo) -> AccountKey:
     """Return the stable cache key for an account."""
     return (account.provider, account.email)
+
+
+def routing_usage_state(state: UsageState, provider: str, claude_basis: str) -> UsageState:
+    """Project usage for routing while retaining the full state for display.
+
+    Weekly Claude routing ignores model-scoped quotas. Account-wide limits
+    still constrain both modes; Codex and the legacy Fable mode are unchanged.
+    """
+    if provider == "claude" and claude_basis == "weekly":
+        return replace(state, windows=tuple(w for w in state.windows if not w.scoped))
+    return state
 
 
 def should_auto_switch(active_usage: UsageState, enabled: bool, threshold: float) -> bool:

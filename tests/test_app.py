@@ -425,7 +425,8 @@ def test_provider_switch_dispatch_and_result(app_module, tmp_path, provider, swi
     target = SimpleNamespace(provider=provider, email="target@test.com")
     app._usage_state_cache = {(provider, active.email): app_module.UsageState(available=True, display="100%")}
     app._last_auto_switch_attempt = {}
-    settings = SimpleNamespace(auto_switch={provider: True}, auto_switch_threshold=95)
+    from claude_switcher.config import AppSettings
+    settings = AppSettings(auto_switch={provider: True}, auto_switch_threshold=95)
     fake_rumps.notification.reset_mock()
     fake_rumps.alert.reset_mock()
     assert app_module.PROVIDERS[provider]["switch"] is getattr(app_module, switch_fn)
@@ -853,8 +854,9 @@ def test_proactive_menu_toggle_persists(app_module, tmp_path, initial):
         app._add_auto_switch_menu()
     menu = app.menu.add.call_args.args[0]
     assert [i.title for i in menu.children[:2]] == ["Claude Code", "Codex CLI"]
-    assert menu.children[2] is app_module.rumps.separator
-    item = menu.children[3]
+    assert menu.children[2].title == "Route based on"
+    assert menu.children[3] is app_module.rumps.separator
+    item = next(i for i in menu.children if getattr(i, "title", None) == "Use expiring quota first")
     assert item.title == "Use expiring quota first"
     assert item.state == int(initial)
     item.callback(item)
