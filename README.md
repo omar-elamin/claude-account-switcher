@@ -57,6 +57,7 @@ The remaining controls are:
 | Control | What it does |
 | --- | --- |
 | `Auto-switch` | Separate `Claude Code` and `Codex CLI` toggles. Both start off. `Use expiring quota first` allows early switching when auto-switch is enabled. |
+| `Auto-switch → Route based on` | Under the `Claude Code` heading, choose `Fable usage` or `Weekly usage`. One choice is active at a time; the heading itself is not selectable. |
 | `Auto-switch → Codex gateway (switch running sessions)` | Lets running Codex sessions follow account switches through a local gateway. |
 | `Auto-reset` | Separate `Claude Code` and `Codex CLI` toggles. Both start off. Enabling one allows resets without a confirmation dialog when the automatic reset conditions are met. |
 | `✚ Add Claude account...` / `✚ Add Codex account...` | Starts a sign-in for that provider. |
@@ -76,7 +77,7 @@ A Claude usage row can look like this:
 5h 40% (2h 1m) | 7d 20% (1d 5h) | Fable 32% (1d 5h)
 ```
 
-The percentages show usage consumed. Parentheses show the time until each window resets. Model-specific weekly windows use the names returned by the provider. All reported windows, including model-specific ones, count when the app checks whether an account has reached its limit.
+The percentages show usage consumed. Parentheses show the time until each window resets. Model-specific weekly windows use the names returned by the provider. The display always shows all reported windows. Which windows guide automatic switching and resets depends on the Claude routing choice described below.
 
 A Codex row can look like this:
 
@@ -130,7 +131,14 @@ Codex tokens are refreshed when needed and written back to the account's Keychai
 
 Auto-switch is off by default for each provider. When enabled, it checks usage after each refresh and chooses among accounts with saved credentials and known room below the usage limit. The default limit threshold is 100%.
 
-With `Use expiring quota first` on, the app may switch before the active account is exhausted. It prefers the account whose target window resets soonest: the first reported Codex window, or Claude's `Fable` window with a fallback to `7d`. Reset times within an hour count as a tie. The current account wins a tie; otherwise the account with the most quota left wins.
+For Claude, open `Auto-switch → Route based on` and choose:
+
+- **Fable usage:** the default, including for existing installs. All reported windows count toward an account's limit. The target window is `Fable`, with a fallback to `7d`.
+- **Weekly usage:** use the overall `7d` window as the target. Model-specific windows are excluded from checks of available quota and account ranking.
+
+Both choices respect the overall `5h` and `7d` limits. Codex uses its first reported window as the target. The Claude choice is saved as `claude_route_based_on` in the config, with a value of `fable` or `weekly`.
+
+With `Use expiring quota first` on, the app may switch before the active account is exhausted. It prefers the account whose target window resets soonest. Reset times within an hour count as a tie. The current account wins a tie; otherwise the account with the most quota left in that window wins.
 
 When no usable account's target window expires within the next day, the app can select an unused account whose reset clock appears not to have started. With `Use expiring quota first` off, it waits until the active account reaches its limit.
 
@@ -163,6 +171,8 @@ A notification reports the result, then usage and reset balances refresh. If the
 `Auto-reset → Claude Code` and `Auto-reset → Codex CLI` are independent and off by default. Enabling either permits automatic credit use for that provider without a confirmation dialog.
 
 After a usage refresh, an enabled provider can reset only when its active account is exhausted and there is no other account to switch to. A saved account with unknown usage also counts as a possible switching fallback and blocks automatic resets. This check applies even when Auto-switch is off.
+
+Claude uses the selected `Route based on` policy to check exhaustion, compare switching alternatives, and recheck the target before a reset. In `Weekly usage` mode, a model-specific limit alone does not trigger an automatic reset. Choosing a routing mode does not enable Auto-reset. Its separate toggle must be on.
 
 The app prefers an available reset on the active account, then on another exhausted account of the same provider. It reads the target's usage and eligibility again, then rechecks the triggering active account, setting, and switching alternatives before sending the reset request. An account switch or opt-out during those checks stops the pending automatic reset.
 

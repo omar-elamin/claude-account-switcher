@@ -9,7 +9,7 @@ from pathlib import Path
 import rumps
 from Foundation import NSBundle, NSOperationQueue
 
-from claude_switcher import reset_service, reset_ui
+from claude_switcher import reset_service, reset_ui, routing_ui
 from claude_switcher import codex_core, core, keychain, login_item
 from claude_switcher.codex_gateway import (
     Gateway, disable_config, enable_config, gateway_configured,
@@ -23,6 +23,7 @@ from claude_switcher.auto_switch import (
     should_auto_switch,
     choose_auto_reset_target,
     should_auto_reset,
+    routing_usage_state,
 )
 from claude_switcher.codex_core import (
     check_codex_cli,
@@ -42,6 +43,7 @@ from claude_switcher.config import (
     get_active_account,
     load_settings,
     set_auto_switch_enabled,
+    set_claude_route_based_on,
     set_proactive_switch_enabled,
     set_codex_gateway_enabled,
     _atomic_write,
@@ -313,6 +315,8 @@ class ClaudeSwitcherApp(rumps.App):
             item._provider = provider
             item.state = 1 if settings.auto_switch.get(provider, False) else 0
             auto_menu.add(item)
+        auto_menu.add(routing_ui.routing_menu(
+            rumps.MenuItem, settings.claude_route_based_on, self._on_select_routing_basis))
         auto_menu.add(rumps.separator)
         item = rumps.MenuItem("Use expiring quota first", callback=self._on_toggle_proactive_switch)
         item.state = 1 if settings.proactive_switch else 0
@@ -428,17 +432,27 @@ class ClaudeSwitcherApp(rumps.App):
 
         threading.Thread(target=_check, daemon=True).start()
 
+    def _on_select_routing_basis(self, sender):
+        set_claude_route_based_on(sender._routing_basis, self.config_path)
+        self._rebuild_menu()
+        self._fetch_all_usage()
+
+    def _routing_states(self, settings):
+        return {key: routing_usage_state(state, key[0], settings.claude_route_based_on)
+                for key, state in self._usage_state_cache.items()}
+
     def _auto_reset_authorized(self, provider, trigger_email):
         settings = load_settings(self.config_path)
+        routing_states = self._routing_states(settings)
         active = get_active_account(self.config_path, provider=provider)
         if active is None or active.email != trigger_email:
             return False
-        state = self._usage_state_cache.get(account_key(active))
+        state = routing_states.get(account_key(active))
         if state is None or not should_auto_reset(
                 state, settings.auto_reset.get(provider, False), settings.auto_switch_threshold):
             return False
         return choose_auto_switch_target(provider, load_accounts(self.config_path), active.email,
-            self._usage_state_cache, self._has_credentials, settings.auto_switch_threshold) is None
+            routing_states, self._has_credentials, settings.auto_switch_threshold) is None
 
     def _consume_reset(self, provider: str, email: str, credits: int, trigger_email: str) -> dict:
         result = {"provider": provider, "email": email, "credits": credits, "code": "unavailable"}
@@ -451,6 +465,7 @@ class ClaudeSwitcherApp(rumps.App):
             if account is None:
                 return result
             state = self._fetch_usage_state(account, get_active_account(self.config_path, provider=provider))
+            state = routing_usage_state(state, provider, settings.claude_route_based_on)
             if not should_auto_reset(state, True, settings.auto_switch_threshold):
                 return result
             adapter = PROVIDERS[provider]["reset"]
@@ -458,7 +473,10 @@ class ClaudeSwitcherApp(rumps.App):
             if status.offer is None:
                 return result
             # Disabling the option during the read cancels the pending redemption.
-            authorize = lambda: self._auto_reset_authorized(provider, trigger_email)
+            authorize = lambda: (
+                (provider != "claude" or load_settings(self.config_path).claude_route_based_on
+                 == settings.claude_route_based_on)
+                and self._auto_reset_authorized(provider, trigger_email))
             if not authorize():
                 return result
             result["credits"] = status.remaining
@@ -900,7 +918,8 @@ class ClaudeSwitcherApp(rumps.App):
         if active is None:
             return None
         settings = load_settings(self.config_path)
-        state = self._usage_state_cache.get(account_key(active))
+        routing_states = self._routing_states(settings)
+        state = routing_states.get(account_key(active))
         if state is None or not should_auto_reset(
             state, settings.auto_reset.get(provider, False), settings.auto_switch_threshold
         ):
@@ -908,13 +927,13 @@ class ClaudeSwitcherApp(rumps.App):
         accounts = load_accounts(self.config_path)
         # Compute directly even when auto-switch is disabled or cooling down.
         if choose_auto_switch_target(
-            provider, accounts, active.email, self._usage_state_cache,
+            provider, accounts, active.email, routing_states,
             self._has_credentials, settings.auto_switch_threshold,
         ) is not None:
             return None
         statuses = reset_statuses if reset_statuses is not None else getattr(self, "_reset_cache", {})
         target = choose_auto_reset_target(provider, accounts, active.email,
-            self._usage_state_cache, statuses, settings.auto_switch_threshold)
+            routing_states, statuses, settings.auto_switch_threshold)
         if target is None:
             return None
         key = account_key(target)
@@ -967,19 +986,20 @@ class ClaudeSwitcherApp(rumps.App):
 
     def _attempt_auto_switch(self, provider: str) -> dict | None:
         settings = load_settings(self.config_path)
+        routing_states = self._routing_states(settings)
         if not settings.auto_switch.get(provider, False):
             return None
         active = get_active_account(self.config_path, provider=provider)
         if not active:
             return None
 
-        active_state = self._usage_state_cache.get(account_key(active))
+        active_state = routing_states.get(account_key(active))
         if not active_state or not active_state.available:
             return None
 
         accounts = load_accounts(self.config_path)
         best = choose_fefo_target(
-            provider, accounts, self._usage_state_cache, self._has_credentials,
+            provider, accounts, routing_states, self._has_credentials,
             settings.auto_switch_threshold, active_email=active.email,
         )
         exhausted = should_auto_switch(active_state, True, settings.auto_switch_threshold)
@@ -1001,7 +1021,7 @@ class ClaudeSwitcherApp(rumps.App):
                 provider=provider,
                 accounts=accounts,
                 active_email=active.email,
-                usage_by_account=self._usage_state_cache,
+                usage_by_account=routing_states,
                 has_credentials=self._has_credentials,
                 threshold=settings.auto_switch_threshold,
             )

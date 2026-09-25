@@ -8,7 +8,7 @@ class UsageWindow:
     label: str
     percent: float
     resets_in: str | None = None
-    # The scoped flag controls display ordering only.
+    # Model-scoped windows are displayed separately and optional for routing.
     scoped: bool = False
     resets_at: float | None = None
 

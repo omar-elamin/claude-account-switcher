@@ -173,3 +173,57 @@ def test_setting_write_overlaps_account_and_toggle_without_lost_updates(tmp_path
     assert config.load_settings(path).claude_route_based_on == 'weekly'
     assert config.load_settings(path).auto_switch['codex']
     assert [a.email for a in config.load_accounts(path)] == ['new']
+
+
+@pytest.mark.parametrize('basis,expected_active', [('fable', 'active'), ('weekly', 'spare')])
+def test_periodic_refresh_routes_parsed_provider_usage_and_never_resets(app_module, tmp_path, monkeypatch, basis, expected_active):
+    import io
+    import urllib.request
+    from claude_switcher import usage as client
+    from tests.test_app import ImmediateThread
+    app = setup_app(app_module, tmp_path, basis, {'active': usage(), 'spare': usage()})
+    app._usage_state_cache.clear()
+    requests = []
+    monkeypatch.setattr(client.keychain, 'read_credentials', lambda service:
+        json.dumps({'claudeAiOauth': {'accessToken': service.split(':')[-1]}}))
+    def http(request, timeout):
+        requests.append(request)
+        assert request.get_method() == 'GET', 'This journey may not redeem a reset'
+        email = request.get_header('Authorization').removeprefix('Bearer ')
+        payload = {'five_hour': {'utilization': 100 if email == 'active' else 0},
+                   'seven_day': {'utilization': 70},
+                   'limits': [{'kind': 'weekly_scoped', 'percent': 100,
+                               'scope': {'model': {'display_name': 'Fable'}}}]}
+        return io.BytesIO(json.dumps(payload).encode())
+    monkeypatch.setattr(urllib.request, 'urlopen', http)
+    monkeypatch.setitem(app_module.PROVIDERS['claude'], 'fetch_active_usage',
+                        lambda: client.fetch_usage_for_account('active', app.config_path))
+    monkeypatch.setitem(app_module.PROVIDERS['claude'], 'fetch_usage',
+                        lambda email: client.fetch_usage_for_account(email, app.config_path))
+    # The switch boundary persists the selected identity in the isolated config.
+    monkeypatch.setitem(app_module.PROVIDERS['claude'], 'switch',
+                        lambda email, path: config.set_active_account(email, path, 'claude'))
+    monkeypatch.setattr(app_module.threading, 'Thread', ImmediateThread)
+    monkeypatch.setattr(app_module, '_on_main_thread', lambda fn: fn())
+    app_module.ClaudeSwitcherApp._fetch_all_usage(app)
+    assert config.get_active_account(app.config_path).email == expected_active
+    assert len(requests) == 2
+    assert 'Fable 100%' in app._usage_cache[('claude', 'spare')]
+    assert config.load_settings(app.config_path).auto_reset == {'claude': False, 'codex': False}
+    assert not app._refresh_in_progress
+
+
+@pytest.mark.parametrize('basis', ['fable', 'weekly'])
+def test_claude_choice_does_not_change_codex_routing(app_module, tmp_path, monkeypatch, basis):
+    app = setup_app(app_module, tmp_path, basis, {'claude': usage()})
+    for email, active in [('codex-active', True), ('codex-spare', False)]:
+        config.add_account(config.AccountInfo(email, 'pro', '', active, email, provider='codex'), app.config_path)
+    config.set_auto_switch_enabled('codex', True, app.config_path)
+    app._usage_state_cache.update({
+        ('codex', 'codex-active'): UsageState(True, '100%', (UsageWindow('7d', 100),)),
+        ('codex', 'codex-spare'): UsageState(True, '50%', (UsageWindow('7d', 50),)),
+    })
+    switch = Mock()
+    monkeypatch.setitem(app_module.PROVIDERS['codex'], 'switch', switch)
+    assert app._attempt_auto_switch('codex')['email'] == 'codex-spare'
+    switch.assert_called_once_with('codex-spare', app.config_path)
