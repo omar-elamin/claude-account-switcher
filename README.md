@@ -1,122 +1,180 @@
 # Claude Switcher
 
-A macOS menu-bar app that keeps several Claude Code and Codex CLI accounts signed in at once and switches the active one from the menu bar. Version 0.4.3. MIT license.
+A macOS menu-bar app for saving Claude Code and Codex CLI accounts, checking their usage, and switching between them. It also shows available usage resets and can spend them with your confirmation or through optional automatic resets. Version 0.4.3.
 
-The app lives in the menu bar only. It has no Dock icon and no Cmd-Tab entry. Claude and Codex are handled independently: switching one never changes the other. The same email can exist once for Claude and once for Codex.
+Claude and Codex have separate accounts and settings. Switching one does not switch the other. The same email can be saved once for each provider. The app has no Dock icon or Cmd-Tab entry.
 
-This repository is a fork of [Symbioose/claude-account-switcher](https://github.com/Symbioose/claude-account-switcher). Upstream publishes a Homebrew cask (`brew install --cask Symbioose/tap/claude-switcher`) and zip releases. Those are upstream builds and do not contain this fork's fixes. This fork is built from source with `./build_local.sh` (see [Build from source](#build-from-source)).
+This is a fork of [Symbioose/claude-account-switcher](https://github.com/Symbioose/claude-account-switcher). Upstream's Homebrew cask and release downloads do not include this fork's changes. Build this fork from source using the steps below.
 
-![Claude Switcher screenshot](screenshot.png)
+![Claude Switcher menu from an earlier version](screenshot.png)
+
+This screenshot predates the Claude reset menu and the automatic reset options for both providers. See [The menu](#the-menu) for the current controls.
 
 ## Features
 
-- Switch the active Claude Code account without logging out and back in
-- Switch the active Codex CLI account the same way
-- Live usage for every saved account, shown under each row in the menu
-- Optional auto-switch, per provider, when the active account reaches its limit
-- Show, spend, and optionally auto-spend the banked Codex rate-limit resets an account holds
-- First launch imports the Claude and Codex accounts that are already signed in
-- Saved credentials live in macOS Keychain, not in a config file
+- Save and switch Claude Code and Codex CLI accounts without signing in each time.
+- Check usage for active and saved accounts.
+- Enable automatic account switching separately for each provider.
+- View reset balances for each account, confirm a manual reset, or opt into automatic resets.
+- Import existing Claude and Codex sign-ins on first launch.
+- Keep saved credentials in macOS Keychain.
 
 ## Install
 
-There are no releases for this fork. Build it from source:
+### Requirements
+
+- macOS. Upstream lists macOS 12 or later.
+- Claude Code CLI for Claude accounts.
+- Codex CLI with file-mode credentials for Codex accounts. See [Codex credential storage](#codex-credential-storage).
+- Python 3.10 or later to build from source. This fork has been built and tested with Python 3.13.
+
+Build and install this fork:
 
 ```bash
 git clone https://github.com/omar-elamin/claude-account-switcher.git
 cd claude-account-switcher
-./build_local.sh
-# Output: dist/Claude Switcher.app
+./build_local.sh --install
 ```
 
-Drag `dist/Claude Switcher.app` to `/Applications` and launch it. It appears as a menu bar icon.
+Open `/Applications/Claude Switcher.app`. Its icon appears in the menu bar.
 
-Or run `./build_local.sh --install` to build and copy the app to `/Applications`.
+To build without installing, run `./build_local.sh`. The output is `dist/Claude Switcher.app`, which you can drag to `/Applications`.
 
-The app is not notarized, so macOS may block it on first launch. Open **System Settings → Privacy & Security** and click **Open Anyway**.
+The app is not notarized. If macOS blocks the first launch, open **System Settings → Privacy & Security** and click **Open Anyway**.
 
 ## Usage
 
+### First launch
+
+With no config file yet, the app imports the currently signed-in Claude and Codex accounts. A failed Codex import produces a notification and does not stop startup.
+
 ### The menu
 
-From top to bottom:
+Each provider has a section, `── Claude Code ──` or `── Codex CLI ──`, with one row per saved account. Rows show `email (plan)`, mark the active account, and show usage underneath. Click an account to switch to it. A Codex row marked `Login required` opens sign-in instead.
 
-- A header per provider: `── Claude Code ──` and `── Codex CLI ──`.
-- Under each header, one row per saved account, shown as `email (plan)`, with the active account marked and a usage line underneath. Click a row to switch to that account. A Codex row whose saved session has expired shows `Login required`; clicking it opens the Codex login instead of switching. Rows show `•••` until the first fetch finishes, `Checking…` on rows that came back unavailable while a quick retry is pending, and `Usage unavailable` when retries are exhausted.
-- `Auto-switch` submenu with one item per provider, labelled `Claude Code` and `Codex CLI`, with a checkmark when enabled. Clicking one toggles it, and a notification says "Enabled" or "Disabled". `Use expiring quota first` controls whether the app switches before the active account runs out. Below it, `Codex gateway (switch running sessions)` turns the local gateway on or off, with a checkmark when enabled.
-- `Auto-reset` submenu with one item, `Codex CLI`, with a checkmark when enabled. Clicking it toggles the setting, and a notification says "Enabled" or "Disabled".
-- `✚ Add Claude account...` and `✚ Add Codex account...`
-- `↻ Refresh usage`
-- `− Remove account` submenu. It lists every saved account as `[Claude] email` or `[Codex] email`, including the active one. Choosing the active account shows an alert instead of removing it: "You cannot remove the active Claude Code account. Switch first." (or "… active Codex CLI account …").
-- `↺ Reset Codex usage` submenu. It lists the Codex accounts that can apply a reset right now, as `email (N available)`. If none can, it shows one disabled item: `No reset applicable now`.
-- `Start at login` writes a per-user launch agent that opens the app when you log in (takes effect at your next login; turning it off removes the agent); the agent points at wherever the app bundle is, so run it from /Applications (`./build_local.sh --install`) to keep that path stable.
-- `⏻ Quit`
+The remaining controls are:
+
+| Control | What it does |
+| --- | --- |
+| `Auto-switch` | Separate `Claude Code` and `Codex CLI` toggles. Both start off. `Use expiring quota first` allows early switching when auto-switch is enabled. |
+| `Auto-switch → Codex gateway (switch running sessions)` | Lets running Codex sessions follow account switches through a local gateway. |
+| `Auto-reset` | Separate `Claude Code` and `Codex CLI` toggles. Both start off. Enabling one allows resets without a confirmation dialog when the automatic reset conditions are met. |
+| `✚ Add Claude account...` / `✚ Add Codex account...` | Starts a sign-in for that provider. |
+| `↻ Refresh usage` | Refreshes usage and reset availability. |
+| `− Remove account` | Removes a saved account. Switch away from an active account before removing it. |
+| `↺ Reset Claude usage` / `↺ Reset Codex usage` | Shows every saved account for that provider and its reset balance. A submenu appears when that provider has saved accounts. |
+| `Start at login` | Creates or removes a per-user launch agent. Install the app in `/Applications` first so the launch path stays stable. |
+| `⏻ Quit` | Closes the app. |
+
+Enabled toggles have a checkmark. Changing an automatic switch or reset setting also produces an Enabled or Disabled notification.
 
 ### Usage display
 
-A Claude row looks like this:
+A Claude usage row can look like this:
 
 ```text
 5h 40% (2h 1m) | 7d 20% (1d 5h) | Fable 32% (1d 5h)
 ```
 
-The first segment is the 5-hour window. The second is the 7-day window. After that comes one segment for each model-scoped weekly limit the API reports, labelled with the model's own name (today: `Fable`). The value in parentheses is the time until that window resets. Model-scoped windows are informational only and never trigger auto-switch.
+The percentages show usage consumed. Parentheses show the time until each window resets. Model-specific weekly windows use the names returned by the provider. All reported windows, including model-specific ones, count when the app checks whether an account has reached its limit.
 
-A Codex row looks like this:
+A Codex row can look like this:
 
 ```text
 7d 100% (3h 24m) · 2 resets
 ```
 
-There is one segment per rate-limit window the API reports (primary, then secondary), labelled by the window's real length as reported by the API (for example `5h` or `7d`). On the plans seen so far, the primary window is a 7-day window. When an account holds banked resets, the row ends with `· N resets` (`· 1 reset` for one). See [Rate-limit resets](#rate-limit-resets).
+Codex window labels use the lengths returned by the provider, such as `5h` or `7d`. When the account has reset credits, the row also shows the count.
 
-Claude usage comes from `https://api.anthropic.com/oauth/usage`, called with each saved account's own token, so every saved account shows its own usage, including inactive ones. Claude access tokens last about 8 hours. Claude Code refreshes the live one. The app refreshes an inactive account's saved token itself when its usage call comes back expired, so inactive rows keep showing real usage. The row reads `Token expired (switch to refresh)` only when the app must not refresh: while an add is in progress, or when the saved token is the same pair the live session holds, or for up to 5 minutes after a refresh attempt failed (rotating it would log Claude Code out). Switching to that account then refreshes it. A `Login required` row means the refresh was rejected, so the saved session was revoked and needs a new sign-in. If the CLI's live session belongs to a different account than the one marked active (for example after a sign-in done outside the app), the active row shows that account's own saved-session usage rather than the live token's, and the log notes the drift. Click the account to re-sync the live session. Codex usage comes from the chatgpt.com backend usage endpoint. A saved Codex token that needs refreshing is refreshed, and the refreshed token is written back to that account's Keychain backup.
+Usage refreshes at launch, every five minutes, after adding or switching accounts, and when you select `↻ Refresh usage`. Unavailable rows get up to three quick retries, six seconds apart. Rows show `•••` before the first result, `Checking…` during a quick retry, and `Usage unavailable` if the retries do not recover the result.
 
-Usage refreshes at launch, every 5 minutes, after adding or switching an account, and when you click `↻ Refresh usage`. If any row is unavailable, the app retries quickly up to 3 times, 6 seconds apart.
-
-macOS closes the menu when you click any item, so `↻ Refresh usage` shows a "Refreshing usage…" notification, then "Usage updated" with the numbers when done. Reopen the menu to see the rows.
+macOS closes the menu when you click an item. Refreshing produces notifications; reopen the menu to see the updated rows.
 
 ### Adding an account
 
-- Claude: the app runs `claude auth login`. Sign in in the browser window that appears.
-- Codex: the app opens a Terminal window running `codex login -c 'cli_auth_credentials_store="file"'`. Sign in there.
+Choose the provider's Add option:
 
-Before the login starts, the app backs up the current session to Keychain:
+- Claude runs `claude auth login` and opens browser sign-in.
+- Codex opens Terminal and runs `codex login -c 'cli_auth_credentials_store="file"'`.
 
-- Claude: the app backs up the current session under the active account only if the `oauthAccount` email in `~/.claude.json` matches it. If they differ, it skips the backup rather than overwrite another account's backup.
-- Codex: the app backs up the current session under the email embedded in the live `~/.codex/auth.json`. If that email was not saved yet, it is imported as a new saved account.
+Before sign-in, the app saves the outgoing session and clears the local credential slot. It avoids either CLI's logout command because logout could revoke the session being saved.
 
-In both cases the app then clears the live credential slot.
+For Claude, a backup requires a nonempty access token and a matching email in `~/.claude.json`. Cleared-login markers and malformed credentials do not replace an existing backup. Codex uses the email in `~/.codex/auth.json` and imports it if needed.
 
-The app does not run `claude auth logout` or `codex logout`. Those commands revoke the previous account's session on the server, which would make its backup unusable. The previous account's server session stays valid, so you can switch back later.
+Sign-in times out after five minutes. On cancellation or failure, the app restores the previous credential snapshot if one was saved. Clicking Add again cancels the pending sign-in and starts a fresh one. Switching or removing accounts during sign-in reports the provider as busy.
 
-A login times out after 5 minutes. If a login is cancelled, fails, or times out, the previous session is restored.
+### Switching accounts
 
-Clicking Add while a sign-in for that provider is still open cancels it and starts a fresh one ("Restarting … login"). Only one add per provider runs at a time. Switching or removing during an add reports the account as busy; try again in a moment.
+For Claude, the app saves the outgoing credentials when the local account identity matches, copies the selected backup into `Claude Code-credentials`, and updates `oauthAccount` in `~/.claude.json`. For Codex, it saves the outgoing session and writes the selected session to `~/.codex/auth.json` with `0600` permissions.
 
-### Switching
+A cleared Claude login does not replace an existing saved credential backup. Switching rejects a saved credential without a nonempty access token. These are checks of the stored credential structure; they do not prove the provider will accept the token. Clicking the account already marked active does nothing. Use Add to sign in again if that account needs recovery.
 
-- Claude: the current live token is backed up to Keychain under `claude-switcher:{email}` (with the same identity check as above). The target's backup is written into Claude Code's credential slot `Claude Code-credentials`, and the `oauthAccount` object in `~/.claude.json` is swapped.
-- Codex: the current `~/.codex/auth.json` is backed up under `codex-switcher:{email}`. The target's saved session is written to `~/.codex/auth.json` with `0600` permissions.
-
-Verify after switching:
+To check which account each CLI is using:
 
 ```bash
 claude auth status
 codex login status
 ```
 
+### Expired or changed sign-ins
+
+The app reads each saved account's usage with that account's credentials. It can refresh saved Claude tokens, but leaves Claude Code's live credential entry to the CLI. It skips refreshes while a Claude sign-in is in progress or when the saved and live sessions share a token pair, and limits attempts to once per account every five minutes.
+
+`Token expired (switch to refresh)` means the saved Claude token needs attention from the CLI. Switch to the account so Claude Code can attempt a refresh. `Login required` means a new sign-in is needed; use `✚ Add Claude account...`. Expired access tokens can remain in backups so the CLI has a chance to refresh them.
+
+If a Claude sign-in outside the app changes the live account, the app avoids saving that session over a different account's backup. If the intended account is already marked active, use Add to sign in again. When an external sign-in matches the active account, the app can update its backup after rechecking the local credentials and identity.
+
+Codex tokens are refreshed when needed and written back to the account's Keychain backup. A saved Codex session with a revoked or rotated refresh token shows `Login required`. Click it or use Add to sign in again.
+
 ### Auto-switch
 
-Auto-switch is off by default and is set per provider. When it is on for a provider, the app evaluates on every usage refresh which usable account should be active: the one whose target window resets soonest (Codex: the weekly window; Claude: the Fable window, or the 7-day window if the account has no Fable limit), and among ties the one with the most left. Budget left in a window is lost when it resets, so using the soonest-expiring quota first wastes the least. An account counts as usable when it has valid credentials, known usage, and no window at 100%.
+Auto-switch is off by default for each provider. When enabled, it checks usage after each refresh and chooses among accounts with saved credentials and known room below the usage limit. The default limit threshold is 100%.
 
-With 'Use expiring quota first' on (the default), the app switches to that account even while the active one still has room. A weekly window's clock only starts when the account is first used, so an account that has not been used since its reset is full but earns no refill; when no usable account's window expires within the next day, the app switches to such an account to start its clock, then goes back to using the soonest-expiring quota. With it off, the app switches only when the active account reaches 100%, and then to that account. Either way it never crosses providers, keeps a 60-second gap between attempts per provider, and does not switch away from an account you chose by hand until that account runs out. If no account with known usage has room, it falls back to a saved account whose usage is unknown.
+With `Use expiring quota first` on, the app may switch before the active account is exhausted. It prefers the account whose target window resets soonest: the first reported Codex window, or Claude's `Fable` window with a fallback to `7d`. Reset times within an hour count as a tie. The current account wins a tie; otherwise the account with the most quota left wins.
+
+When no usable account's target window expires within the next day, the app can select an unused account whose reset clock appears not to have started. With `Use expiring quota first` off, it waits until the active account reaches its limit.
+
+Automatic switching stays within one provider, waits at least 60 seconds between attempts, and respects an account you selected manually until it reaches its limit. If the active account is exhausted and no account has known room, it can try a saved account whose usage is unknown.
+
+### Usage resets
+
+Both providers have a reset submenu. Each lists every saved account, including accounts that cannot reset right now:
+
+| Row text after the email | Meaning |
+| --- | --- |
+| `checking resets…` | The app is waiting for a balance check. |
+| `could not check` | The balance is unknown. |
+| `0 resets left` | The provider reported no remaining resets. |
+| `N resets left, unavailable now` | Resets remain, but none can be used now. |
+| `N resets left, available` | A reset is currently available. |
+
+Only available rows can be selected. An unknown balance is kept distinct from zero. Reset availability comes from the provider; having a balance alone does not make an account eligible.
+
+#### Manual resets
+
+Open `↺ Reset Claude usage` or `↺ Reset Codex usage`, then select an available account. The app checks again before showing **Reset usage?** The dialog names the provider, account, affected limits, and reset balance. It also shows the offer's end date when supplied and explains that spending a reset cannot be undone.
+
+Choose **Cancel** to leave without sending a reset request. Choose **Reset** to spend one reset. Before sending the request, the app checks the account identity, current eligibility, and the details used for confirmation. Changed details stop the request and require another check.
+
+A notification reports the result, then usage and reset balances refresh. If the result is uncertain, the app says: “We could not confirm what happened. Check your usage before you try again.” A lost response can follow a successful reset, so check usage and the remaining balance before starting another attempt.
+
+#### Automatic resets
+
+`Auto-reset → Claude Code` and `Auto-reset → Codex CLI` are independent and off by default. Enabling either permits automatic credit use for that provider without a confirmation dialog.
+
+After a usage refresh, an enabled provider can reset only when its active account is exhausted and there is no other account to switch to. A saved account with unknown usage also counts as a possible switching fallback and blocks automatic resets. This check applies even when Auto-switch is off.
+
+The app prefers an available reset on the active account, then on another exhausted account of the same provider. It reads the target's usage and eligibility again, then rechecks the triggering active account, setting, and switching alternatives before sending the reset request. An account switch or opt-out during those checks stops the pending automatic reset.
+
+Manual and automatic requests share a guard so the same provider/account cannot reset concurrently. Automatic attempts have a one-minute cooldown per provider and a one-hour cooldown per account, including uncertain outcomes. These cooldowns last for the running app session.
+
+Automatic resets do not switch accounts themselves. If Auto-switch is enabled, a later refresh can move to an account whose usage was reset. Each automatic attempt reports its result and refreshes usage and balances. Settings are stored per provider under `auto_reset` in the config file.
 
 ### Codex gateway
 
-Turn on `Auto-switch → Codex gateway (switch running sessions)` to let running Codex sessions follow account switches. Codex normally keeps its token in memory, so replacing `~/.codex/auth.json` does not change the account a running session uses when it hits a usage limit. The gateway sends each authenticated request with the active account's token.
+Turn on `Auto-switch → Codex gateway (switch running sessions)` to let running Codex sessions follow account switches. Codex normally keeps its token in memory, so replacing its auth file does not change an open session. The gateway sends requests with the active account's token.
 
-The gateway listens only on `127.0.0.1`, on port `8790` by default. Codex requires custom workspace backends to use HTTPS, including backends on loopback. The app writes this block at the top of `~/.codex/config.toml` to send Codex traffic through the gateway:
+It listens on `127.0.0.1`, port `8790` by default, over HTTPS. The app adds this managed block at the top of `~/.codex/config.toml`:
 
 ```toml
 # managed by Claude Switcher: Codex gateway
@@ -124,46 +182,39 @@ openai_base_url = "https://127.0.0.1:8790/backend-api/codex"
 chatgpt_base_url = "https://127.0.0.1:8790/backend-api/"
 ```
 
-The app keeps a one-time backup at `~/.codex/config.toml.claude-switcher.bak`. Turning the gateway off removes the managed block. Restart open Codex CLI and desktop sessions once whenever you turn the gateway on or off so they read the new settings. Keep Claude Switcher running while the gateway is on.
+A one-time backup is saved at `~/.codex/config.toml.claude-switcher.bak`. Turning the gateway off removes the managed block. Restart open Codex CLI and desktop sessions whenever you turn it on or off so they read the new settings. Keep Claude Switcher running while the gateway is enabled.
 
-On first use, Claude Switcher creates a local CA and server certificate in `~/Library/Application Support/Claude Switcher/codex-gateway-tls`. macOS asks once for permission to trust the CA in your login keychain. The CA has a name constraint that permits only `127.0.0.1`, and the app deletes the CA private key as soon as it signs the server certificate. This prevents the CA from signing more certificates later.
+On first use, the app creates a local certificate authority (CA) and server certificate in `~/Library/Application Support/Claude Switcher/codex-gateway-tls`. macOS asks for permission to trust the CA in your login keychain. The CA is constrained to `127.0.0.1`; the app deletes its private key after signing the server certificate.
 
-To remove the trust entry, open Keychain Access, select the login keychain, and delete the certificate whose name starts with `Claude Switcher Local CA`. You can also find its SHA-1 fingerprint and remove it in Terminal:
+To remove that trust, open Keychain Access and delete the login-keychain certificate whose name starts with `Claude Switcher Local CA`. Or find its SHA-1 fingerprint and remove it in Terminal:
 
 ```sh
 security find-certificate -a -c "Claude Switcher Local CA" -Z ~/Library/Keychains/login.keychain-db
 security delete-certificate -Z SHA1_FINGERPRINT -t ~/Library/Keychains/login.keychain-db
 ```
 
-With Codex auto-switch enabled, a usage-limit response makes the gateway switch to an available account and retry the same request once, so the thread can continue on the new account. Other rate-limit responses pass through unchanged. The gateway adds the active account's credentials to every request, including Codex's plugin calls, which Codex sends without credentials when a custom address is configured. If no account is available, the gateway returns the original usage-limit response.
+With Codex auto-switch enabled, a usage-limit response lets the gateway switch to an available account and retry the request once. Other rate-limit responses pass through. If no account is available, it returns the original usage-limit response. The gateway also adds credentials to plugin calls that arrive without them.
 
-The gateway supports HTTP/1.1 only. It refuses WebSocket upgrades so Codex uses its streaming HTTP fallback. The local port has no authentication: any local process can use it with the active account's credentials. This requires the same trust in local processes as the auth file.
+The gateway supports HTTP/1.1 and rejects WebSocket upgrades so Codex can use streaming HTTP. **The local port has no client authentication: any local process can use it with the active account's credentials.**
 
-### Rate-limit resets
+## Codex credential storage
 
-A banked reset is a one-time Codex usage reset that OpenAI grants to a ChatGPT account (Go, Plus, Pro, and Business plans). It is stored on the account and expires 30 days after it is granted. Using one resets both the 5-hour and the weekly window of that account.
+Only Codex file-mode credentials are supported. For keyring mode, the app asks you to change the setting and sign in again:
 
-Only an account that is currently at a limit can apply a reset. The app reads this from the usage API, which reports both how many resets the account holds and how many it can apply now.
+```toml
+# ~/.codex/config.toml
+cli_auth_credentials_store = "file"
+```
 
-To use one by hand, open `↺ Reset Codex usage` and click the account. A dialog asks: "Use 1 of N banked resets for {email}? This resets that account's Codex 5-hour and weekly windows and cannot be undone." with **Reset** and **Cancel**. After you confirm, a notification reports the result: "Reset applied", "Nothing to reset", "No reset credit available", "Already redeemed", or the error. Usage then refreshes.
+Then run:
 
-Auto-reset is off by default and exists for Codex only. When it is on, after each usage refresh the app checks whether the active Codex account is at its limit and no other saved Codex account has room. Only then does it spend one reset: on the active account if it can apply one, otherwise on another exhausted account that can. It works whether or not Auto-switch is on. Two guards apply: at least 60 seconds between attempts, and never the same account twice within an hour, so a reset that did not take effect cannot burn a second one. Auto-reset never switches accounts by itself. If Auto-switch is on, the next refresh can move to the account that now has room.
-
-The setting is stored as `auto_reset` in the config file, next to `auto_switch`.
-
-Claude Code has no reset feature. Nothing changes for Claude accounts.
-
-### First launch
-
-With no config file yet, the app imports the currently signed-in Claude and Codex accounts. If the Codex import fails (for example, unsupported credential storage), the app notifies you and continues.
+```bash
+codex login
+```
 
 ## How it works
 
-Claude Code stores its OAuth credentials in macOS Keychain under `Claude Code-credentials` and account metadata in `~/.claude.json`. Codex CLI stores its ChatGPT session in `~/.codex/auth.json` when `cli_auth_credentials_store = "file"` is set. Claude Switcher keeps one Keychain backup per saved account and copies the selected backup into the CLI's live slot on switch.
-
-A Codex reset is sent to `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`, the same endpoint the Codex CLI uses, with the same headers as the usage call and an idempotency key (a UUID). The app never sends it for an account that cannot apply a reset, and on a network timeout it retries once with the same key, so a reset is never applied twice.
-
-A saved Claude token is refreshed with `https://platform.claude.com/v1/oauth/token`, the same endpoint and client id Claude Code uses. The app refreshes only its own backups (`claude-switcher:{email}`), never the live `Claude Code-credentials` entry. Before refreshing, it checks that the backup is not the same token pair as the live session, re-reads the backup to make sure nothing changed it meanwhile, and tries at most once per account every 5 minutes. The new tokens are written to the backup before they are used. Saved Codex tokens were already refreshed the same way.
+The app stores one Keychain backup per provider and email. Switching copies the selected backup into the CLI's live credential location.
 
 ```text
 macOS Keychain
@@ -181,58 +232,27 @@ macOS Keychain
 └── provider, email, plan, active state, settings
 ```
 
-## Codex note
+Claude usage is read from `https://api.anthropic.com/oauth/usage`. Saved Claude tokens are refreshed through `https://platform.claude.com/v1/oauth/token`. Refreshes recheck the saved credentials before writing and write new tokens only to the app's backup. Codex uses the ChatGPT backend for usage and reset requests.
 
-Only Codex file-mode credentials are supported. If `cli_auth_credentials_store` is `keyring`, the app reports:
+Both providers share the reset menus, confirmation flow, and automatic reset policy. Provider adapters keep their own authentication and reset contracts. Claude checks the grant, organization, credentials, and confirmed details, and does not automatically retry a reset POST. Codex binds confirmation to the account ID and balance, and retries selected network failures once using the same request ID. Neither path treats an uncertain response as proof that no credit was spent.
 
-> Codex keyring credential storage is not supported yet. Set cli_auth_credentials_store = "file" in ~/.codex/config.toml and run codex login.
-
-To switch to file mode:
-
-```toml
-# ~/.codex/config.toml
-cli_auth_credentials_store = "file"
-```
-
-Then run:
-
-```bash
-codex login
-```
-
-If a saved Codex session has expired because its refresh token was already rotated, the app does not restore it. The row shows `Login required`. Click the row (or Add) to sign that account in again.
+See [Usage reset architecture](docs/reset-architecture.md) for the contracts and test coverage.
 
 ## Security
 
-- Saved credentials live in macOS Keychain. The config file stores metadata only. It is written atomically with `0600` permissions in a `0700` directory. A corrupt config is backed up rather than overwritten.
-- Writes to Keychain pass the secret to `security add-generic-password` as a hex string via `-X`. The plaintext is never on the command line, but the hex is briefly visible in `ps`, so this reduces process-argument exposure rather than eliminating it. The alternative, piping the secret to the tool's prompt, silently truncates at 128 characters and corrupted real credentials, which is why it is not used.
-- Emails are validated before being used in Keychain service names.
-- Subprocess calls never use `shell=True`.
-- Keychain operations time out after 5 seconds. Usage checks run in background threads with timeouts, so the menu never hangs.
-- The app never backs up a live credential under an account name it cannot confirm it belongs to.
-- Token refreshes never write Claude Code's live credential entry. They touch only the app's own backups, and a backup that shares its token pair with the live session is never refreshed.
+- Saved credentials live in macOS Keychain. The config holds account metadata and settings, with `0600` file permissions in a `0700` directory. Config writes are atomic; corrupt files are backed up.
+- Keychain writes pass credentials to `security add-generic-password` as hex through `-X`. **Hex is reversible and briefly visible in process arguments.** The tool's interactive prompt is avoided because it truncates long credentials.
+- Emails are validated before use in Keychain service names. Subprocess calls do not use `shell=True`.
+- Keychain commands have five-second timeouts. Usage checks run in background threads with network timeouts.
+- Claude backup and switch paths check local account identity and credential structure to avoid replacing saved sessions with cleared-login markers or another account's credentials.
+- Saved Claude token refreshes write only the app's backups and skip backups that share a token pair with the live session.
+- Enabling the Codex gateway grants local processes access to the active account through its loopback port. Review [Codex gateway](#codex-gateway) before enabling it.
 
-## Requirements
+## Development
 
-- macOS (upstream states 12 or later)
-- Claude Code CLI, for Claude switching
-- Codex CLI with file-mode credentials, for Codex switching
-- Python 3.10 or later, to build from source (built and tested here with 3.13)
+`build_local.sh` creates a `.venv`, installs the package in editable mode, runs py2app, copies required `@rpath` libraries into the bundle, and signs the result ad hoc. The library-copy step includes libffi, libssl, libcrypto, and their dependencies. `build_app.sh` runs only the py2app step and omits that packaging work.
 
-## Build from source
-
-```bash
-git clone https://github.com/omar-elamin/claude-account-switcher.git
-cd claude-account-switcher
-./build_local.sh
-# Output: dist/Claude Switcher.app
-```
-
-`build_local.sh` creates a `.venv`, installs the package in editable mode, runs py2app, then copies the `@rpath` dylibs that py2app skips (libffi, libssl, libcrypto and their dependencies) into the bundle and re-signs it ad hoc. Without that step the app either fails to launch (libffi) or cannot make HTTPS calls and shows "Usage unavailable". `build_app.sh` runs the same py2app step on its own. `build_local.sh` does not call it; it repeats that step and adds the editable install and the dylib copying around it.
-
-Run `./build_local.sh --install` to also copy the built app to `/Applications`.
-
-To run from source instead of building the app:
+To run from source:
 
 ```bash
 python3 -m venv .venv
@@ -241,15 +261,13 @@ pip install -e ".[dev]"
 claude-switcher
 ```
 
-Run the tests:
+Run tests:
 
 ```bash
 pytest tests/ -q
 ```
 
-There are 551 tests. Gateway transport tests use a fake upstream on loopback and skip where local socket binding is blocked. The tests that drive the real macOS `security` tool use a temporary keychain and skip where one cannot be created. They never touch the real Claude Code entry.
-
-The app is not notarized. On first launch macOS may block it. Open **System Settings → Privacy & Security** and click **Open Anyway**.
+Tests cover account and credential handling, usage, reset confirmation and automatic reset rules, native Cocoa menus, and the gateway. Reset tests use synthetic provider responses and do not need live reset credits. Gateway transport tests use a fake upstream on loopback and skip where local socket binding is blocked. Tests that call the real macOS `security` tool use a temporary keychain and skip where one cannot be created.
 
 ## License
 
