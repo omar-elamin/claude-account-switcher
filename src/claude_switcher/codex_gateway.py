@@ -7,6 +7,7 @@ import http.client
 import io
 import json
 import os
+import queue
 import re
 import socket
 import ssl
@@ -88,7 +89,7 @@ _MAX_LINE = 65536          # same line limit as http.server / http.client
 _MAX_HEADERS = 100         # same header count limit as http.client
 _CONNECT_TIMEOUT = 30      # upstream TCP connect + TLS handshake; streams have no read timeout
 _HANDSHAKE_TIMEOUT = 10    # local TLS handshake
-_WORKERS = 8               # token_provider / on_usage_limit / DNS
+_WORKERS = 8               # daemon threads for token_provider / on_usage_limit / DNS
 _STOP_TIMEOUT = 2          # per shutdown phase
 
 # http.client's request validation, so bad input fails the same way (502).
@@ -548,6 +549,104 @@ async def _json_error(writer, command, status, message):
         pass
 
 
+class _WorkerPool:
+    """A bounded pool of daemon threads for blocking calls made from the event loop.
+
+    Not concurrent.futures: its executors register an interpreter-exit hook that
+    joins every worker, so one blocked token refresh would stop the app quitting.
+    These threads are daemons that nothing joins.
+    """
+
+    def __init__(self, size, name):
+        self._size = size
+        self._name = name
+        self._jobs = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._threads = []
+        self._idle = 0
+        self._closed = False
+
+    def run(self, fn, *args):
+        """Run fn(*args) on a worker; return an asyncio future for its result."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('worker pool is shut down')
+            self._jobs.put((loop, future, fn, args))
+            # Reserve an idle worker for the job, or start one while below the limit.
+            # At the limit the job waits in the queue for the next free worker.
+            if self._idle:
+                self._idle -= 1
+            elif len(self._threads) < self._size:
+                thread = threading.Thread(target=self._work, daemon=True,
+                                          name=f'{self._name}-{len(self._threads)}')
+                self._threads.append(thread)
+                thread.start()
+        return future
+
+    def _work(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            loop, future, fn, args = job
+            if not future.done():   # a cancelled request needs no call
+                try:
+                    result, error = fn(*args), None
+                except BaseException as exc:
+                    result, error = None, exc
+                try:
+                    loop.call_soon_threadsafe(_deliver, future, result, error)
+                except RuntimeError:
+                    pass            # the loop is closed; nobody is waiting
+            with self._lock:
+                self._idle += 1
+
+    def shutdown(self):
+        """Stop accepting work and let idle workers exit. Never waits for a call."""
+        with self._lock:
+            self._closed = True
+            try:
+                while True:
+                    self._jobs.get_nowait()
+            except queue.Empty:
+                pass
+            for _ in self._threads:
+                self._jobs.put(None)
+
+
+def _deliver(future, result, error):
+    if future.done():
+        return
+    if error is None:
+        future.set_result(result)
+    else:
+        future.set_exception(error)
+
+
+async def _connect(loop, pool, host, port):
+    """socket.create_connection() without asyncio's default thread-pool resolver."""
+    try:   # an IP literal needs no lookup, so no worker thread
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, 0, socket.AI_NUMERICHOST)
+    except socket.gaierror:
+        infos = await pool.run(socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM)
+    error = None
+    for family, kind, proto, _, address in infos:
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.setblocking(False)
+            await loop.sock_connect(sock, address)
+            return sock
+        except OSError as exc:
+            sock.close()
+            error = exc
+        except BaseException:
+            sock.close()
+            raise
+    raise error if error is not None else OSError('getaddrinfo returned no addresses')
+
+
 class _ClientProtocol(asyncio.StreamReaderProtocol):
     """A client connection. Cancels its in-flight request when the client goes away."""
 
@@ -618,7 +717,7 @@ class Gateway:
         self._thread = None
         self._server = None
         self._sock = None
-        self._executor = None
+        self._pool = None
         self._upstream_ssl = None
         self._connections = set()
 
@@ -640,14 +739,12 @@ class Gateway:
             except BaseException:
                 sock.close()
                 raise
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=_WORKERS, thread_name_prefix='codex-gateway-worker')
+            pool = _WorkerPool(_WORKERS, 'codex-gateway-worker')
             loop = asyncio.new_event_loop()
-            loop.set_default_executor(executor)        # DNS lookups use the same bounded pool
             loop.set_exception_handler(lambda loop, context: None)   # never log request data
             ready = concurrent.futures.Future()
             self._upstream_ssl = upstream_ssl
-            self._executor = executor
+            self._pool = pool
             self._connections = set()
             thread = threading.Thread(target=self._run, args=(loop, sock, ready),
                                       name='codex-gateway', daemon=True)
@@ -659,7 +756,7 @@ class Gateway:
                     loop.call_soon_threadsafe(loop.stop)
                 thread.join(timeout=_STOP_TIMEOUT)
                 sock.close()
-                executor.shutdown(wait=False)
+                pool.shutdown()
                 raise
             self.port = sock.getsockname()[1]
             self._sock = sock
@@ -705,8 +802,8 @@ class Gateway:
             thread.join(timeout=_STOP_TIMEOUT)
             sock.close()   # normally already closed by server.close(); frees the port regardless
             # Blocking callbacks may still be running; do not wait for them.
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
+            self._pool.shutdown()
+            self._pool = None
 
     async def _shutdown(self, server):
         server.close()                              # stop listening; frees the port
@@ -777,6 +874,18 @@ class Gateway:
         finally:
             conn.busy = False
 
+    async def _open_upstream(self, loop, command, parts, https):
+        sock = await _connect(loop, self._pool, parts.hostname,
+                              parts.port or (443 if https else 80))
+        try:
+            return await loop.create_connection(
+                lambda: _UpstreamProtocol(loop, command), sock=sock,
+                ssl=self._upstream_ssl if https else None,
+                server_hostname=parts.hostname if https else None)
+        except BaseException:
+            sock.close()
+            raise
+
     async def _forward(self, conn, request, headers, body, writer):
         loop = asyncio.get_running_loop()
         command = request.command
@@ -785,7 +894,7 @@ class Gateway:
         try:
             for attempt in range(2):
                 try:
-                    identity = await loop.run_in_executor(self._executor, self.token_provider)
+                    identity = await self._pool.run(self.token_provider)
                     if not identity:
                         raise ValueError
                     email, token = identity
@@ -801,12 +910,7 @@ class Gateway:
                 payload = _upstream_request(command, request.path, parts,
                                             rewrite_headers(headers, token), body)
                 transport, response = await asyncio.wait_for(
-                    loop.create_connection(
-                        lambda: _UpstreamProtocol(loop, command),
-                        parts.hostname, parts.port or (443 if https else 80),
-                        ssl=self._upstream_ssl if https else None,
-                        server_hostname=parts.hostname if https else None),
-                    _CONNECT_TIMEOUT)
+                    self._open_upstream(loop, command, parts, https), _CONNECT_TIMEOUT)
                 try:
                     transport.write(payload)
                     status, response_headers = await response.head
@@ -817,8 +921,7 @@ class Gateway:
                     if (attempt == 0 and authenticated and buffered is not None
                             and is_usage_limit(status, buffered)):
                         try:
-                            switched = await loop.run_in_executor(
-                                self._executor, self.on_usage_limit, email)
+                            switched = await self._pool.run(self.on_usage_limit, email)
                         except Exception:
                             switched = False
                         if switched:

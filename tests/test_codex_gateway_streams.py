@@ -9,8 +9,10 @@ import asyncio
 import http.client
 import json
 import hashlib
+import os
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -564,3 +566,77 @@ def test_slow_client_holds_back_a_fast_upstream(harness):
     assert finished.is_set()
     assert len(body) == size
     assert hashlib.sha256(body).digest() == hashlib.sha256(block * (size // len(block))).digest()
+
+
+EXIT_PROBE = r"""
+import importlib.util, socket, ssl, sys, threading
+spec = importlib.util.spec_from_file_location('gateway_under_test', sys.argv[1])
+gateway = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gateway)
+entered = threading.Event()
+
+def token_provider():               # a token refresh or `security` call that never returns
+    entered.set()
+    threading.Event().wait()
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(sys.argv[2], sys.argv[3])
+server = gateway.Gateway('127.0.0.1', 0, token_provider, lambda email: False,
+                         upstream='http://127.0.0.1:9', ssl_context=context)
+server.start()
+client = ssl.create_default_context(cafile=sys.argv[4]).wrap_socket(
+    socket.create_connection(('127.0.0.1', server.port)), server_hostname='127.0.0.1')
+client.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+assert entered.wait(5), 'token_provider was not called'
+server.stop()
+client.close()
+print('main returned', flush=True)
+"""
+
+
+def test_process_exits_while_a_blocking_callback_is_stuck(certs):
+    # Quitting the app must not wait for a token_provider call that never returns.
+    gateway_paths, _ = certs
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        [os.path.dirname(os.path.dirname(os.path.abspath(codex_tls.__file__))),
+         os.environ.get('PYTHONPATH', '')]))
+    process = subprocess.Popen(
+        [sys.executable, '-c', EXIT_PROBE, gateway.__file__, str(gateway_paths.cert),
+         str(gateway_paths.key), str(gateway_paths.ca)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        output, errors = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, errors = process.communicate()
+        pytest.fail(f'process did not exit within 5 s after stop(): {output}{errors}')
+    assert 'main returned' in output, errors
+    assert process.returncode == 0, errors
+
+
+def test_dns_names_resolve_without_extra_threads(harness):
+    upstream_factory, start, _, https = harness
+
+    async def respond(up, path, reader, writer):
+        writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')
+        await writer.drain()
+
+    up = upstream_factory(respond)
+    server = gateway.Gateway(
+        '127.0.0.1', 0, Mock(return_value=('active@test.com', 'active-token')),
+        Mock(return_value=False), upstream=f'http://localhost:{up.port}')
+    server.start()
+    try:
+        before = set(threading.enumerate())
+        conn = http.client.HTTPConnection('127.0.0.1', server.port, timeout=10)
+        conn.request('GET', '/by-name')
+        response = conn.getresponse()
+        assert (response.status, response.read()) == (200, b'ok')
+        conn.close()
+        assert up.requests[0][1]['host'] == f'localhost:{up.port}'
+        # asyncio's default executor (threads named asyncio_N) must never start:
+        # its interpreter-exit hook would join them.
+        extra = set(threading.enumerate()) - before
+        assert not [thread.name for thread in extra if thread.name.startswith('asyncio_')]
+    finally:
+        server.stop()
