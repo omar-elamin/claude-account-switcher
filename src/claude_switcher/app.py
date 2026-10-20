@@ -101,6 +101,12 @@ PROVIDERS = {
     },
 }
 AUTO_SWITCH_COOLDOWN_SECONDS = 60
+# The usage timer ticks every minute and checks only each provider's active
+# account, so it cannot go from below the switch threshold to its limit unseen.
+# Every fifth tick refreshes all saved accounts instead (one fetch per account).
+ACTIVE_USAGE_REFRESH_SECONDS = 60
+FULL_USAGE_REFRESH_SECONDS = 300
+FULL_REFRESH_EVERY_TICKS = FULL_USAGE_REFRESH_SECONDS // ACTIVE_USAGE_REFRESH_SECONDS
 AUTO_RESET_ACCOUNT_COOLDOWN_SECONDS = 3600
 # Manual callbacks run on Cocoa's main thread; automatic resets run on a worker.
 # Claiming a provider/account must be atomic across both entry points.
@@ -183,12 +189,14 @@ class ClaudeSwitcherApp(rumps.App):
         self._refresh_requested = False   # a Refresh click landed mid-flight; honour it after
         self._manual_refresh = False      # current refresh is user-initiated -> notify when done
         self._signing_in_since: dict[str, float] = {}  # provider -> time.time() Add was clicked
+        self._usage_ticks = 0
         self._first_launch()
         if load_settings(self.config_path).codex_gateway:
             self._start_codex_gateway()
         self._rebuild_menu()
         self._fetch_all_usage()
-        self._auto_switch_timer = rumps.Timer(self._on_periodic_usage_refresh, 300)
+        self._auto_switch_timer = rumps.Timer(
+            self._on_periodic_usage_refresh, ACTIVE_USAGE_REFRESH_SECONDS)
         self._auto_switch_timer.start()
 
     def _first_launch(self):
@@ -900,6 +908,62 @@ class ClaudeSwitcherApp(rumps.App):
 
         threading.Thread(target=_fetch, daemon=True).start()
 
+    def _fetch_active_usage(self):
+        """Fetch usage for each provider's active account only, then run auto-switch.
+
+        Uses the same switch decision as a full refresh. Does nothing while any
+        refresh is in flight: a full refresh fetches the active accounts too.
+        A failed fetch keeps the last known numbers and makes no switch decision;
+        the next full refresh shows the failure and runs the quick retries.
+        """
+        if self._refresh_in_progress:
+            return
+        self._refresh_in_progress = True
+        providers = ("claude", "codex")
+        actives = [get_active_account(self.config_path, provider=p) for p in providers]
+
+        def _fetch():
+            auto_switch_results = []
+            try:
+                fresh = set()
+                for account in actives:
+                    if account is None or _add_lease_held(account.provider):
+                        continue
+                    state = self._fetch_usage_state(account, account)
+                    if not state.available:
+                        continue
+                    key = account_key(account)
+                    self._usage_state_cache[key] = state
+                    self._usage_cache[key] = state.display
+                    fresh.add(account.provider)
+
+                for provider in providers:
+                    if provider not in fresh:
+                        continue
+                    result = self._attempt_auto_switch(provider)
+                    if result:
+                        auto_switch_results.append(result)
+            finally:
+                def _finish():
+                    self._refresh_in_progress = False
+                    switched = any(r["status"] == "switched" for r in auto_switch_results)
+                    if switched:
+                        self._rebuild_menu()
+                    self._update_usage_labels()
+                    for result in auto_switch_results:
+                        # The full refresh repeats "limit reached" every five minutes;
+                        # repeating it every minute here would only add noise.
+                        if result["status"] != "no_target":
+                            self._notify_auto_switch_result(result)
+                    if switched or self._refresh_requested:
+                        # After a switch, refresh all rows as a full refresh does.
+                        self._refresh_requested = False
+                        self._fetch_all_usage()
+
+                _on_main_thread(_finish)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
     def _on_toggle_auto_reset(self, sender):
         provider = sender._provider
         if not PROVIDERS[provider]["reset"].supports_automatic:
@@ -1111,6 +1175,15 @@ class ClaudeSwitcherApp(rumps.App):
         self._fetch_all_usage()
 
     def _on_periodic_usage_refresh(self, _):
+        """Timer tick: check the active accounts, and every fifth tick all accounts.
+
+        A full-refresh tick does not also run the active check, so no account
+        is fetched twice on the same tick.
+        """
+        self._usage_ticks += 1
+        if self._usage_ticks % FULL_REFRESH_EVERY_TICKS:
+            self._fetch_active_usage()
+            return
         self._quick_retries_left = QUICK_RETRY_BUDGET
         self._fetch_all_usage()
 
