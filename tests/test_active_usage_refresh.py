@@ -28,9 +28,20 @@ class _FakeTimer:
         self.started = True
 
 
+class _FakeMenuItem:
+    def __init__(self, title, callback=None):
+        self.title, self.callback, self.state = title, callback, 0
+
+    def add(self, item):
+        pass
+
+    def set_callback(self, callback):
+        self.callback = callback
+
+
 fake_rumps = types.ModuleType("rumps")
 fake_rumps.App = _FakeApp
-fake_rumps.MenuItem = type("MenuItem", (), {})
+fake_rumps.MenuItem = _FakeMenuItem
 fake_rumps.Timer = _FakeTimer
 fake_rumps.separator = object()
 fake_rumps.notification = MagicMock()
@@ -120,7 +131,7 @@ class Harness:
                                 lambda *a, **k: app_module.reset_service.ResetStatus())
 
         # Worker threads and main-thread blocks are queued, then run on demand.
-        self.threads, self.main = [], []
+        self.threads, self.main, self.in_main = [], [], False
         module = app_module
         harness = self
         class _QueuedThread:
@@ -142,7 +153,11 @@ class Harness:
 
     def run_main(self):
         while self.main:
-            self.main.pop(0)()
+            self.in_main = True
+            try:
+                self.main.pop(0)()
+            finally:
+                self.in_main = False
 
     def settle(self):
         while self.threads or self.main:
@@ -206,10 +221,12 @@ def test_60s_tick_switches_active_account_at_threshold(harness, provider, percen
     label = harness.module.PROVIDER_LABELS[provider]
     assert harness.notices() == [f"Auto-switched {label}"]
     harness.app._rebuild_menu.assert_called_once()
-    # After a switch, all rows refresh, as after any switch today.
-    harness.fetched.clear()
+    # After a switch, the other rows refresh. The fetch log is kept across the
+    # follow-up refresh: no account is fetched twice for one tick.
     harness.settle()
-    assert Counter(harness.fetched) == Counter(ALL_ACCOUNTS)
+    counts = Counter(harness.fetched)
+    assert max(counts.values()) == 1, counts
+    assert counts == Counter(ALL_ACCOUNTS)
     assert harness.switch[provider].call_count == 1
 
 
@@ -282,3 +299,25 @@ def test_60s_tick_does_not_repeat_the_limit_reached_notice(harness):
     assert harness.fetched == ACTIVES
     harness.switch["claude"].assert_not_called()
     assert harness.notices() == []
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_minute_switch_reads_no_keychain_on_the_main_thread(harness, monkeypatch, provider):
+    active = {"claude": "c-active", "codex": "x-active"}[provider]
+    del harness.app._rebuild_menu            # use the real menu rebuild
+    monkeypatch.setattr(harness.module.login_item, "is_enabled", lambda: False)
+    main_thread_reads = []
+
+    def has_credentials(account):
+        if harness.in_main:
+            main_thread_reads.append((account.provider, account.email))
+        return True
+
+    harness.app._has_credentials = has_credentials
+    harness.live[(provider, active)] = _state(99.0)
+    harness.tick()
+    harness.settle()
+    harness.switch[provider].assert_called_once()
+    assert main_thread_reads == []
+    # The rebuilt menu still shows a usage row for every account with credentials.
+    assert set(harness.app._usage_items) == set(ALL_ACCOUNTS)

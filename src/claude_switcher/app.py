@@ -244,8 +244,13 @@ class ClaudeSwitcherApp(rumps.App):
                 message="Please install Claude Code or Codex CLI before using Claude Switcher.",
             )
 
-    def _rebuild_menu(self):
-        """Rebuild the menu from current account state."""
+    def _rebuild_menu(self, credentials=None):
+        """Rebuild the menu from current account state.
+
+        credentials maps account keys to "has saved credentials". A caller on
+        the main thread can pass flags read on a worker thread, so the rebuild
+        does not wait for a Keychain read per account.
+        """
         accounts = load_accounts(self.config_path)
         self.menu.clear()
         self._usage_items = {}
@@ -257,7 +262,7 @@ class ClaudeSwitcherApp(rumps.App):
             if provider_accounts:
                 if section_added:
                     self.menu.add(rumps.separator)
-                self._add_provider_section(provider, provider_accounts)
+                self._add_provider_section(provider, provider_accounts, credentials)
                 section_added = True
 
         self.menu.add(rumps.separator)
@@ -288,13 +293,14 @@ class ClaudeSwitcherApp(rumps.App):
         self.menu.add(item)
         self.menu.add(rumps.MenuItem("\u23FB  Quit", callback=rumps.quit_application))
 
-    def _add_provider_section(self, provider: str, accounts):
+    def _add_provider_section(self, provider: str, accounts, credentials=None):
         header = rumps.MenuItem(f"\u2500\u2500 {PROVIDER_LABELS[provider]} \u2500\u2500")
         header.set_callback(None)
         self.menu.add(header)
 
         for account in accounts:
-            has_creds = self._has_credentials(account)
+            known = credentials.get(account_key(account)) if credentials else None
+            has_creds = known if known is not None else self._has_credentials(account)
             prefix = "\u25C9  " if account.active else "\u25CB  "
             if has_creds:
                 label = f"{prefix}{account.email} ({account.subscription_type})"
@@ -812,8 +818,12 @@ class ClaudeSwitcherApp(rumps.App):
             _on_main_thread(completed)
             return True
 
-    def _fetch_all_usage(self):
-        """Fetch usage for all accounts in a background thread."""
+    def _fetch_all_usage(self, skip=frozenset()):
+        """Fetch usage for all accounts in a background thread.
+
+        Accounts in skip (account keys) were fetched a moment ago: keep their
+        cached usage and reset status instead of fetching them again.
+        """
         if self._refresh_in_progress:
             # Don't silently drop the request: run again once this one finishes.
             self._refresh_requested = True
@@ -832,6 +842,10 @@ class ClaudeSwitcherApp(rumps.App):
             try:
                 for account in accounts:
                     key = account_key(account)
+                    if key in skip:
+                        reset_statuses[key] = getattr(self, "_reset_cache", {}).get(
+                            key, reset_service.ResetStatus())
+                        continue
                     if _add_lease_held(account.provider):
                         # Sign-in in progress for this provider: a fetch can only
                         # return "unavailable". Keep the last known numbers; the
@@ -922,6 +936,9 @@ class ClaudeSwitcherApp(rumps.App):
         providers = ("claude", "codex")
         actives = [get_active_account(self.config_path, provider=p) for p in providers]
 
+        fetched = set()
+        credentials = {}
+
         def _fetch():
             auto_switch_results = []
             try:
@@ -929,6 +946,7 @@ class ClaudeSwitcherApp(rumps.App):
                 for account in actives:
                     if account is None or _add_lease_held(account.provider):
                         continue
+                    fetched.add(account_key(account))
                     state = self._fetch_usage_state(account, account)
                     if not state.available:
                         continue
@@ -943,22 +961,29 @@ class ClaudeSwitcherApp(rumps.App):
                     result = self._attempt_auto_switch(provider)
                     if result:
                         auto_switch_results.append(result)
+                if any(r["status"] == "switched" for r in auto_switch_results):
+                    # Read Keychain flags here, not in the menu rebuild on the main thread.
+                    credentials.update({account_key(a): self._has_credentials(a)
+                                        for a in load_accounts(self.config_path)})
             finally:
                 def _finish():
                     self._refresh_in_progress = False
                     switched = any(r["status"] == "switched" for r in auto_switch_results)
                     if switched:
-                        self._rebuild_menu()
+                        self._rebuild_menu(credentials)
                     self._update_usage_labels()
                     for result in auto_switch_results:
                         # The full refresh repeats "limit reached" every five minutes;
                         # repeating it every minute here would only add noise.
                         if result["status"] != "no_target":
                             self._notify_auto_switch_result(result)
-                    if switched or self._refresh_requested:
-                        # After a switch, refresh all rows as a full refresh does.
+                    if self._refresh_requested:
+                        # A refresh asked for during this check fetches every account.
                         self._refresh_requested = False
                         self._fetch_all_usage()
+                    elif switched:
+                        # Refresh the other rows; this tick already fetched these.
+                        self._fetch_all_usage(skip=frozenset(fetched))
 
                 _on_main_thread(_finish)
 
