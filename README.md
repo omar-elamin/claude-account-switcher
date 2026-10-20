@@ -87,7 +87,7 @@ A Codex row can look like this:
 
 Codex window labels use the lengths returned by the provider, such as `5h` or `7d`. When the account has reset credits, the row also shows the count.
 
-Usage refreshes at launch, every five minutes, after adding or switching accounts, and when you select `↻ Refresh usage`. Unavailable rows get up to three quick retries, six seconds apart. Rows show `•••` before the first result, `Checking…` during a quick retry, and `Usage unavailable` if the retries do not recover the result.
+Usage for all accounts refreshes at launch, every five minutes, after adding or switching accounts, and when you select `↻ Refresh usage`. Between these refreshes, the app checks the active account of each provider every minute. If that check fails, the row keeps its last numbers until the next full refresh. Unavailable rows get up to three quick retries, six seconds apart. Rows show `•••` before the first result, `Checking…` during a quick retry, and `Usage unavailable` if the retries do not recover the result.
 
 macOS closes the menu when you click an item. Refreshing produces notifications; reopen the menu to see the updated rows.
 
@@ -129,7 +129,7 @@ Codex tokens are refreshed when needed and written back to the account's Keychai
 
 ### Auto-switch
 
-Auto-switch is off by default for each provider. When enabled, it checks usage after each refresh and chooses among accounts with saved credentials and known room below the usage limit. The default limit threshold is 100%.
+Auto-switch is off by default for each provider. When enabled, it checks usage after each refresh, including the one-minute check of the active account, and chooses among accounts with saved credentials and known room below the usage limit. The default limit threshold is 100%.
 
 For Claude, open `Auto-switch → Route based on` and choose:
 
