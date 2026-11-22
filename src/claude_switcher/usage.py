@@ -1,11 +1,14 @@
 """Fetch Claude API usage stats via the OAuth usage endpoint."""
 
 import json
+import math
+import threading
 import time
 import logging
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from claude_switcher import core, keychain
 from claude_switcher.common import _format_countdown
@@ -15,6 +18,18 @@ from claude_switcher.usage_state import UsageState, UsageWindow
 logger = logging.getLogger(__name__)
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
+MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+# Smallest request that returns the account's rate-limit headers.
+_HEADER_PROBE_BODY = json.dumps({
+    "model": "claude-haiku-5-5",
+    "max_tokens": 1,
+    "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+    "messages": [{"role": "user", "content": "hi"}],
+}).encode()
+# time.monotonic() value before which the usage endpoint is not called (after a
+# 429). Monotonic, so a wall-clock change cannot end the wait early.
+_usage_endpoint_retry_at = 0.0
+_usage_endpoint_lock = threading.Lock()
 _last_refresh_attempt: dict[str, float] = {}
 # Last refresh rejection per email, so a throttled poll repeats "Login required"
 # instead of flipping back to "Token expired" for five minutes.
@@ -60,19 +75,120 @@ def _fetch_usage_once(creds: str) -> dict | None:
             "User-Agent": "claude-code/2.1.11",
         },
     )
+    global _usage_endpoint_retry_at
+    # The usage endpoint rate limits hard, for every account at once (22 Nov
+    # 2026: all 6 accounts got 429 for hours, so no switch ran). Calls go out one
+    # at a time, so no call starts while another one's 429 sets the wait. During
+    # the wait, read the same numbers from the rate-limit headers instead.
+    with _usage_endpoint_lock:
+        if time.monotonic() < _usage_endpoint_retry_at:
+            rate_limited = True
+        else:
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    return _auth_error(creds)
+                if exc.code != 429:
+                    return None
+                wait = _retry_after_seconds(exc.headers)
+                _usage_endpoint_retry_at = max(_usage_endpoint_retry_at,
+                                               time.monotonic() + wait)
+                rate_limited = True
+            except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+                return None
+    if rate_limited:
+        return _fetch_usage_from_headers(token, creds)
+    return None
+
+
+def _auth_error(creds: str) -> dict:
+    # Claude access tokens last about 8 hours and only Claude Code
+    # refreshes the live one. Saved accounts can attempt refresh when
+    # expired; an unexpired 401 means a new sign-in is required.
+    code = "token_expired" if _token_expired(creds) else "login_required"
+    return {"error": {"code": code}}
+
+
+def _retry_after_seconds(headers, now: float | None = None) -> float:
+    """Seconds to wait from a Retry-After header (delay or HTTP date), at least 60."""
+    now = time.time() if now is None else now
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
+        raw = (headers.get("Retry-After") or "").strip()
+    except AttributeError:
+        raw = ""
+    value = 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)  # HTTP dates are always GMT
+            value = when.timestamp() - now
+        except (TypeError, ValueError, IndexError, OverflowError):
+            value = 0.0
+    return max(value, 60.0)
+
+
+def _fetch_usage_from_headers(token: str, creds: str) -> dict | None:
+    """Read usage from the anthropic-ratelimit-unified-* headers of a 1-token request.
+
+    Every Messages API response, also the 429 for a full account, carries the
+    account's 5-hour and 7-day utilization (a 0..1 fraction) and reset time
+    (epoch seconds). Returns the usage endpoint's shape, an auth error, or None.
+    """
+    req = urllib.request.Request(
+        MESSAGES_URL,
+        data=_HEADER_PROBE_BODY,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json",
+            "User-Agent": "claude-code/2.1.11",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            headers = resp.headers
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            # Claude access tokens last about 8 hours and only Claude Code
-            # refreshes the live one. Saved accounts can attempt refresh when
-            # expired; an unexpired 401 means a new sign-in is required.
-            code = "token_expired" if _token_expired(creds) else "login_required"
-            return {"error": {"code": code}}
+            return _auth_error(creds)
+        headers = exc.headers
+    except (urllib.error.URLError, TimeoutError, OSError):
         return None
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
-        return None
+    return usage_from_ratelimit_headers(headers)
+
+
+def usage_from_ratelimit_headers(headers) -> dict | None:
+    """Convert unified rate-limit headers to {"five_hour": ..., "seven_day": ...}."""
+    prefix = "anthropic-ratelimit-unified-"
+    values = {k.lower()[len(prefix):]: v for k, v in (headers or {}).items()
+              if k.lower().startswith(prefix)}
+    usage = {}
+    for short, key in (("5h", "five_hour"), ("7d", "seven_day")):
+        try:
+            # The API can report a little over 1.0 for a full window.
+            percent = float(values[f"{short}-utilization"]) * 100
+            if not math.isfinite(percent):
+                raise ValueError("utilization is not a number")
+            percent = min(max(percent, 0.0), 100.0)
+        except (KeyError, TypeError, ValueError):
+            # A rejected window may omit utilization; it is full.
+            if values.get(f"{short}-status") != "rejected":
+                continue
+            percent = 100.0
+        resets_at = None
+        try:
+            resets_at = datetime.fromtimestamp(
+                float(values[f"{short}-reset"]), tz=timezone.utc).isoformat()
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            pass
+        usage[key] = {"utilization": percent, "resets_at": resets_at}
+    return usage or None
 
 
 def _token_expired(creds_json: str) -> bool:
